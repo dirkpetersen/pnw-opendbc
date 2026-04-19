@@ -90,6 +90,7 @@ class CarControllerParams:
 class MgSafetyFlags(IntFlag):
   LONG_CONTROL = 1
   ALT_BRAKE = 2
+  NON_EV = 4
 
 
 DBC = CAR.create_dbc_map()
