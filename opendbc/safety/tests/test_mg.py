@@ -7,7 +7,7 @@ import opendbc.safety.tests.common as common
 from opendbc.safety.tests.common import CANPackerSafety
 
 
-class TestMGSafety(common.PandaCarSafetyTest, common.DriverTorqueSteeringSafetyTest):
+class TestMGSafety(common.CarSafetyTest, common.DriverTorqueSteeringSafetyTest):
 
   TX_MSGS = [[0x1fd, 0], ]
   RELAY_MALFUNCTION_ADDRS = {0: (0x1fd,)}

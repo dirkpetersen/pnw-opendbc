@@ -23,7 +23,7 @@ def round_angle(apply_angle, can_offset=0):
   return away_round(apply_angle_can + rnd_offset) * 0.1 - 1638.35
 
 
-class TeslaLegacyLateralBase(common.PandaCarSafetyTest, common.AngleSteeringSafetyTest):
+class TeslaLegacyLateralBase(common.CarSafetyTest, common.AngleSteeringSafetyTest):
   """Base class for Tesla Legacy lateral (steering) control tests"""
 
   STANDSTILL_THRESHOLD = 0.1
@@ -235,7 +235,7 @@ class TeslaLegacyLateralBase(common.PandaCarSafetyTest, common.AngleSteeringSafe
         self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
 
 
-class TeslaLegacyLongitudinalBase(common.PandaCarSafetyTest, common.LongitudinalAccelSafetyTest):
+class TeslaLegacyLongitudinalBase(common.CarSafetyTest, common.LongitudinalAccelSafetyTest):
   """Base class for Tesla Legacy longitudinal (acceleration) control tests"""
 
   STANDSTILL_THRESHOLD = 0.1
