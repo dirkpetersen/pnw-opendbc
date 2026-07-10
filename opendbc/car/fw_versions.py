@@ -115,6 +115,12 @@ def match_fw_to_car_exact(live_fw_versions: LiveFwVersions, match_brand: str | N
                 is_brand(MODEL_TO_BRAND[c], match_brand)}
 
   for candidate, fws in candidates.items():
+    # A platform with no FW versions on record (e.g. an unpopulated TODO entry) has nothing to
+    # invalidate it and would exact-match EVERY car, making all fingerprints ambiguous — the empty
+    # MG_ZS placeholder turned a Tesla Raven into MOCK this way (2026-07-10). Never match on nothing.
+    if not len(fws):
+      invalid.add(candidate)
+      continue
     config = FW_QUERY_CONFIGS[MODEL_TO_BRAND[candidate]]
     for ecu, expected_versions in fws.items():
       expected_versions = expected_versions + extra_fw_versions.get(candidate, {}).get(ecu, [])
