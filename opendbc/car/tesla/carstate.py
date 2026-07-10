@@ -241,6 +241,18 @@ class CarState(CarStateBase):
     else:
       ret.seatbeltUnlatched = cp_chassis.vl["SDM1"]["SDM_bcklDrivStatus"] != 1
 
+    # Blindspot (bsm2pnw) — Tesla's own rear blind-spot warning (computed by the Autopilot computer
+    # from the rear repeater cameras + ultrasonics), broadcast as AutopilotStatus (0x399) on the
+    # chassis bus. 2-bit fields: 0=NO_WARNING, 1/2=WARNING, 3=SNA. Only an actual warning counts as
+    # occupied; 0/SNA read as clear, so behaviour degrades to the pre-BSM baseline if the car stops
+    # emitting warnings. The message is EXPLICITLY subscribed in get_can_parsers (HW3 only), so a
+    # total loss of 0x399 surfaces as a CAN error instead of a silent always-clear — a silent clear
+    # would defeat the DesireHelper lane-change gate while looking protected.
+    if self.CP.carFingerprint == CAR.TESLA_MODEL_S_HW3:
+      bsm = cp_chassis.vl["AutopilotStatus"]
+      ret.leftBlindspot = bsm["DAS_blindSpotRearLeft"] in (1, 2)
+      ret.rightBlindspot = bsm["DAS_blindSpotRearRight"] in (1, 2)
+
     # AEB
     ret.stockAeb = cp_ap_pt.vl["DAS_control"]["DAS_aebEvent"] == 1
 
@@ -265,7 +277,12 @@ class CarState(CarStateBase):
         Bus.ap_party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.autopilot_party),
         Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CANBUS.powertrain),
         Bus.ap_pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CANBUS.autopilot_powertrain),
-        Bus.chassis: CANParser(DBC[CP.carFingerprint][Bus.chassis], [], CANBUS.chassis if CP.carFingerprint == CAR.TESLA_MODEL_S_HW3 else CANBUS.party),
+        # bsm2pnw: explicitly subscribe AutopilotStatus (0x399, blind-spot) on the HW3 Raven so its
+        # absence trips can_valid (CAN error) instead of silently reading as "no blindspot". freq=0
+        # keeps the parser's learned-frequency timeout (same as every other legacy message).
+        Bus.chassis: CANParser(DBC[CP.carFingerprint][Bus.chassis],
+                               [("AutopilotStatus", 0)] if CP.carFingerprint == CAR.TESLA_MODEL_S_HW3 else [],
+                               CANBUS.chassis if CP.carFingerprint == CAR.TESLA_MODEL_S_HW3 else CANBUS.party),
       }
 
     return {
