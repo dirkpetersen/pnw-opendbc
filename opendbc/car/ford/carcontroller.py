@@ -2,6 +2,7 @@ import math
 import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
+from opendbc.car.carlog import carlog
 from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
 from opendbc.car.ford import fordcan_pnw  # fordsafety2pnw: BluePilot 4-signal lateral builders
@@ -217,21 +218,33 @@ class CarController(CarControllerBase):
       # before LateralCurvExt.update. Panda rate-checks desired_curvature vs the last TX on the
       # bus; that must match the prior frame's lat.apply_curvature only (not an intermediate
       # stock-limited value).
-      lat = self._latext.update(CC, CS, actuators, self.apply_curvature_last, self.CP)
-      self.apply_curvature_last = lat.apply_curvature
-
-      if self.CP.flags & FordFlags.CANFD:
-        mode = 1 if CC.latActive else 0
-        counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
-        can_sends.append(fordcan_pnw.create_lat_ctl2_msg(
-          self.packer, self.CAN, mode, lat.ramp_type, lat.precision_type,
-          -lat.path_offset, -lat.path_angle, -lat.apply_curvature, -lat.curvature_rate, counter
-        ))
+      # fordsafety2pnw resilience: a LateralCurvExt failure must NEVER kill card (today's numpy
+      # cast crash was this exact blast radius — card died on every drive). On any exception,
+      # log once and permanently fall back to the stock curvature-only path for this drive:
+      # steering assist stays alive, the driver just loses the 4-signal extras.
+      try:
+        lat = self._latext.update(CC, CS, actuators, self.apply_curvature_last, self.CP)
+      except Exception:
+        carlog.exception("LateralCurvExt failed — falling back to stock lateral for this drive")
+        self._latext = None
+        lat = None
+      if lat is None:
+        pass  # one 20Hz frame without a lat msg; stock path resumes next STEER_STEP
       else:
-        can_sends.append(fordcan_pnw.create_lat_ctl_msg(
-          self.packer, self.CAN, CC.latActive, lat.ramp_type, lat.precision_type,
-          -lat.path_offset, -lat.path_angle, -lat.apply_curvature, -lat.curvature_rate
-        ))
+        self.apply_curvature_last = lat.apply_curvature
+
+        if self.CP.flags & FordFlags.CANFD:
+          mode = 1 if CC.latActive else 0
+          counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
+          can_sends.append(fordcan_pnw.create_lat_ctl2_msg(
+            self.packer, self.CAN, mode, lat.ramp_type, lat.precision_type,
+            -lat.path_offset, -lat.path_angle, -lat.apply_curvature, -lat.curvature_rate, counter
+          ))
+        else:
+          can_sends.append(fordcan_pnw.create_lat_ctl_msg(
+            self.packer, self.CAN, CC.latActive, lat.ramp_type, lat.precision_type,
+            -lat.path_offset, -lat.path_angle, -lat.apply_curvature, -lat.curvature_rate
+          ))
 
     elif (self.frame % CarControllerParams.STEER_STEP) == 0:
       # fordlat2pnw: blend the model's PREDICTED curvature (0.2 s lookahead, leads the planner) into
