@@ -6,9 +6,18 @@ from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
+from opendbc.car.pnw_vehicle import PnwVehicle
 
 LongCtrlState = structs.CarControl.Actuators.LongControlState
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
+
+# fordlat2pnw: predicted-curvature blend constants (BluePilot/alan-polk defaults: pc_blend_ratio
+# low/high both 0.40, lookup 0.2 s). Tunable from drive telemetry (strAng excursions on turn exit).
+PC_BLEND_LOOKUP_S = 0.2   # seconds into the model horizon for the predicted curvature
+PC_BLEND_RATIO = 0.40     # predicted weight; (1 - ratio) = planner-desired weight
+PC_BLEND_MIN_V = 9.0      # m/s — blend only where apply_ford_curvature_limits' current-curvature
+                          # clip is ACTIVE (>9); below it, 1/v amplifies resting model-yaw noise and
+                          # the clip is bypassed (Gemini catch) -> pure stock desired curvature
 
 # CAN FD limits:
 # Limit to average banked road since safety doesn't have the roll
@@ -75,11 +84,33 @@ class CarController(CarControllerBase):
     self.lead_distance_bars_last = None
     self.distance_bar_frame = 0
 
+    # fordlat2pnw: predicted-curvature blend for the F-150 Lightning — port of BluePilot's
+    # (alan-polk) pc_blend mechanism, CURVATURE-SIGNAL-ONLY so it stays entirely within stock Ford
+    # panda safety (no flash; the 4-signal LateralCurvExt is deliberately NOT ported). The model's
+    # predicted curvature LEADS the planner's desired curvature, so blending it in relaxes steering
+    # earlier on turn exit — fixes the post-curve wind-up that threw the truck left onto straights
+    # (driver report 2026-07-11). Guarded imports: bare opendbc checkout -> blend off, pure stock.
+    veh = PnwVehicle(CP)  # capability view — no fingerprint checks in feature code (driver directive)
+    self._pcblend_enabled = veh.pc_blend
+    self._pcblend_sm = None
+    self._pcblend_tidxs = None
+    if self._pcblend_enabled:
+      try:
+        import cereal.messaging as messaging
+        try:
+          from openpilot.selfdrive.modeld.constants import ModelConstants
+        except ImportError:
+          from selfdrive.modeld.constants import ModelConstants
+        self._pcblend_sm = messaging.SubMaster(['modelV2'])
+        self._pcblend_tidxs = list(ModelConstants.T_IDXS)
+      except Exception:
+        self._pcblend_enabled = False
+
     # icbm2pnw: stock-ACC set-speed steering for the F-150 Lightning (Tier 1, no op-long). The brain
     # (target selection from CES/VTSC curve logic) runs in the pnw layer and publishes the IcbmTarget
     # mem-param; this side is only the closed-loop executor (see icbm_pnw.py for the safety envelope).
     # Params import is runtime-only and guarded: on a bare opendbc checkout ICBM simply stays off.
-    self._icbm_enabled = (not CP.openpilotLongitudinalControl) and CP.carFingerprint == CAR.FORD_F_150_LIGHTNING_MK1
+    self._icbm_enabled = veh.icbm
     self._icbm_governor = None
     self._icbm_cmd = None
     self._icbm_params = None
@@ -148,13 +179,32 @@ class CarController(CarControllerBase):
     ### lateral control ###
     # send steer msg at 20Hz
     if (self.frame % CarControllerParams.STEER_STEP) == 0:
+      # fordlat2pnw: blend the model's PREDICTED curvature (0.2 s lookahead, leads the planner) into
+      # the desired curvature at BluePilot's default 40/60 ratio. The blended value flows through the
+      # UNCHANGED stock pipeline below (anti_overshoot n/a for Lightning, curvature-error clip, rate
+      # limits, CAN-FD lat-accel cap), so every stock safety property is preserved. Freshness-guarded:
+      # a stale/absent model falls back to the pure desired curvature.
+      desired_curvature = actuators.curvature
+      if self._pcblend_enabled and CC.latActive and CS.out.vEgoRaw > PC_BLEND_MIN_V:
+        try:
+          self._pcblend_sm.update(0)
+          model = self._pcblend_sm['modelV2']
+          lane_changing = model.meta.laneChangeState in (1, 2, 3)  # preLaneChange/Starting/Finishing
+          if (self._pcblend_sm.alive['modelV2'] and not lane_changing
+              and len(model.orientationRate.z) >= 17):
+            curvatures = np.array(model.orientationRate.z) / CS.out.vEgoRaw
+            predicted = float(np.interp(PC_BLEND_LOOKUP_S, self._pcblend_tidxs, curvatures))
+            desired_curvature = predicted * PC_BLEND_RATIO + desired_curvature * (1.0 - PC_BLEND_RATIO)
+        except Exception:
+          pass
+
       # Bronco and some other cars consistently overshoot curv requests
       # Apply some deadzone + smoothing convergence to avoid oscillations
       if self.CP.carFingerprint in (CAR.FORD_BRONCO_SPORT_MK1, CAR.FORD_F_150_MK14):
-        self.anti_overshoot_curvature_last = anti_overshoot(actuators.curvature, self.anti_overshoot_curvature_last, CS.out.vEgoRaw)
+        self.anti_overshoot_curvature_last = anti_overshoot(desired_curvature, self.anti_overshoot_curvature_last, CS.out.vEgoRaw)
         apply_curvature = self.anti_overshoot_curvature_last
       else:
-        apply_curvature = actuators.curvature
+        apply_curvature = desired_curvature
 
       # apply rate limits, curvature error limit, and clip to signal range
       current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
