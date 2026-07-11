@@ -37,6 +37,12 @@
 #define SAFETY_MG 35U
 #define SAFETY_TESLA_LEGACY 36U
 
+// BluePilot: Ford safety debug — printf in libsafety/safety.c only; no-op on panda (no libc printf)
+#ifndef FORD_SAFETY_DBG
+#define FORD_SAFETY_DBG(...) ((void)0)
+#endif
+// End BluePilot
+
 #define GET_BIT(msg, b) ((bool)!!(((msg)->data[((b) / 8U)] >> ((b) % 8U)) & 0x1U))
 #define GET_FLAG(value, mask) (((value) & (mask)) == (mask))
 

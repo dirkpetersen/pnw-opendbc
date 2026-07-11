@@ -4,6 +4,7 @@ from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
+from opendbc.car.ford import fordcan_pnw  # fordsafety2pnw: BluePilot 4-signal lateral builders
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 from opendbc.car.pnw_vehicle import PnwVehicle
@@ -91,10 +92,27 @@ class CarController(CarControllerBase):
     # earlier on turn exit — fixes the post-curve wind-up that threw the truck left onto straights
     # (driver report 2026-07-11). Guarded imports: bare opendbc checkout -> blend off, pure stock.
     veh = PnwVehicle(CP)  # capability view — no fingerprint checks in feature code (driver directive)
-    self._pcblend_enabled = veh.pc_blend
+
+    # fordsafety2pnw: BluePilot's (alan-polk) full 4-signal lateral control (LateralCurvExt).
+    # REQUIRES the matching 4-signal ford.h panda safety from this branch — with STOCK ford safety
+    # the nonzero curvature_rate would be blocked on the bus and lateral would go dead, so this
+    # capability must only ship together with the panda rebuild. Guarded imports: on a bare opendbc
+    # checkout (no cereal / modeld constants) construction fails and we fall back to the stock
+    # curvature-only path below. When active, LateralCurvExt OWNS lateral: it contains its own
+    # predicted-curvature blend and human-turn reset, so the standalone pc_blend/ht_reset helpers
+    # below are bypassed to avoid double-applying them.
+    self._latext = None
+    if veh.four_signal_lat:
+      try:
+        from opendbc.car.ford.lateral_curv_pnw import LateralCurvExt
+        self._latext = LateralCurvExt(CP)
+      except Exception:
+        self._latext = None
+
+    self._pcblend_enabled = veh.pc_blend and self._latext is None
     # fordlat_pnw human-turn reset (see fordlat_pnw.py) — guarded like everything else
     self._htreset = None
-    if veh.ht_reset:
+    if veh.ht_reset and self._latext is None:
       try:
         from opendbc.car.ford.fordlat_pnw import HumanTurnHold
         self._htreset = HumanTurnHold()
@@ -156,6 +174,11 @@ class CarController(CarControllerBase):
   def update(self, CC, CS, now_nanos):
     can_sends = []
 
+    # fordsafety2pnw: BluePilot updates SubMaster (modelV2/liveParameters/selfdriveState/radarState)
+    # and the vehicle model every frame, before the lateral step
+    if self._latext is not None:
+      self._latext.update_sm()
+
     actuators = CC.actuators
     hud_control = CC.hudControl
 
@@ -186,7 +209,31 @@ class CarController(CarControllerBase):
 
     ### lateral control ###
     # send steer msg at 20Hz
-    if (self.frame % CarControllerParams.STEER_STEP) == 0:
+    if (self.frame % CarControllerParams.STEER_STEP) == 0 and self._latext is not None:
+      # fordsafety2pnw: BluePilot 4-signal lateral path (curvature, curvature_rate, path_offset,
+      # path_angle) — LateralCurvExt OWNS lateral here (own predicted blend + human-turn reset;
+      # the standalone pc_blend/ht_reset helpers are disabled in __init__ when this is active).
+      # BluePilot: do not run apply_ford_curvature_limits here or overwrite apply_curvature_last
+      # before LateralCurvExt.update. Panda rate-checks desired_curvature vs the last TX on the
+      # bus; that must match the prior frame's lat.apply_curvature only (not an intermediate
+      # stock-limited value).
+      lat = self._latext.update(CC, CS, actuators, self.apply_curvature_last, self.CP)
+      self.apply_curvature_last = lat.apply_curvature
+
+      if self.CP.flags & FordFlags.CANFD:
+        mode = 1 if CC.latActive else 0
+        counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
+        can_sends.append(fordcan_pnw.create_lat_ctl2_msg(
+          self.packer, self.CAN, mode, lat.ramp_type, lat.precision_type,
+          -lat.path_offset, -lat.path_angle, -lat.apply_curvature, -lat.curvature_rate, counter
+        ))
+      else:
+        can_sends.append(fordcan_pnw.create_lat_ctl_msg(
+          self.packer, self.CAN, CC.latActive, lat.ramp_type, lat.precision_type,
+          -lat.path_offset, -lat.path_angle, -lat.apply_curvature, -lat.curvature_rate
+        ))
+
+    elif (self.frame % CarControllerParams.STEER_STEP) == 0:
       # fordlat2pnw: blend the model's PREDICTED curvature (0.2 s lookahead, leads the planner) into
       # the desired curvature at BluePilot's default 40/60 ratio. The blended value flows through the
       # UNCHANGED stock pipeline below (anti_overshoot n/a for Lightning, curvature-error clip, rate
