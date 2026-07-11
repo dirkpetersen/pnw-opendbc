@@ -28,3 +28,11 @@ class PnwVehicle:
     # human-turn reset (fordlat_pnw.HumanTurnHold): flush commanded curvature during a sustained
     # manual turn so release ramps from ~0 (kills the post-override other-lane lurch)
     self.ht_reset: bool = fp == "FORD_F_150_LIGHTNING_MK1"
+
+    # fordsafety2pnw: BluePilot (alan-polk) 4-signal lateral control (curvature + curvature_rate +
+    # path_offset + path_angle via LateralCurvExt). REQUIRES the matching 4-signal panda safety
+    # (opendbc/safety/modes/ford.h from the fordsafety2pnw port) — with stock ford safety the
+    # nonzero curvature_rate would be blocked and lateral would go dead. When this path is active
+    # it OWNS lateral: LateralCurvExt has its own predicted-curvature blend and human-turn reset,
+    # so the standalone pc_blend / ht_reset helpers are bypassed by the carcontroller.
+    self.four_signal_lat: bool = fp == "FORD_F_150_LIGHTNING_MK1"
