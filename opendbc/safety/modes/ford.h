@@ -536,8 +536,18 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
 
     // Reset latch: activate when both curvature and path_angle are zero (reset/neutral state)
     // This allows smooth ramp-up after human turn detection without blocked messages
-    if ((desired_curvature == 0) && (desired_path_angle == 0)) {
-      // Reset detected, activate latch for ramp period
+    // pnw-hardening (2026-07-11): the reset latch is gated on controls_allowed. Its only legitimate
+    // job is to relax rate-of-change checks during the human-turn-reset ramp, which ALWAYS happens
+    // while engaged. BluePilot's original set violation=false unconditionally, and because openpilot
+    // sends neutral (curvature==0 && path_angle==0) frames continuously WHILE DISENGAGED, the latch
+    // was ~permanently armed when disengaged -> a full bypass of controls_allowed (a buggy process
+    // could steer while "off" and the panda would allow it). Forcing the counter to 0 whenever
+    // !controls_allowed makes the disengaged-steering block fully enforced again, with ZERO loss of
+    // the engaged ramp behavior. (Proven by test_reset_latch_blocked_when_disengaged.)
+    if (!controls_allowed) {
+      reset_bypass_latch_counter = 0;                        // disengaged: latch inert, full checks
+    } else if ((desired_curvature == 0) && (desired_path_angle == 0)) {
+      // Reset detected, activate latch for ramp period (engaged only)
       reset_bypass_latch_counter = RESET_BYPASS_LATCH_DURATION;
       violation = false;  // Immediate bypass for reset state
     } else if (reset_bypass_latch_counter > 0) {
@@ -639,8 +649,18 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
 
     // Reset latch: activate when both curvature and path_angle are zero (reset/neutral state)
     // This allows smooth ramp-up after human turn detection without blocked messages
-    if ((desired_curvature == 0) && (desired_path_angle == 0)) {
-      // Reset detected, activate latch for ramp period
+    // pnw-hardening (2026-07-11): the reset latch is gated on controls_allowed. Its only legitimate
+    // job is to relax rate-of-change checks during the human-turn-reset ramp, which ALWAYS happens
+    // while engaged. BluePilot's original set violation=false unconditionally, and because openpilot
+    // sends neutral (curvature==0 && path_angle==0) frames continuously WHILE DISENGAGED, the latch
+    // was ~permanently armed when disengaged -> a full bypass of controls_allowed (a buggy process
+    // could steer while "off" and the panda would allow it). Forcing the counter to 0 whenever
+    // !controls_allowed makes the disengaged-steering block fully enforced again, with ZERO loss of
+    // the engaged ramp behavior. (Proven by test_reset_latch_blocked_when_disengaged.)
+    if (!controls_allowed) {
+      reset_bypass_latch_counter = 0;                        // disengaged: latch inert, full checks
+    } else if ((desired_curvature == 0) && (desired_path_angle == 0)) {
+      // Reset detected, activate latch for ramp period (engaged only)
       reset_bypass_latch_counter = RESET_BYPASS_LATCH_DURATION;
       violation = false;  // Immediate bypass for reset state
     } else if (reset_bypass_latch_counter > 0) {

@@ -380,18 +380,29 @@ class TestFordSafetyBase(common.CarSafetyTest):
                   curv0 = self._curv_can(curvature) == 0
                   pa0 = self._path_angle_can(path_angle) == 0
                   po0 = self._path_offset_can(path_offset) == 0
+                  cr0 = self._curvature_rate_can(curvature_rate) == 0
 
-                  if curv0 and pa0:
-                    # reset frame: always allowed, arms the bypass latch
+                  # pnw-hardened latch: the reset-frame bypass is ENGAGED-ONLY. When disengaged the
+                  # latch is inert and each frame is judged by the normal per-signal checks (stock
+                  # semantics): only an all-zero steer command is allowed while controls_allowed=False.
+                  if curv0 and pa0 and controls_allowed:
+                    # reset frame while engaged: bypass all checks, arms the 60-frame latch
                     should_tx = True
                     latch_armed = True
                   elif not steer_control_enabled:
-                    should_tx = False
-                  else:
-                    should_tx = controls_allowed and pa0 and po0
-                    # Only CAN FD has the max lateral acceleration limit
+                    # steer request off: the frame must be FULLY neutral (all four signals zero);
+                    # any nonzero signal is a malformed off-frame and is blocked
+                    should_tx = curv0 and pa0 and po0 and cr0
+                  elif controls_allowed:
+                    # steer on, engaged: path_angle & path_offset within ROC-of-0 (only ~0 passes),
+                    # curvature within the CAN FD lat-accel limit, curvature_rate unbounded
+                    should_tx = pa0 and po0
                     if self.STEER_MESSAGE == MSG_LateralMotionControl2:
                       should_tx = should_tx and abs(curvature) <= curvature_accel_limit_upper
+                  else:
+                    # steer on, DISENGAGED: requesting steer control while not engaged is illegal
+                    # regardless of the commanded values -> always blocked (the closed hole)
+                    should_tx = False
 
                   with self.subTest(controls_allowed=controls_allowed, steer_control_enabled=steer_control_enabled,
                                     path_offset=float(path_offset), path_angle=float(path_angle), curvature_rate=float(curvature_rate),
@@ -471,26 +482,44 @@ class TestFordSafetyBase(common.CarSafetyTest):
   # BluePilot shipped NO test coverage for these paths (its test_ford.py is the stock suite);
   # these tests were written for the pnw port to pin the ported behavior exactly as compiled.
   def test_reset_latch_behavior(self):
-    """Pin the reset-bypass latch semantics of the ported ford.h.
-    A frame with curvature == 0 and path_angle == 0 always TXes — even with
-    controls_allowed=False (a real hole in the ported safety, pinned deliberately so any
-    change to it is explicit) — and arms a 60-frame bypass during which otherwise-violating
-    frames also TX."""
+    """Reset-bypass latch, pnw-hardened: gated on controls_allowed. While ENGAGED, a neutral frame
+    (curvature==0, path_angle==0) arms a 60-frame window in which otherwise-rate-violating frames
+    still TX (the human-turn-reset ramp). The latch preserves BluePilot's engaged behavior exactly."""
     self._drain_reset_latch()
     speed = 5.
     self._reset_curvature_measurement(0, speed)
-    self.safety.set_controls_allowed(False)
+    self.safety.set_controls_allowed(True)
 
-    # otherwise-violating frame is blocked with the latch drained
+    # otherwise-violating frame blocked with the latch drained
     self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.2, 0.01, 0)))
-
-    # reset frame: allowed despite controls_allowed=False, arms the latch
+    # reset frame arms the latch
     self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0, 0, 0)))
-
-    # violating frames pass for exactly RESET_BYPASS_LATCH_DURATION frames
+    # violating frames pass for exactly RESET_BYPASS_LATCH_DURATION frames, then blocked
     for _ in range(self.RESET_BYPASS_LATCH_DURATION):
       self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0.2, 0.01, 0)))
-    # then are blocked again
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.2, 0.01, 0)))
+
+  def test_reset_latch_blocked_when_disengaged(self):
+    """ANTI-HOLE (pnw-hardening 2026-07-11): the latch must NEVER bypass the disengaged-steering
+    block. With controls_allowed=False, neutral frames do NOT arm the latch, and a nonzero steer
+    command is blocked — even immediately after neutral frames (the exact sequence openpilot emits
+    while disengaged). This is the panda's core guarantee; regressing it re-opens the controls_allowed
+    bypass BluePilot shipped."""
+    self._drain_reset_latch()
+    self._reset_curvature_measurement(0, 5.)
+
+    # arm the latch while ENGAGED, then disengage — the stale window must not carry over
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0, 0, 0)))       # arms latch
+    self.safety.set_controls_allowed(False)
+
+    # neutral frames while disengaged (what openpilot sends) must NOT re-arm a bypass
+    for _ in range(5):
+      self._tx(self._lat_ctl_msg(True, 0, 0, 0, 0))
+    # a nonzero steer command while disengaged is BLOCKED, latch or no latch
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.2, 0.01, 0)))
+    # and again right after another neutral frame (no arming path exists while disengaged)
+    self._tx(self._lat_ctl_msg(True, 0, 0, 0, 0))
     self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.2, 0.01, 0)))
 
   def test_path_angle_limits(self):
