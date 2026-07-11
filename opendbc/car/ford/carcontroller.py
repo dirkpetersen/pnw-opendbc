@@ -344,9 +344,22 @@ class CarController(CarControllerBase):
 
     if (self.frame % CarControllerParams.ACC_UI_STEP) == 0 or send_ui:
       show_distance_bars = self.frame - self.distance_bar_frame < 400
-      can_sends.append(fordcan.create_acc_ui_msg(self.packer, self.CAN, self.CP, main_on, CC.latActive,
-                                                 fcw_alert, CS.out.cruiseState.standstill, show_distance_bars,
-                                                 hud_control, CS.acc_tja_status_stock_values))
+      if self._latext is not None:
+        # fordlat2pnw/hud: 4-signal path -> BluePilot rich cluster messaging. BlueCruise blue display
+        # + DM-state-driven TJA warning/text (Resume Control / Cancelled / hands prompts / lane
+        # departure) computed from selfdriveState.alertType (already subscribed by LateralCurvExt).
+        # Display-only, ACCDATA_3 (0x18A) is TX-allowlisted -> no safety surface.
+        standstill = CS.out.cruiseState.standstill
+        alert_type = self._latext.ss.alertType if getattr(self._latext, 'ss', None) is not None else ""
+        _tja_msg, _tja_warn, _hands = fordcan_pnw.compute_dm_msg_values(
+          alert_type, hud_control, True, main_on, standstill)
+        can_sends.append(fordcan_pnw.create_acc_ui_msg(self.packer, self.CAN, self.CP, main_on,
+          CC.latActive, fcw_alert, standstill, hud_control, CS.acc_tja_status_stock_values,
+          True, send_ui, show_distance_bars, _tja_warn, _tja_msg))
+      else:
+        can_sends.append(fordcan.create_acc_ui_msg(self.packer, self.CAN, self.CP, main_on, CC.latActive,
+                                                   fcw_alert, CS.out.cruiseState.standstill, show_distance_bars,
+                                                   hud_control, CS.acc_tja_status_stock_values))
 
     self.main_on_last = main_on
     self.lkas_enabled_last = CC.latActive

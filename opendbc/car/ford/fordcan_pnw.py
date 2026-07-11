@@ -82,6 +82,59 @@ def create_lat_ctl2_msg(packer, CAN: CanBus, mode: int, ramp_type: int, precisio
   return packer.make_can_msg("LateralMotionControl2", CAN.main, values)
 
 
+# fordlat2pnw/hud (BluePilot alan-polk compute_dm_msg_values + get_dm_state, ported 1:1) — maps
+# selfdriveState.alertType to the Ford cluster's TJA warning/message signals so BlueCruise-mode
+# alerts ("Resume Control", "Cancelled", hands-on prompts, lane-departure) render in the cluster.
+# Display-only (ACCDATA_3 0x18A, TX-allowlisted). Returns (tja_msg, tja_warn, hands).
+def get_dm_state(d_state, main_on):
+  e = str(d_state or "").split("/")
+  if main_on:
+    return e[0], e[-1]
+  return "none", "none"
+
+
+def compute_dm_msg_values(alert_type, hud_control, send_hands_free_cluster_msg, main, standstill=False):
+  tja_msg = 0
+  tja_warn = 0
+  hands = 0
+  driverState, disableState = get_dm_state(alert_type, main)
+
+  if send_hands_free_cluster_msg:
+    if disableState == "noEntry":
+      tja_msg = 1
+    elif (driverState in ("driverDistracted", "driverUnresponsive") or
+          disableState in ("softDisable", "immediateDisable")):
+      tja_warn = 3   # Resume Control
+    elif disableState == "userDisable":
+      tja_warn = 1   # Cancelled
+    elif driverState == "preDriverDistracted":
+      hands = 1
+    elif driverState == "promptDriverDistracted":
+      hands = 2 if not standstill else 1
+    elif driverState == "preDriverUnresponsive":
+      hands = 1
+    elif driverState == "promptDriverUnresponsive":
+      hands = 2 if not standstill else 1
+    elif hud_control.leftLaneDepart:
+      tja_warn = 5
+    elif hud_control.rightLaneDepart:
+      tja_warn = 4
+  else:
+    if disableState == "noEntry":
+      tja_msg = 1
+    elif (driverState in ("driverDistracted", "driverUnresponsive") or
+          disableState in ("softDisable", "immediateDisable")):
+      tja_warn = 3
+    elif disableState == "userDisable":
+      tja_warn = 1
+    elif driverState in ("preDriverDistracted", "preDriverUnresponsive"):
+      hands = 1
+    elif driverState in ("promptDriverDistracted", "promptDriverUnresponsive"):
+      hands = 2 if not standstill else 1
+
+  return tja_msg, tja_warn, hands
+
+
 def create_acc_ui_msg(packer, CAN: CanBus, CP, main_on: bool, enabled: bool, fcw_alert: bool,
                       standstill: bool, hud_control, stock_values: dict, send_hands_free_msg: bool,
                       send_ui: bool, send_bars: bool, tja_warn: int, tja_msg: int):
