@@ -367,9 +367,12 @@ class CarController(CarControllerBase):
     self.lead_distance_bars_last = hud_control.leadDistanceBars
 
     new_actuators = actuators.as_builder()
-    new_actuators.curvature = self.apply_curvature_last
-    new_actuators.accel = self.accel
-    new_actuators.gas = self.gas
+    # fordsafety2pnw: float() casts are BluePilot's, not optional — the 4-signal LateralCurvExt
+    # math returns numpy.float64 (np.clip/np.interp), and capnp setters reject numpy types
+    # (KjException "unsupported type"). Without the cast, card dies the moment lateral engages.
+    new_actuators.curvature = float(self.apply_curvature_last)
+    new_actuators.accel = float(self.accel)
+    new_actuators.gas = float(self.gas)
 
     self.frame += 1
     return new_actuators, can_sends
