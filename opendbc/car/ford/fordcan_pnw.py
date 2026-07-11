@@ -223,3 +223,28 @@ def create_acc_ui_msg(packer, CAN: CanBus, CP, main_on: bool, enabled: bool, fcw
     values["FcwAudioWarn_B_Rq"] = 1  # FCW audio alert
 
   return packer.make_can_msg("ACCDATA_3", CAN.main, values)
+
+
+def create_acc_msg(packer, CAN: CanBus, long_active: bool, gas: float, accel: float, accel_pred: float,
+                   stopping: bool, brake_actuate: bool, precharge_actuate: bool, v_ego_kph: float):
+  """
+  Creates a CAN message for the Ford ACC Command (BluePilot extension, ported 1:1).
+
+  vs stock create_acc_msg: brake control split into brake_actuate and precharge_actuate
+  (independent hysteresis, precharge engages slightly before full brake for smoother initial
+  decel) and accel_pred passed in instead of the stock hardcoded -5.0.
+
+  Frequency is 50Hz.
+  """
+  values = {
+    "AccBrkTot_A_Rq": accel,                           # Brake total accel request: [-20|11.9449] m/s^2
+    "Cmbb_B_Enbl": 1 if long_active else 0,            # Enabled: 0=No, 1=Yes
+    "AccPrpl_A_Rq": gas,                               # Acceleration request: [-5|5.23] m/s^2
+    "AccPrpl_A_Pred": accel_pred,                      # Predicted accel (parameter, not hardcoded)
+    "AccResumEnbl_B_Rq": 1 if long_active else 0,
+    "AccVeh_V_Trg": v_ego_kph,                         # Target speed: [0|255] km/h
+    "AccBrkPrchg_B_Rq": 1 if precharge_actuate else 0, # Pre-charge brake request
+    "AccBrkDecel_B_Rq": 1 if brake_actuate else 0,     # Deceleration request
+    "AccStopStat_B_Rq": 1 if stopping else 0,
+  }
+  return packer.make_can_msg("ACCDATA", CAN.main, values)

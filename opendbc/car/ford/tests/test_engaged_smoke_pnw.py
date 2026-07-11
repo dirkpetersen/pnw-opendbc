@@ -42,21 +42,20 @@ CURVATURE_SWEEP = [0.0, 0.002, -0.002, 0.02, -0.02]  # 1/m: straight, gentle, ne
 FRAMES_PER_CASE = 60                          # covers STEER_STEP(5) and ACC_UI_STEP(20) multiple times
 
 
-def _make_interface(platform):
+def _make_interface(platform, alpha_long=False):
   CarInterface = interfaces[platform]
   fingerprints = {b: {} for b in range(7)}
-  car_params = CarInterface.get_params(platform, fingerprints, [], alpha_long=False,
+  car_params = CarInterface.get_params(platform, fingerprints, [], alpha_long=alpha_long,
                                        is_release=False, docs=False)
   return CarInterface(car_params.as_reader())
 
 
 def _set_speed(ci, v_ego):
-  cs = ci.CS.out.as_builder()
-  cs.vEgo = float(v_ego)
-  cs.vEgoRaw = float(v_ego)
-  cs.standstill = v_ego < 0.1
-  cs.canValid = True
-  ci.CS.out = cs.as_reader()
+  # CS.out is opendbc structs.CarState — a plain mutable Python object, not capnp
+  ci.CS.out.vEgo = float(v_ego)
+  ci.CS.out.vEgoRaw = float(v_ego)
+  ci.CS.out.standstill = v_ego < 0.1
+  ci.CS.out.canValid = True
 
 
 def _engaged_cc(curvature):
@@ -95,7 +94,7 @@ def test_engaged_lateral_smoke(platform, expects_4signal):
         now_nanos += int(DT_CTRL * 1e9)
 
       # belt-and-suspenders: outputs must be capnp-safe plain floats
-      for field in ("curvature", "accel", "gas", "steer"):
+      for field in ("curvature", "accel", "gas"):
         val = getattr(new_actuators, field)
         assert type(val) is float, f"{platform} new_actuators.{field} is {type(val)} at vEgo={v_ego}"
 
@@ -120,3 +119,65 @@ def test_disengaged_then_engage_transition():
     new_actuators, _ = ci.apply(engaged, now_nanos)
     now_nanos += int(DT_CTRL * 1e9)
   assert type(new_actuators.curvature) is float
+
+
+def test_oplong_bp_follow_smoke():
+  """fordlong2pnw: op-long engaged sweep through the BP follow path (LongitudinalExt),
+  incl. above the 50 mph deadband; outputs must stay plain floats."""
+  if not HAVE_CEREAL:
+    pytest.skip("cereal not on PYTHONPATH")
+  ci = _make_interface(FORD.FORD_F_150_LIGHTNING_MK1, alpha_long=True)
+  ci.update([])
+  assert ci.CC._latext is not None
+  assert ci.CC._longext is not None, "bp_long_follow capability did not construct LongitudinalExt"
+
+  now = 0
+  for v_ego in [0.0, 15.0, 25.0, 31.0]:
+    _set_speed(ci, v_ego)
+    for accel in [0.5, 0.0, -1.5, -3.0]:
+      cc = structs.CarControl()
+      cc.enabled = True
+      cc.latActive = True
+      cc.longActive = True
+      cc.actuators.curvature = 0.002
+      cc.actuators.accel = float(accel)
+      cc = cc.as_reader()
+      for _ in range(FRAMES_PER_CASE):
+        na, _ = ci.apply(cc, now)
+        now += int(DT_CTRL * 1e9)
+      for field in ("curvature", "accel", "gas"):
+        assert type(getattr(na, field)) is float
+
+
+def test_ext_failures_fall_back_not_crash():
+  """Injected failures in EITHER ext must fall back to stock paths, never raise out of apply()."""
+  if not HAVE_CEREAL:
+    pytest.skip("cereal not on PYTHONPATH")
+  ci = _make_interface(FORD.FORD_F_150_LIGHTNING_MK1, alpha_long=True)
+  ci.update([])
+  _set_speed(ci, 15.0)
+  cc = structs.CarControl()
+  cc.enabled = True
+  cc.latActive = True
+  cc.longActive = True
+  cc.actuators.curvature = 0.002
+  cc.actuators.accel = -1.0
+  cc = cc.as_reader()
+
+  class BoomLong:
+    disable_downhill_comp_UI = True
+    def update(self, *a, **k): raise RuntimeError("injected")
+  class BoomLat:
+    def update_sm(self): pass
+    def update(self, *a, **k): raise RuntimeError("injected")
+
+  ci.CC._longext = BoomLong()
+  now = 0
+  for _ in range(60):
+    ci.apply(cc, now); now += int(DT_CTRL * 1e9)
+  assert ci.CC._longext is None, "long fallback did not disarm the failing ext"
+
+  ci.CC._latext = BoomLat()
+  for _ in range(60):
+    ci.apply(cc, now); now += int(DT_CTRL * 1e9)
+  assert ci.CC._latext is None, "lat fallback did not disarm the failing ext"

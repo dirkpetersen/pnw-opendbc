@@ -111,6 +111,17 @@ class CarController(CarControllerBase):
         self._latext = None
 
     self._pcblend_enabled = veh.pc_blend and self._latext is None
+
+    # fordlong2pnw: BluePilot highway follow control. Needs the radarState SubMaster that
+    # LateralCurvExt owns, so it activates only alongside a live 4-signal path; falls back to
+    # the stock ACC message on any failure (same never-kill-card policy as lateral).
+    self._longext = None
+    if veh.bp_long_follow and self._latext is not None:
+      try:
+        from opendbc.car.ford.longitudinal_ext_pnw import LongitudinalExt
+        self._longext = LongitudinalExt()
+      except Exception:
+        self._longext = None
     # fordlat_pnw human-turn reset (see fordlat_pnw.py) — guarded like everything else
     self._htreset = None
     if veh.ht_reset and self._latext is None:
@@ -338,11 +349,34 @@ class CarController(CarControllerBase):
         self.brake_request = True
 
       stopping = CC.actuators.longControlState == LongCtrlState.stopping
-      # TODO: look into using the actuators packet to send the desired speed
-      can_sends.append(fordcan.create_acc_msg(self.packer, self.CAN, CC.longActive, gas, accel, stopping, self.brake_request, v_ego_kph=V_CRUISE_MAX))
 
-      self.accel = accel
-      self.gas = gas
+      lng = None
+      if self._longext is not None and self._latext is not None:
+        # fordlong2pnw: BP follow control on top of the stock-processed accel/gas. Downhill
+        # clamp applied here per BP (disable_downhill_comp_UI default): negative pitch -> 0.
+        try:
+          pitch_for_bp = accel_due_to_pitch
+          if self._longext.disable_downhill_comp_UI and pitch_for_bp < 0:
+            pitch_for_bp = 0.0
+          lng = self._longext.update(CC, CS, self._latext.sm, accel, gas, pitch_for_bp,
+                                     CS.out.vEgo * 2.23694, stopping, V_CRUISE_MAX)
+        except Exception:
+          carlog.exception("LongitudinalExt failed — falling back to stock long for this drive")
+          self._longext = None
+          lng = None
+
+      if lng is not None:
+        can_sends.append(fordcan_pnw.create_acc_msg(
+          self.packer, self.CAN, CC.longActive, lng.gas, lng.accel, lng.accel_pred_send,
+          lng.stopping, lng.brake_actuate, lng.precharge_actuate, v_ego_kph=lng.target_speed))
+        self.accel = lng.accel
+        self.gas = lng.gas
+      else:
+        # TODO: look into using the actuators packet to send the desired speed
+        can_sends.append(fordcan.create_acc_msg(self.packer, self.CAN, CC.longActive, gas, accel, stopping, self.brake_request, v_ego_kph=V_CRUISE_MAX))
+
+        self.accel = accel
+        self.gas = gas
 
     ### ui ###
     send_ui = (self.main_on_last != main_on) or (self.lkas_enabled_last != CC.latActive) or (self.steer_alert_last != steer_alert)

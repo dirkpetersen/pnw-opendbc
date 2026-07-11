@@ -36,3 +36,8 @@ class PnwVehicle:
     # it OWNS lateral: LateralCurvExt has its own predicted-curvature blend and human-turn reset,
     # so the standalone pc_blend / ht_reset helpers are bypassed by the carcontroller.
     self.four_signal_lat: bool = fp == "FORD_F_150_LIGHTNING_MK1"
+
+    # fordlong2pnw: BluePilot (alan-polk) highway follow control (LongitudinalExt) — shapes
+    # gas/accel by lead state above ~50 mph, split brake/precharge hysteresis. Only meaningful
+    # when openpilot owns longitudinal, so gate on op_long: inert until Alpha Long is enabled.
+    self.bp_long_follow: bool = self.op_long and fp == "FORD_F_150_LIGHTNING_MK1"
