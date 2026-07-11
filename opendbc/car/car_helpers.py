@@ -1,3 +1,4 @@
+import json
 import os
 import time
 
@@ -37,6 +38,27 @@ def _get_interface_names() -> dict[str, list[str]]:
 # imports from directory opendbc/car/<name>/
 interface_names = _get_interface_names()
 interfaces = load_interfaces(interface_names)
+
+
+# pnw: fleet identity fallback — config lives ON-DEVICE ONLY (VINs are personal data, never in the
+# repo): /data/pnw/fleet_vins.json (mode 600), shape:
+#   {"vins": {"<17-char VIN>": "<PLATFORM>"}, "no_vin_platform": "<PLATFORM>"}
+# "vins": VIN -> platform. A vendor OTA reflashes modules and changes their FW part-number strings,
+#   breaking exact FW matching (the 2025 Lightning is exact-match-only: its EPS answers no Ford
+#   platform-code query, so fuzzy matching can never rescue it). The VIN never changes.
+# "no_vin_platform": two-car-fleet inference — when everything failed AND the live-queried VIN reads
+#   UNKNOWN, assume the fleet car whose VIN is unreadable over CAN (the Tesla Raven).
+# Missing/unparseable file, or a platform name not in `interfaces` -> stock behavior (MOCK).
+PNW_FLEET_FILE = "/data/pnw/fleet_vins.json"
+
+
+def pnw_fleet_config() -> dict:
+  try:
+    with open(PNW_FLEET_FILE) as f:
+      cfg = json.load(f)
+    return cfg if isinstance(cfg, dict) else {}
+  except Exception:
+    return {}
 
 
 def can_fingerprint(can_recv: CanRecvCallable) -> tuple[str | None, dict[int, dict]]:
@@ -136,6 +158,24 @@ def fingerprint(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_mu
     car_fingerprint = list(fw_candidates)[0]
     source = CarParams.FingerprintSource.fw
     exact_match = exact_fw_match
+
+  # pnw: fleet identity fallback — fires only when FW matching AND CAN fingerprinting both came up
+  # empty (post-vendor-OTA FW churn), and only on a LIVE-queried VIN: a cached VIN could be stale
+  # from the other fleet car after a device swap and must never label this one (Gemini review catch;
+  # CarParamsCache is CLEAR_ON_MANAGER_START so cache can't cross a swap anyway — belt and braces).
+  # Logged loudly so a fallback hit is visible and the new FW strings get captured + added to
+  # fingerprints.py (see pnw-pilot-deploy skill, vendor-OTA recipe).
+  if car_fingerprint is None and not cached:
+    fleet = pnw_fleet_config()
+    fallback = fleet.get("vins", {}).get(vin) if vin != VIN_UNKNOWN else fleet.get("no_vin_platform")
+    if fallback is not None and fallback in interfaces:
+      car_fingerprint = fallback
+      source = CarParams.FingerprintSource.fixed
+      exact_match = True
+      carlog.error({"event": "PNW fleet identity fallback", "vin": vin, "car_fingerprint": car_fingerprint,
+                    "fw_count": len(car_fw)})
+    elif fallback is not None:
+      carlog.error({"event": "PNW fleet fallback IGNORED - unknown platform in fleet_vins.json", "platform": str(fallback)})
 
   if fixed_fingerprint:
     car_fingerprint = fixed_fingerprint
