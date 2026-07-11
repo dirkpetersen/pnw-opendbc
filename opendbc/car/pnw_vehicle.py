@@ -24,3 +24,7 @@ class PnwVehicle:
     # predicted-curvature blend (fordlat2pnw): Ford curvature-only lateral cars where the
     # BluePilot-derived turn-exit blend is validated
     self.pc_blend: bool = fp == "FORD_F_150_LIGHTNING_MK1"
+
+    # human-turn reset (fordlat_pnw.HumanTurnHold): flush commanded curvature during a sustained
+    # manual turn so release ramps from ~0 (kills the post-override other-lane lurch)
+    self.ht_reset: bool = fp == "FORD_F_150_LIGHTNING_MK1"

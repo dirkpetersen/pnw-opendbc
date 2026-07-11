@@ -92,6 +92,14 @@ class CarController(CarControllerBase):
     # (driver report 2026-07-11). Guarded imports: bare opendbc checkout -> blend off, pure stock.
     veh = PnwVehicle(CP)  # capability view — no fingerprint checks in feature code (driver directive)
     self._pcblend_enabled = veh.pc_blend
+    # fordlat_pnw human-turn reset (see fordlat_pnw.py) — guarded like everything else
+    self._htreset = None
+    if veh.ht_reset:
+      try:
+        from opendbc.car.ford.fordlat_pnw import HumanTurnHold
+        self._htreset = HumanTurnHold()
+      except Exception:
+        self._htreset = None
     self._pcblend_sm = None
     self._pcblend_tidxs = None
     if self._pcblend_enabled:
@@ -197,6 +205,12 @@ class CarController(CarControllerBase):
             desired_curvature = predicted * PC_BLEND_RATIO + desired_curvature * (1.0 - PC_BLEND_RATIO)
         except Exception:
           pass
+
+      # fordlat_pnw human-turn reset: during a sustained manual turn, flush the COMMANDED curvature
+      # to 0 through the normal rate limiter — on release it ramps back from ~0 instead of slamming
+      # in from the value accumulated while fighting the driver (the other-lane release lurch).
+      if self._htreset is not None and self._htreset.tick(CS.out.steeringPressed, CS.out.steeringAngleDeg):
+        desired_curvature = 0.0
 
       # Bronco and some other cars consistently overshoot curv requests
       # Apply some deadzone + smoothing convergence to avoid oscillations
