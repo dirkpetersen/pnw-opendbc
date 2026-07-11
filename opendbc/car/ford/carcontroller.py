@@ -75,6 +75,45 @@ class CarController(CarControllerBase):
     self.lead_distance_bars_last = None
     self.distance_bar_frame = 0
 
+    # icbm2pnw: stock-ACC set-speed steering for the F-150 Lightning (Tier 1, no op-long). The brain
+    # (target selection from CES/VTSC curve logic) runs in the pnw layer and publishes the IcbmTarget
+    # mem-param; this side is only the closed-loop executor (see icbm_pnw.py for the safety envelope).
+    # Params import is runtime-only and guarded: on a bare opendbc checkout ICBM simply stays off.
+    self._icbm_enabled = (not CP.openpilotLongitudinalControl) and CP.carFingerprint == CAR.FORD_F_150_LIGHTNING_MK1
+    self._icbm_governor = None
+    self._icbm_cmd = None
+    self._icbm_params = None
+    if self._icbm_enabled:
+      try:
+        from openpilot.common.params import Params
+        from opendbc.car.ford.icbm_pnw import PressGovernor
+        self._icbm_params = Params("/dev/shm/params")
+        self._icbm_governor = PressGovernor()
+      except Exception:
+        self._icbm_enabled = False
+
+  def _icbm_buttons(self, CS) -> str | None:
+    """Poll the brain's target at ~4 Hz, run the executor at 100 Hz. Returns 'dec'/'inc'/None."""
+    import json
+    import time
+    from opendbc.car.ford.icbm_pnw import IcbmCommand, decide_press
+    if (self.frame % 25) == 0:  # 4 Hz mem-param read
+      try:
+        raw = self._icbm_params.get("IcbmTarget")
+        if isinstance(raw, (bytes, str)) and raw:
+          raw = json.loads(raw)
+        # params_pyx returns a dict for JSON keys; require all fields or stand down
+        if isinstance(raw, dict) and all(k in raw for k in ("target", "ceiling", "ts")):
+          self._icbm_cmd = IcbmCommand(target_ms=float(raw["target"]), ceiling_ms=float(raw["ceiling"]), ts=float(raw["ts"]))
+        else:
+          self._icbm_cmd = None
+      except Exception:
+        self._icbm_cmd = None
+    driver_override = bool(CS.out.gasPressed or CS.out.brakePressed)
+    intent = decide_press(float(CS.out.cruiseState.speed), self._icbm_cmd, time.time(),
+                          bool(CS.out.cruiseState.enabled), driver_override)
+    return self._icbm_governor.update(self.frame, intent)
+
   def update(self, CC, CS, now_nanos):
     can_sends = []
 
@@ -96,6 +135,15 @@ class CarController(CarControllerBase):
     # the stock system checks for steering pressed, and eventually disengages cruise control
     elif CS.acc_tja_status_stock_values["Tja_D_Stat"] != 0 and (self.frame % CarControllerParams.ACC_UI_STEP) == 0:
       can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.camera, CS.buttons_stock_values, tja_toggle=True))
+    # icbm2pnw: steer the STOCK ACC set speed toward the brain's target via SET +/- taps (Lightning
+    # only, never with op-long, never engages/resumes ACC — full envelope in icbm_pnw.py). Sent at
+    # the SCCM 10 Hz cadence pattern to camera+main like cancel/resume above.
+    elif self._icbm_enabled:
+      btn = self._icbm_buttons(CS)
+      if btn == "dec" and (self.frame % CarControllerParams.BUTTONS_STEP) == 0:
+        # DEC-ONLY by design (see icbm_pnw.py) — there is deliberately no set_inc send path here
+        can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.camera, CS.buttons_stock_values, set_dec=True))
+        can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.main, CS.buttons_stock_values, set_dec=True))
 
     ### lateral control ###
     # send steer msg at 20Hz
