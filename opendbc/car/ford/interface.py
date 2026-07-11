@@ -59,10 +59,17 @@ class CarInterface(CarInterfaceBase):
     if ret.flags & FordFlags.CANFD:
       ret.safetyConfigs[-1].safetyParam |= FordSafetyFlags.CANFD.value
 
-      # TRON (SecOC) platforms are not supported
-      # LateralMotionControl2, ACCDATA are 16 bytes on these platforms
-      if len(fingerprint[CAN.camera]):
-        if fingerprint[CAN.camera].get(0x3d6) != 8 or fingerprint[CAN.camera].get(0x186) != 8:
+      # TRON (SecOC) platforms are not supported.
+      # LateralMotionControl2 (0x3d6) and ACCDATA (0x186) are 16 bytes on SecOC platforms, 8 bytes
+      # otherwise. fordsecoc2pnw: flag SecOC only when a message is actually PRESENT at a non-8-byte
+      # size (the genuine TRON signature). An ABSENT message means "ADAS camera not captured within
+      # the ~1 s CAN fingerprint window" (boot/ignition race), NOT SecOC — the old `.get(addr) != 8`
+      # also matched None and intermittently dashcam-locked the F-150 Lightning with a correct
+      # fingerprint (FORD_SECOC2XNOR.md; recurred live 2026-07-11). Real SecOC cars are still caught.
+      cam = fingerprint[CAN.camera]
+      if len(cam):
+        secoc = (0x3d6 in cam and cam[0x3d6] != 8) or (0x186 in cam and cam[0x186] != 8)
+        if secoc:
           carlog.error('dashcamOnly: SecOC is unsupported')
           ret.dashcamOnly = True
     else:
