@@ -1,4 +1,5 @@
 from opendbc.car import CanBusBase, structs
+from opendbc.car.ford.values import FordFlags
 
 HUDControl = structs.CarControl.HUDControl
 
@@ -162,6 +163,12 @@ def create_acc_ui_msg(packer, CAN: CanBus, CP, main_on: bool, enabled: bool, fcw
       status = 3  # ActiveInterventionLeft
     elif hud_control.rightLaneDepart:
       status = 4  # ActiveInterventionRight
+    elif CP.flags & FordFlags.CANFD:
+      # bluecruise2pnw (driver req 2026-07-11): value 7 lights the BlueCruise BLUE engaged display
+      # on CAN-FD clusters (DBC labels it "NotUsed_1"; meaning discovered by alan-polk/BluePilot,
+      # bp commits 4d48596b51/d8284baf0e). Same allowlisted 0x18A message, payload-only — no panda
+      # change; safety never inspects Tja_D_Stat. CAN (non-FD) Fords keep 2 (bp f52678e16f).
+      status = 7  # BlueCruise blue cluster display
     else:
       status = 2  # Active
   elif main_on:
