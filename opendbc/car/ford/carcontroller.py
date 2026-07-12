@@ -150,14 +150,16 @@ class CarController(CarControllerBase):
     # Params import is runtime-only and guarded: on a bare opendbc checkout ICBM simply stays off.
     self._icbm_enabled = veh.icbm
     self._icbm_governor = None
+    self._icbm_guard = None
     self._icbm_cmd = None
     self._icbm_params = None
     if self._icbm_enabled:
       try:
         from openpilot.common.params import Params
-        from opendbc.car.ford.icbm_pnw import PressGovernor
+        from opendbc.car.ford.icbm_pnw import PressGovernor, RestoreGuard
         self._icbm_params = Params("/dev/shm/params")
         self._icbm_governor = PressGovernor()
+        self._icbm_guard = RestoreGuard()   # icbmrestore2pnw: human-detection latch for the inc path
       except Exception:
         self._icbm_enabled = False
 
@@ -173,14 +175,28 @@ class CarController(CarControllerBase):
           raw = json.loads(raw)
         # params_pyx returns a dict for JSON keys; require all fields or stand down
         if isinstance(raw, dict) and all(k in raw for k in ("target", "ceiling", "ts")):
-          self._icbm_cmd = IcbmCommand(target_ms=float(raw["target"]), ceiling_ms=float(raw["ceiling"]), ts=float(raw["ts"]))
+          # icbmrestore2pnw: optional "dir" marks a guarded restore ("inc"); anything else is a cap.
+          # An unknown value stands down entirely (fail-closed on protocol drift).
+          icbm_dir = str(raw.get("dir", "dec"))
+          if icbm_dir in ("dec", "inc"):
+            self._icbm_cmd = IcbmCommand(target_ms=float(raw["target"]), ceiling_ms=float(raw["ceiling"]),
+                                         ts=float(raw["ts"]), dir=icbm_dir)
+          else:
+            self._icbm_cmd = None
         else:
           self._icbm_cmd = None
       except Exception:
         self._icbm_cmd = None
     driver_override = bool(CS.out.gasPressed or CS.out.brakePressed)
-    intent = decide_press(float(CS.out.cruiseState.speed), self._icbm_cmd, time.time(),
+    now = time.time()
+    stock_set = float(CS.out.cruiseState.speed)
+    intent = decide_press(stock_set, self._icbm_cmd, now,
                           bool(CS.out.cruiseState.enabled), driver_override)
+    # icbmrestore2pnw: the guard runs EVERY frame while a restore command is active (it tracks the
+    # set-speed trajectory even when no press is intended) and swallows inc intents for the rest of
+    # the episode once a human touched the buttons. Caps ('dec') are never filtered.
+    restoring = self._icbm_cmd is not None and getattr(self._icbm_cmd, "dir", "dec") == "inc"
+    intent = self._icbm_guard.filter(intent, stock_set, now, restoring)
     return self._icbm_governor.update(self.frame, intent)
 
   def update(self, CC, CS, now_nanos):
@@ -215,9 +231,16 @@ class CarController(CarControllerBase):
     elif self._icbm_enabled:
       btn = self._icbm_buttons(CS)
       if btn == "dec" and (self.frame % CarControllerParams.BUTTONS_STEP) == 0:
-        # DEC-ONLY by design (see icbm_pnw.py) — there is deliberately no set_inc send path here
+        # Caps stay DEC-ONLY (see icbm_pnw.py)
         can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.camera, CS.buttons_stock_values, set_dec=True))
         can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.main, CS.buttons_stock_values, set_dec=True))
+      elif btn == "inc" and (self.frame % CarControllerParams.BUTTONS_STEP) == 0:
+        # icbmrestore2pnw: restore-only SET+ path — reachable ONLY for a brain command explicitly
+        # marked dir="inc" (return to the driver's OWN latched ceiling), ceiling-clamped in
+        # decide_press, human-latched by RestoreGuard, same 0x083 message the safety code already
+        # TX-allows (cancel/resume bits are the only checked signals) — no panda change.
+        can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.camera, CS.buttons_stock_values, set_inc=True))
+        can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.main, CS.buttons_stock_values, set_inc=True))
 
     ### lateral control ###
     # send steer msg at 20Hz
