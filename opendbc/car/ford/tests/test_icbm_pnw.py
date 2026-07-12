@@ -78,3 +78,99 @@ def test_governor_releases_when_intent_stops():
 
 def test_step_constant_matches_ford_tap():
   assert abs(STEP_MS - 1.0 * MPH_TO_MS) < 1e-9
+
+
+# ---- icbmrestore2pnw: guarded restore (inc) path ---------------------------------------------------
+from opendbc.car.ford.icbm_pnw import RestoreGuard
+
+
+def rcmd(target_mph, ceiling_mph, ts=NOW):
+  return IcbmCommand(target_ms=target_mph * MPH_TO_MS, ceiling_ms=ceiling_mph * MPH_TO_MS,
+                     ts=ts, dir="inc")
+
+
+def test_restore_inc_toward_ceiling():
+  # restoring: set 45, restore target 60 (== ceiling) -> press up
+  assert decide_press(45 * MPH_TO_MS, rcmd(60, 60), NOW, True, False) == "inc"
+
+
+def test_restore_never_above_ceiling():
+  # brain asks above the ceiling: clamped to the ceiling; at/above it -> silent
+  assert decide_press(60 * MPH_TO_MS, rcmd(75, 60), NOW, True, False) is None
+  assert decide_press(59.7 * MPH_TO_MS, rcmd(75, 60), NOW, True, False) is None  # within deadband
+  assert decide_press(55 * MPH_TO_MS, rcmd(75, 60), NOW, True, False) == "inc"   # below: only to 60
+
+
+def test_restore_command_never_decs():
+  # stock somehow ABOVE the restore target: an inc command must NOT dec (no oscillation)
+  assert decide_press(65 * MPH_TO_MS, rcmd(60, 60), NOW, True, False) is None
+
+
+def test_cap_command_never_incs():
+  # unchanged rule: a cap (dir absent/dec) never presses up even with stock below target
+  assert decide_press(45 * MPH_TO_MS, cmd(60, 60), NOW, True, False) is None
+
+
+def test_restore_gates_cruise_override_stale():
+  assert decide_press(45 * MPH_TO_MS, rcmd(60, 60), NOW, False, False) is None       # ACC off
+  assert decide_press(45 * MPH_TO_MS, rcmd(60, 60), NOW, True, True) is None         # pedals
+  assert decide_press(45 * MPH_TO_MS, rcmd(60, 60, ts=NOW - STALE_LIMIT_S - 0.1), NOW, True, False) is None
+  assert decide_press(0.0, rcmd(60, 60), NOW, True, False) is None                   # no set reported
+
+
+def test_guard_passes_own_cadence():
+  g = RestoreGuard()
+  t, s = NOW, 45 * MPH_TO_MS
+  assert g.filter("inc", s, t, True) == "inc"
+  for _ in range(5):                      # +1 mph per 0.5 s = our own tap cadence: fine
+    t += 0.5
+    s += STEP_MS
+    assert g.filter("inc", s, t, True) == "inc"
+  assert not g.blocked
+
+
+def test_guard_blocks_on_set_decrease_and_latches():
+  g = RestoreGuard()
+  g.filter("inc", 45 * MPH_TO_MS, NOW, True)
+  # driver pressed SET-: set went down while we only press up -> block, and STAY blocked
+  assert g.filter("inc", 44 * MPH_TO_MS, NOW + 0.5, True) is None
+  assert g.blocked
+  assert g.filter("inc", 45 * MPH_TO_MS, NOW + 1.0, True) is None   # still blocked this episode
+  # episode ends (silent/empty command) -> latch clears; a NEW restore episode works again
+  assert g.filter(None, 45 * MPH_TO_MS, NOW + 2.0, False) is None
+  assert not g.blocked
+  assert g.filter("inc", 45 * MPH_TO_MS, NOW + 3.0, True) == "inc"
+
+
+def test_guard_blocks_on_driver_hold_jump():
+  g = RestoreGuard()
+  g.filter("inc", 45 * MPH_TO_MS, NOW, True)
+  # +5 mph in 0.3 s: Ford SET+ hold (5 mph steps) -> a human is on the stalk -> block
+  assert g.filter("inc", 50 * MPH_TO_MS, NOW + 0.3, True) is None
+  assert g.blocked
+
+
+def test_guard_never_touches_dec():
+  g = RestoreGuard()
+  # cap phase (restoring=False): dec passes untouched regardless of set movement
+  assert g.filter("dec", 60 * MPH_TO_MS, NOW, False) == "dec"
+  assert g.filter("dec", 45 * MPH_TO_MS, NOW + 0.1, False) == "dec"
+  assert not g.blocked
+
+
+def test_guard_dec_command_clears_restore_block():
+  g = RestoreGuard()
+  g.filter("inc", 45 * MPH_TO_MS, NOW, True)
+  assert g.filter("inc", 43 * MPH_TO_MS, NOW + 0.5, True) is None    # blocked (manual dec)
+  # a NEW cap engages (dec command, restoring=False): dec passes AND the latch clears
+  assert g.filter("dec", 43 * MPH_TO_MS, NOW + 1.0, False) == "dec"
+  assert not g.blocked
+
+
+def test_governor_inc_tap_pattern_matches_dec_cadence():
+  g = PressGovernor()
+  frames = [g.update(f, "inc") for f in range(100)]
+  # discrete taps: PRESS_FRAMES asserted, then a gap of at least GAP_FRAMES
+  assert frames[:PRESS_FRAMES] == ["inc"] * PRESS_FRAMES
+  assert all(b is None for b in frames[PRESS_FRAMES:PRESS_FRAMES + GAP_FRAMES])
+  assert "inc" in frames[PRESS_FRAMES + GAP_FRAMES:]
