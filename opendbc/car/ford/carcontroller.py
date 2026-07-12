@@ -388,7 +388,13 @@ class CarController(CarControllerBase):
           self._longext = None
           lng = None
 
-      if lng is not None:
+      # fordlong2pnw hop fix (field incident 2026-07-12, city stop-and-go "hopping like a horse"):
+      # ONLY use the BP acc message (narrow -0.14/-0.06 brake hysteresis + precharge split) when BP
+      # follow control is ACTUALLY applied (bp_long_used: >50mph deadband etc.). Below the deadband
+      # the BP path previously still owned the brake bit with its narrow band -> the request
+      # flapped around gentle city decels and pulsed the brakes. Stock path = stock 0.0/0.3
+      # hysteresis, byte-identical to pre-port city behavior.
+      if lng is not None and lng.bp_long_used:
         can_sends.append(fordcan_pnw.create_acc_msg(
           self.packer, self.CAN, CC.longActive, lng.gas, lng.accel, lng.accel_pred_send,
           lng.stopping, lng.brake_actuate, lng.precharge_actuate, v_ego_kph=lng.target_speed))
