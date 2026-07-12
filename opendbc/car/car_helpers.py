@@ -130,6 +130,24 @@ def fingerprint(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_mu
       cached = False
 
     exact_fw_match, fw_candidates = match_fw_to_car(car_fw, vin)
+
+    # fpcache2pnw (2026-07-11 poisoned-cache incident): a cached FW set can be unmatchable — e.g. a
+    # partial sleepy-bus query persisted under a real-car label by the fleet fallback. Re-matching it
+    # fails deterministically on every card restart of the session (toggle onroad-cycle, ignitionCan
+    # flap), and the fleet fallback below is intentionally dead for cached VINs — so the session was
+    # doomed to MOCK even with the car fully on. Instead: fall back ONCE to a full live VIN+FW query
+    # (cached=False), which both gives exact matching a real shot and legitimately re-arms the fleet
+    # fallback on a LIVE-queried VIN (the device-swap guard is preserved). Still one-shot, still
+    # entirely inside the startup fingerprint — CarParams can never change mid-drive.
+    if cached and len(fw_candidates) == 0:
+      carlog.error({"event": "cached FW matched no candidates - falling back to live FW query",
+                    "cached_fw_count": len(car_fw), "cached_vin": vin})
+      set_obd_multiplexing(True)
+      vin_rx_addr, vin_rx_bus, vin = get_vin(can_recv, can_send, (0, 1))
+      ecu_rx_addrs = get_present_ecus(can_recv, can_send, set_obd_multiplexing, num_pandas=num_pandas)
+      car_fw = get_fw_versions_ordered(can_recv, can_send, set_obd_multiplexing, vin, ecu_rx_addrs, num_pandas=num_pandas)
+      cached = False
+      exact_fw_match, fw_candidates = match_fw_to_car(car_fw, vin)
   else:
     vin_rx_addr, vin_rx_bus, vin = -1, -1, VIN_UNKNOWN
     exact_fw_match, fw_candidates, car_fw = True, set(), []
