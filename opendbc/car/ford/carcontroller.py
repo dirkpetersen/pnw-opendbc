@@ -144,6 +144,17 @@ class CarController(CarControllerBase):
       except Exception:
         self._pcblend_enabled = False
 
+    # fordlatui2pnw: publish which lateral path is live (4-signal / pc-blend / stock) so the UI
+    # overlay can WARN if the alan-polk 4-signal path silently fell back to stock (e.g. LateralCurvExt
+    # failed to construct). Independent /dev/shm handle — the 4-signal runs in BOTH Lightning long
+    # modes (not only when ICBM is enabled). Display-only; fully guarded so it can never affect control.
+    self._latstat_params = None
+    try:
+      from openpilot.common.params import Params as _P
+      self._latstat_params = _P("/dev/shm/params")
+    except Exception:
+      self._latstat_params = None
+
     # icbm2pnw: stock-ACC set-speed steering for the F-150 Lightning (Tier 1, no op-long). The brain
     # (target selection from CES/VTSC curve logic) runs in the pnw layer and publishes the IcbmTarget
     # mem-param; this side is only the closed-loop executor (see icbm_pnw.py for the safety envelope).
@@ -449,6 +460,17 @@ class CarController(CarControllerBase):
     new_actuators.curvature = float(self.apply_curvature_last)
     new_actuators.accel = float(self.accel)
     new_actuators.gas = float(self.gas)
+
+    # fordlatui2pnw: ~4 Hz lateral-path status for the UI overlay. "4sig" = alan-polk LateralCurvExt
+    # owns lateral; "pc" = predicted-curvature blend fallback; "stock" = plain curvature. Display-only,
+    # fully guarded (a param hiccup here must never touch the actuators returned above).
+    if self._latstat_params is not None and (self.frame % 25) == 0:
+      try:
+        import time
+        _mode = "4sig" if self._latext is not None else ("pc" if self._pcblend_enabled else "stock")
+        self._latstat_params.put_nonblocking("FordLatStatus", {"mode": _mode, "ts": round(time.time(), 2)})
+      except Exception:
+        pass
 
     self.frame += 1
     return new_actuators, can_sends
