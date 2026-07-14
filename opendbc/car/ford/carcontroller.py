@@ -1,3 +1,4 @@
+import json
 import math
 import numpy as np
 from opendbc.can import CANPacker
@@ -69,6 +70,61 @@ def apply_creep_compensation(accel: float, v_ego: float) -> float:
   return float(accel)
 
 
+# fordregen2pnw Fix B: EV regen-bite compensation for the F-150 Lightning. The truck's PCM turns a
+# gentle gas/coast request into much STRONGER regen deceleration than an ICE would (live-measured:
+# openpilot commands ~-0.3 m/s^2, the truck delivers ~-1.25), producing the op-long "deadband-then-
+# bite" jerk that stock ACC (tuned to its own regen) doesn't have. This adds a small, bounded POSITIVE
+# bias to the GAS (throttle/coast) request in the coast band so a gentle command doesn't invoke the
+# hard regen bite.
+#
+# SAFETY (this is why it cannot reduce braking authority):
+#   * It only ever touches `gas` (the throttle/coast request, AccPrpl_A_Rq). It NEVER touches `accel`,
+#     which is the separate BRAKE signal, nor the brake_request / precharge bits.
+#   * It only fires while gas is inside (MIN_GAS, REGEN_COAST_HI) and TAPERS TO 0 at both edges. Below
+#     MIN_GAS the gas request is INACTIVE and braking runs entirely via `accel`/brake_request — a hard
+#     stop or lead-braking command lives there, gets ZERO bias, and keeps full authority.
+#   * The bias is POSITIVE only (never adds regen) and hard-clamped to a small envelope, whatever the
+#     tuning file says.
+# Magnitude is tunable at /data/pnw/regen.json (only ONE clean bite data point exists so far, so ship a
+# conservative default and refine on-road — the file reloads without a rebuild, like rain.json/dm.json).
+# Ford-only (this is the ford carcontroller); Tesla is untouched.
+REGEN_CFG_PATH = "/data/pnw/regen.json"
+_REGEN_DEFAULTS = {"coast_bias": 0.15, "coast_hi": 0.0}   # coast_bias=0.0 disables it; band = (MIN_GAS, 0]
+
+
+def _load_regen_config() -> dict:
+  cfg = dict(_REGEN_DEFAULTS)
+  try:
+    with open(REGEN_CFG_PATH) as f:
+      raw = json.load(f)
+    for k in _REGEN_DEFAULTS:
+      if k in raw:
+        cfg[k] = float(raw[k])
+  except Exception:
+    pass
+  # hard safety envelope regardless of the file: never negative (never ADD regen), never large.
+  cfg["coast_bias"] = min(max(cfg["coast_bias"], 0.0), 0.4)
+  cfg["coast_hi"] = min(max(cfg["coast_hi"], 0.0), 0.3)
+  return cfg
+
+
+def _regen_gas_bias(gas: float, cfg: dict) -> float:
+  """Positive bias for a GAS request in the coast band (MIN_GAS, coast_hi), triangular so it is 0 at
+  both edges — 0 at MIN_GAS (continuous into the untouched brake region) and 0 at coast_hi."""
+  peak = cfg["coast_bias"]
+  lo = CarControllerParams.MIN_GAS   # below this, gas is INACTIVE and braking uses `accel` -> no bias
+  hi = cfg["coast_hi"]
+  if peak <= 0.0 or hi <= lo or not (lo < gas < hi):
+    return 0.0
+  mid = 0.5 * (lo + hi)
+  half = 0.5 * (hi - lo)
+  bias = peak * max(0.0, 1.0 - abs(gas - mid) / half)
+  # HARD GUARD (Gemini #6): never invert a decel request into an accel request. Cap the bias so the
+  # biased gas can only rise toward 0, never cross into positive (throttle). So even at max tuning the
+  # worst case is "no regen", never "the truck accelerates when the planner asked it to slow".
+  return min(bias, max(0.0, -gas))
+
+
 class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP):
     super().__init__(dbc_names, CP)
@@ -81,6 +137,7 @@ class CarController(CarControllerBase):
     self.gas = 0.0
     self.brake_request = False
     self.main_on_last = False
+    self._regen_cfg = _load_regen_config()   # fordregen2pnw Fix B: EV regen-bite gas compensation
     self.lkas_enabled_last = False
     self.steer_alert_last = False
     self.lead_distance_bars_last = None
@@ -405,18 +462,26 @@ class CarController(CarControllerBase):
       # the BP path previously still owned the brake bit with its narrow band -> the request
       # flapped around gentle city decels and pulsed the brakes. Stock path = stock 0.0/0.3
       # hysteresis, byte-identical to pre-port city behavior.
+      # fordregen2pnw Fix B: reload the regen tuning at ~1 Hz so on-road refinement of
+      # /data/pnw/regen.json takes effect without a rebuild (negligible I/O at 1 Hz).
+      if (self.frame % 100) == 0:
+        self._regen_cfg = _load_regen_config()
+
       if lng is not None and lng.bp_long_used:
+        # apply the regen-bite gas bias to whichever gas actually goes on the wire (BP path, >50 mph).
+        bp_gas = lng.gas + (_regen_gas_bias(lng.gas, self._regen_cfg) if CC.longActive else 0.0)
         can_sends.append(fordcan_pnw.create_acc_msg(
-          self.packer, self.CAN, CC.longActive, lng.gas, lng.accel, lng.accel_pred_send,
+          self.packer, self.CAN, CC.longActive, bp_gas, lng.accel, lng.accel_pred_send,
           lng.stopping, lng.brake_actuate, lng.precharge_actuate, v_ego_kph=lng.target_speed))
         self.accel = lng.accel
-        self.gas = lng.gas
+        self.gas = bp_gas
       else:
         # TODO: look into using the actuators packet to send the desired speed
-        can_sends.append(fordcan.create_acc_msg(self.packer, self.CAN, CC.longActive, gas, accel, stopping, self.brake_request, v_ego_kph=V_CRUISE_MAX))
+        st_gas = gas + (_regen_gas_bias(gas, self._regen_cfg) if CC.longActive else 0.0)
+        can_sends.append(fordcan.create_acc_msg(self.packer, self.CAN, CC.longActive, st_gas, accel, stopping, self.brake_request, v_ego_kph=V_CRUISE_MAX))
 
         self.accel = accel
-        self.gas = gas
+        self.gas = st_gas
 
     ### ui ###
     send_ui = (self.main_on_last != main_on) or (self.lkas_enabled_last != CC.latActive) or (self.steer_alert_last != steer_alert)
