@@ -37,8 +37,17 @@ class CarInterface(CarInterfaceBase):
     ret.steerLimitTimer = 1.0
     ret.steerAtStandstill = True
 
+    # fordregen2pnw (2026-07-13): Ford long control was feedforward + a PURE INTEGRATOR (kp unset =0,
+    # ki=0.5). On the F-150 Lightning (EV), a gentle lift command produces strong REGEN decel that the
+    # long path doesn't model; the pure-integral loop then winds up on the -aEgo error and re-adds
+    # throttle -> a jolt-then-accelerate limit cycle while following (planner aTarget stays smooth
+    # ~+0.2 but actuator/aEgo swing 0..+0.95 / -0.87, live-measured). Add proportional damping (kp) and
+    # trim the integral so the loop tracks instead of winding up. FORD-ONLY (this is the ford tuning);
+    # Tesla untouched. See docs/FORDREGEN2PNW.md. (Fix B = a regen gas-bias, sized from the rlog.)
+    ret.longitudinalTuning.kpBP = [0.]
+    ret.longitudinalTuning.kpV = [0.2]
     ret.longitudinalTuning.kiBP = [0.]
-    ret.longitudinalTuning.kiV = [0.5]
+    ret.longitudinalTuning.kiV = [0.3]
 
     if not ret.radarUnavailable and DBC[candidate][Bus.radar] == RADAR.DELPHI_MRR:
       # average of 33.3 Hz radar timestep / 4 scan modes = 60 ms
