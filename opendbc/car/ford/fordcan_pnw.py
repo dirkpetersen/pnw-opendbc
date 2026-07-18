@@ -15,6 +15,49 @@ not ported.
 
 from opendbc.car.ford.fordcan import CanBus, calculate_lat_ctl2_checksum
 
+# angle2pnw: shadow_curvature packing scale, matches ford.h's FORD_BP_SHADOW_CURVATURE_TO_CAN decode.
+_BP_LKA_SHADOW_CURVATURE_SCALE = 1e-6  # 1/meter per raw unit
+
+
+def create_lka_msg(packer, CAN: CanBus, lat_active: bool, hud_control,
+                   angle_mode_engaged: bool = False, shadow_curvature: float = 0.0):
+  """
+  Creates a CAN message for the Ford LKA Command (Lane_Assist_Data1), ported from BluePilot
+  (alan-polk), bluepilotdev/bp-7.0 opendbc_repo/opendbc/sunnypilot/car/ford/fordcan_ext.py.
+
+  angle2pnw: also carries angle_mode_engaged + shadow_curvature packed into bits with no DBC
+  signal mapped to them (confirmed unused -- always 0, no cabana signal -- on real F-150 dashcam
+  routes per BluePilot's own investigation and FORDSAFETY2PNW's prior 0x5F0 dead-end). This
+  message is one openpilot itself originates every cycle, and ford_tx_hook already reads other
+  fields (LkaActvStats_D2_Req) directly out of these same bytes synchronously in the same
+  tx_hook call -- no separate CAN ID, no RX round-trip (panda does not self-receive its own TX).
+
+  With angle_mode_engaged=False and shadow_curvature=0.0 (the defaults, and the ONLY values ever
+  passed while PnwVehicle.angle_lat is off) this produces byte-identical output to stock
+  fordcan.create_lka_msg — `dat[4] |= 0` is a no-op and dat[5]/dat[6] are already 0 from the same
+  underlying empty-values packer.make_can_msg call stock uses.
+
+  Byte layout (bits not covered by any Lane_Assist_Data1 DBC signal):
+    byte 4 bit 0:     angle_mode_engaged
+    byte 4 bits 1-4:  reserved (future bools)
+    byte 5-6:         shadow_curvature (int16, scale 1e-6 1/m)
+    byte 7:           reserved (future value)
+  Must match the decode in ford.h's FORD_Lane_Assist_Data1 tx_hook check exactly.
+
+  Frequency is 33Hz.
+  """
+  addr, dat, bus = packer.make_can_msg("Lane_Assist_Data1", CAN.main, {})
+  dat = bytearray(dat)
+
+  shadow_curvature_raw = int(round(shadow_curvature / _BP_LKA_SHADOW_CURVATURE_SCALE))
+  shadow_curvature_raw = max(-32768, min(32767, shadow_curvature_raw)) & 0xFFFF
+
+  dat[4] |= 1 if angle_mode_engaged else 0
+  dat[5] = (shadow_curvature_raw >> 8) & 0xFF
+  dat[6] = shadow_curvature_raw & 0xFF
+
+  return addr, bytes(dat), bus
+
 
 def create_lat_ctl_msg(packer, CAN: CanBus, lat_active: bool, ramp_type: int, precision_type: int,
                        path_offset: float, path_angle: float, curvature: float, curvature_rate: float):

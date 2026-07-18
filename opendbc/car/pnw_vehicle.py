@@ -41,3 +41,29 @@ class PnwVehicle:
     # gas/accel by lead state above ~50 mph, split brake/precharge hysteresis. Only meaningful
     # when openpilot owns longitudinal, so gate on op_long: inert until Alpha Long is enabled.
     self.bp_long_follow: bool = self.op_long and fp == "FORD_F_150_LIGHTNING_MK1"
+
+    # angle2pnw (FIRST PASS, 2026-07-18): BluePilot (alan-polk) bp-7.0 angle-primary lateral
+    # strategy (LateralAngleExt) — derives path_angle directly from kappa*v*gain instead of the
+    # 4-signal curvature stack (see docs/pnw/ANGLE2PNW.md). Mutually exclusive with
+    # four_signal_lat; requires the matching ford.h angle-mode safety additions (shadow_curvature
+    # cross-check + corroborated wide-range path_angle gate) from the same port.
+    #
+    # angle_lat is the master gate and is HARD-DISABLED in this first pass — no
+    # FordPrefLateralControl UI toggle has been wired yet (deliberately out of scope; a later
+    # pass adds it). Do not flip this to a fingerprint check without also wiring that toggle:
+    # the whole point of this pass is opendbc-layer build+test only, nothing live.
+    self.angle_lat: bool = False
+
+    # Per-platform path_angle gain defaults (low-curvature, high-curvature), BluePilot bp-7.0
+    # values — not user-tunable in BP either, fixed to body style. Populated for every Ford body
+    # style (not just the Lightning) because pnw_vehicle is the correct home for ANY
+    # carFingerprint-conditioned data, even for a platform we don't currently drive; consumed only
+    # when angle_lat is eventually enabled for that platform.
+    _canfd_bof_cars = ("FORD_F_150_MK14", "FORD_F_150_LIGHTNING_MK1", "FORD_EXPEDITION_MK4", "FORD_RANGER_MK2")
+    _canfd_suv_cars = ("FORD_MUSTANG_MACH_E_MK1", "FORD_ESCAPE_MK4_5")
+    if fp in _canfd_bof_cars:
+      self.angle_gain: tuple[float, float] = (0.95, 0.95)
+    elif fp in _canfd_suv_cars:
+      self.angle_gain = (1.00, 1.05)
+    else:
+      self.angle_gain = (1.00, 1.15)

@@ -169,6 +169,28 @@ class CarController(CarControllerBase):
 
     self._pcblend_enabled = veh.pc_blend and self._latext is None
 
+    # angle2pnw (FIRST PASS — hardcoded OFF, no UI toggle wired yet; see
+    # docs/pnw/ANGLE2PNW.md). BluePilot (alan-polk) bp-7.0 angle-primary lateral strategy
+    # (LateralAngleExt): derives path_angle directly from kappa*v*gain instead of the 4-signal
+    # curvature stack. Mutually exclusive with the 4-signal path — only one lateral strategy
+    # object is ever constructed. veh.angle_lat is hardcoded False in pnw_vehicle.py this pass,
+    # so this branch never actually imports/constructs anything in production; kept guarded the
+    # same way as every other capability here so flipping the gate later needs no carcontroller
+    # change beyond wiring a runtime toggle.
+    self._latext_angle = None
+    if veh.angle_lat and self._latext is None:
+      try:
+        from opendbc.car.ford.lateral_angle_pnw import LateralAngleExt
+        self._latext_angle = LateralAngleExt(CP)
+      except Exception:
+        self._latext_angle = None
+    # angle2pnw: LKA-message state for ford.h's angle-mode corroboration channel (see
+    # fordcan_pnw.create_lka_msg). Stay False/0.0 forever while _latext_angle is None — the LKA
+    # send site below only calls the pnw builder when _latext_angle is not None, so these values
+    # are unread (and the wire is byte-identical to stock) whenever angle mode is off.
+    self._angle_mode_engaged = False
+    self._shadow_curvature = 0.0
+
     # fordlong2pnw: BluePilot highway follow control. Needs the radarState SubMaster that
     # LateralCurvExt owns, so it activates only alongside a live 4-signal path; falls back to
     # the stock ACC message on any failure (same never-kill-card policy as lateral).
@@ -274,6 +296,8 @@ class CarController(CarControllerBase):
     # and the vehicle model every frame, before the lateral step
     if self._latext is not None:
       self._latext.update_sm()
+    elif self._latext_angle is not None:
+      self._latext_angle.update_sm()
 
     actuators = CC.actuators
     hud_control = CC.hudControl
@@ -348,6 +372,46 @@ class CarController(CarControllerBase):
             -lat.path_offset, -lat.path_angle, -lat.apply_curvature, -lat.curvature_rate
           ))
 
+    elif (self.frame % CarControllerParams.STEER_STEP) == 0 and self._latext_angle is not None:
+      # angle2pnw: BluePilot bp-7.0 angle-primary lateral path (LateralAngleExt) — path_angle (c1)
+      # is the actuator, curvature/curvature_rate/path_offset stay pinned inactive on the wire.
+      # Same never-kill-card fallback discipline as the 4-signal path above: on any exception, log
+      # once and permanently fall back to the stock curvature-only path for this drive.
+      try:
+        lat = self._latext_angle.update(CC, CS, actuators, self.CP)
+      except Exception:
+        carlog.exception("LateralAngleExt failed — falling back to stock lateral for this drive")
+        self._latext_angle = None
+        lat = None
+      if lat is None:
+        pass  # one 20Hz frame without a lat msg; stock path resumes next STEER_STEP
+      else:
+        self.apply_curvature_last = lat.apply_curvature  # always 0.0 in angle mode
+        # Human-turn override: force lateral inactive (mode 0, all-zero signals) for the duration
+        # of a sustained manual turn instead of winding path_angle into a stale PSCM command.
+        lat_active = CC.latActive and not self._latext_angle.angle_human_turn_active
+        self._angle_mode_engaged = lat_active
+        # Negated to match the sign convention path_angle/apply_curvature use on the wire (see the
+        # -lat.* sends just below and in the 4-signal branch above). ford.h's angle_meas (measured
+        # curvature, from raw yaw rate, no negation) is calibrated against that wire convention —
+        # confirmed by BluePilot via safety_replay against a real route: un-negated,
+        # shadow_curvature and angle_meas were consistently opposite-signed and the deviation
+        # check found a spurious "divergence" every frame above angle_error_min_speed.
+        self._shadow_curvature = -self._latext_angle.bp_kappa_cmd if self._angle_mode_engaged else 0.0
+
+        if self.CP.flags & FordFlags.CANFD:
+          mode = 1 if lat_active else 0
+          counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
+          can_sends.append(fordcan_pnw.create_lat_ctl2_msg(
+            self.packer, self.CAN, mode, lat.ramp_type, lat.precision_type,
+            -lat.path_offset, -lat.path_angle, -lat.apply_curvature, -lat.curvature_rate, counter
+          ))
+        else:
+          can_sends.append(fordcan_pnw.create_lat_ctl_msg(
+            self.packer, self.CAN, lat_active, lat.ramp_type, lat.precision_type,
+            -lat.path_offset, -lat.path_angle, -lat.apply_curvature, -lat.curvature_rate
+          ))
+
     elif (self.frame % CarControllerParams.STEER_STEP) == 0:
       # fordlat2pnw: blend the model's PREDICTED curvature (0.2 s lookahead, leads the planner) into
       # the desired curvature at BluePilot's default 40/60 ratio. The blended value flows through the
@@ -403,7 +467,18 @@ class CarController(CarControllerBase):
 
     # send lka msg at 33Hz
     if (self.frame % CarControllerParams.LKA_STEP) == 0:
-      can_sends.append(fordcan.create_lka_msg(self.packer, self.CAN))
+      if self._latext_angle is not None:
+        # angle2pnw: tell ford.h whether angle mode is engaged, out-of-band from LMC/LMC2, packed
+        # into Lane_Assist_Data1's unused bits (see fordcan_pnw.create_lka_msg). self._angle_mode_engaged
+        # / self._shadow_curvature are set by the angle-mode STEER_STEP branch above and persist
+        # between LKA_STEP ticks (LKA_STEP=33Hz does not align with STEER_STEP=20Hz).
+        can_sends.append(fordcan_pnw.create_lka_msg(
+          self.packer, self.CAN, CC.latActive, hud_control,
+          self._angle_mode_engaged, self._shadow_curvature))
+      else:
+        # Unchanged stock call — byte-identical output while angle mode is off (which is always,
+        # this pass; see fordcan_pnw.create_lka_msg's docstring for why the two are equivalent).
+        can_sends.append(fordcan.create_lka_msg(self.packer, self.CAN))
 
     ### longitudinal control ###
     # send acc msg at 50Hz
@@ -532,7 +607,9 @@ class CarController(CarControllerBase):
     if self._latstat_params is not None and (self.frame % 25) == 0:
       try:
         import time
-        _mode = "4sig" if self._latext is not None else ("pc" if self._pcblend_enabled else "stock")
+        _mode = ("4sig" if self._latext is not None else
+                "angle" if self._latext_angle is not None else
+                "pc" if self._pcblend_enabled else "stock")
         self._latstat_params.put_nonblocking("FordLatStatus", {"mode": _mode, "ts": round(time.time(), 2)})
       except Exception:
         pass
