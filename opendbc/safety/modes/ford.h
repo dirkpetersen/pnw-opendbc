@@ -415,6 +415,30 @@ static bool curvature_rate_cmd_checks(int desired_curvature_rate, bool steer_con
 // Deliberately narrower than steer_angle_cmd_checks: no rate-of-change enforcement here (that's
 // path_angle_cmd_checks's job), and no shared state with curvature mode. This is a pure per-frame
 // proximity check: does this frame's steering intent make physical sense given where the car is.
+//
+// angle2pnw hardening round 2 (Fable finding, round-2 review): shadow_curvature is a value the
+// SENDER (openpilot) reports about itself -- it is NOT derived from path_angle by panda, so this
+// check validates self-reported intent against measured motion, not the actual actuator. A
+// compromised or buggy sender could in principle report a "consistent" shadow_curvature while
+// commanding a divergent path_angle, defeating what this check is trying to corroborate.
+//
+// This does NOT mean path_angle itself is unbounded: it is independently, unconditionally capped
+// by its own value-range check (+-0.25 rad by default, +-0.5/0.5235 rad only when angle mode is
+// confirmed active -- see FORD_DBC_PATH_ANGLE_MIN/MAX and angle_mode_active in the LMC/LMC2
+// blocks) and its own ROC (path_angle_cmd_checks / FORD_PATH_ANGLE_LIMITS_ANGLE), BOTH now
+// value-range-class and immune to the reset-latch amnesty (see the `violation`/`roc_violation`
+// split above this check's call sites). Those two checks are the real, always-enforced bound on
+// what the PSCM can ever be commanded to do -- this function is a secondary corroboration signal
+// on top of that bound, not the bound itself.
+//
+// A numeric cross-check binding shadow_curvature to path_angle directly was considered for this
+// round and deliberately NOT added: the two are different physical units related by a
+// speed-and-curvature-dependent gain curve computed in lateral_angle_pnw.py
+// (kappa_cmd * v_ego * curvature_factor(...)), and reproducing that relationship in panda C to a
+// validated tolerance is more surface than is justified before this port has ANY on-car
+// telemetry. The residual gap this leaves: the corroboration can be gamed to appear consistent
+// without actually being consistent -- but even then, the worst case is a path_angle command
+// somewhere inside the already-enforced value-range + ROC envelope, not an uncapped one.
 static bool ford_shadow_curvature_error_check(int desired_curvature, bool steer_control_enabled,
                                               const AngleSteeringLimits limits) {
   bool violation = false;
@@ -556,10 +580,24 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // to them (byte4 bit0, bytes 5-6 -- confirmed unused on real F-150 dashcam routes; see
     // fordcan_pnw.py's create_lka_msg for the full layout and rationale). Read directly out of the
     // message being transmitted right now, same as curvature/path_angle elsewhere in this file --
-    // no separate CAN ID, no RX round-trip. Read unconditionally (not gated on the action check
-    // above) so a bad action byte can't be used to also suppress this read.
-    ford_bp_angle_mode_engaged = (msg->data[4] & 0x1U) != 0U;
-    ford_bp_shadow_curvature_raw = (int16_t)((msg->data[5] << 8) | msg->data[6]);
+    // no separate CAN ID, no RX round-trip.
+    //
+    // angle2pnw hardening round 2 (Fable+Gemini finding): this self-reported bit alone used to be
+    // the ONLY thing gating the wide DBC path_angle range -- a message with the bit set but
+    // controls_allowed false would still corroborate "angle mode" and (with the LMC/LMC2 checks
+    // as they stood) get the wide range. The bit can now only be SET while controls_allowed is
+    // true, and every use site below additionally requires controls_allowed at check-time
+    // (angle_mode_active = ford_bp_angle_mode_engaged && controls_allowed in the LMC/LMC2 blocks)
+    // -- belt and suspenders, since controls_allowed can drop between this TX and the next.
+    // Explicitly force false (not "leave stale") while disengaged so a flag left True from a prior
+    // engaged session can never linger into a new disengage. See
+    // test_angle_mode_wide_range_requires_controls_allowed.
+    if (controls_allowed) {
+      ford_bp_angle_mode_engaged = (msg->data[4] & 0x1U) != 0U;
+      ford_bp_shadow_curvature_raw = (int16_t)((msg->data[5] << 8) | msg->data[6]);
+    } else {
+      ford_bp_angle_mode_engaged = false;
+    }
   }
 
   // Safety check for LateralMotionControl action
@@ -572,7 +610,24 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     unsigned int raw_path_offset = (msg->data[5] << 2) | (msg->data[6] >> 6);
     // unsigned int raw_ramp_type = (msg->data[6] >> 4) & 0x3U;
 
+    // angle2pnw hardening round 2 (Gemini+Fable review): violation is split into two buckets so
+    // the reset-bypass latch below can NEVER relax anything except genuine rate-of-change checks
+    // (its only stated job). `violation` = value-range checks + the shadow-curvature deviation
+    // check -- NEVER relaxed by the latch, in either mode. `roc_violation` = rate-of-change checks
+    // (curvature's steer_angle_cmd_checks result, path_angle/path_offset/curvature_rate ROC) --
+    // the ONLY thing the latch may zero, and only for RESET_BYPASS_LATCH_DURATION frames after a
+    // genuine neutral/reset frame while engaged. Previously a single `violation` bool meant the
+    // latch's engaged amnesty wiped BOTH buckets, so a single armed frame let a path_angle value at
+    // the raw DBC extreme through -- see test_angle_mode_value_range_survives_latch_amnesty.
     bool violation = false;
+    bool roc_violation = false;
+
+    // angle2pnw hardening round 2: angle mode is only "active" for THIS frame's checks when BOTH
+    // the corroborating bit was set AND controls_allowed is true right now -- a stale/self-reported
+    // bit alone must never unlock the wide path_angle range or its looser ROC table (see the
+    // ford_bp_angle_mode_engaged assignment above, which itself now only updates while
+    // controls_allowed -- see test_angle_mode_wide_range_requires_controls_allowed).
+    bool angle_mode_active = ford_bp_angle_mode_engaged && controls_allowed;
 
     // Check curvature value limits (convert to signed values first)
     int desired_curvature = raw_curvature - FORD_INACTIVE_CURVATURE;
@@ -615,12 +670,14 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // Convert physical limits to CAN units using DBC scaling: physical = (raw * 0.0005) - 0.5
     // So: raw = (physical + 0.5) / 0.0005 = (physical + 0.5) * 2000
     // angle2pnw: angle mode uses path_angle as the actuator and may swing to the full DBC range,
-    // corroborated by ford_bp_angle_mode_engaged (read from Lane_Assist_Data1, see above) so a
-    // frame can't unlock this wider range by merely setting curvature to 0. Curvature mode (the
-    // default, and the ONLY mode driven so far) always keeps the tight 0.25 cap, including at
-    // curvature == 0 (straight driving, or the reset/human-turn frame below).
-    float path_angle_min_phys = ford_bp_angle_mode_engaged ? FORD_DBC_PATH_ANGLE_MIN : FORD_PATH_ANGLE_MIN;
-    float path_angle_max_phys = ford_bp_angle_mode_engaged ? FORD_DBC_PATH_ANGLE_MAX : FORD_PATH_ANGLE_MAX;
+    // corroborated by angle_mode_active (ford_bp_angle_mode_engaged && controls_allowed, see
+    // above) so a frame can't unlock this wider range by merely setting curvature to 0, nor by a
+    // self-reported bit alone while disengaged. Curvature mode (the default, and the ONLY mode
+    // driven so far) always keeps the tight 0.25 cap, including at curvature == 0 (straight
+    // driving, or the reset/human-turn frame below). This is a VALUE-RANGE check -- it accumulates
+    // into `violation`, which the reset latch below can never relax.
+    float path_angle_min_phys = angle_mode_active ? FORD_DBC_PATH_ANGLE_MIN : FORD_PATH_ANGLE_MIN;
+    float path_angle_max_phys = angle_mode_active ? FORD_DBC_PATH_ANGLE_MAX : FORD_PATH_ANGLE_MAX;
     int path_angle_min_can = (int)(path_angle_min_phys * FORD_PATH_ANGLE_LIMITS.angle_deg_to_can);
     int path_angle_max_can = (int)(path_angle_max_phys * FORD_PATH_ANGLE_LIMITS.angle_deg_to_can);
     violation |= (desired_path_angle < path_angle_min_can) || (desired_path_angle > path_angle_max_can);
@@ -633,56 +690,71 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // angle2pnw: angle mode holds curvature pinned at 0 while path_angle does the real steering,
     // so the deviation-vs-measured portion of steer_angle_cmd_checks would eventually trip as the
     // car actually turns (measured curvature moves, commanded curvature doesn't) -- skip applying
-    // it when desired_curvature == 0. Still call it to keep desired_angle_last in sync, and
-    // path_angle keeps its own checks regardless. steer_angle_cmd_checks also carries the
-    // controls_allowed gate every prior mode relied on for every frame; restore that piece
-    // explicitly so a steer_control_enabled frame at curvature == 0 can't bypass it. (bp-7.0 used
-    // `controls_allowed || controls_allowed_lateral` here for its MADS support; this tree has no
-    // MADS, so plain controls_allowed -- strictly narrower -- is substituted.)
+    // it when desired_curvature == 0 AND angle mode is genuinely active. Still call it
+    // unconditionally to keep desired_angle_last in sync (its ROC state must track every frame
+    // regardless of which branch below consumes the result).
+    //
+    // angle2pnw hardening round 2 (Gemini finding): this branch on desired_curvature alone,
+    // regardless of mode, used to also apply in plain CURVATURE mode -- a curvature command of
+    // exactly 0 would skip curvature_violation entirely, so a one-frame step from full-lock
+    // straight to 0 defeated the ROC arm. Gating on `angle_mode_active` too restores byte-identical
+    // curvature-mode behavior to the pre-angle2pnw baseline: curvature_violation (ROC-class, latch-
+    // relaxable) always applies there. See test_curvature_zero_step_still_roc_checked.
+    //
+    // In genuine angle mode, steer_angle_cmd_checks also carried the controls_allowed gate every
+    // prior mode relied on for every frame; restore that piece explicitly so a steer_control_enabled
+    // frame at curvature == 0 can't bypass it. (bp-7.0 used `controls_allowed ||
+    // controls_allowed_lateral` here for its MADS support; this tree has no MADS, so plain
+    // controls_allowed -- strictly narrower -- is substituted.) This substitution is a disengaged-
+    // steering guard, not a rate check -- it accumulates into `violation`, never latch-relaxable.
     bool curvature_violation = steer_angle_cmd_checks(desired_curvature, steer_control_enabled, FORD_STEERING_LIMITS);
-    if (desired_curvature != 0) {
-      violation |= curvature_violation;
-    } else {
+    if (angle_mode_active && (desired_curvature == 0)) {
       violation |= steer_control_enabled && !controls_allowed;
+    } else {
+      roc_violation |= curvature_violation;
     }
     if (test) {
-      FORD_SAFETY_DBG("CAN Out: 1. desired_curvature violation: %d\n", (int)violation);
+      FORD_SAFETY_DBG("CAN Out: 1. desired_curvature violation: %d\n", (int)(violation || roc_violation));
     }
 
     // angle2pnw: angle mode's own deviation-only check (no ROC -- path_angle_cmd_checks below
     // already rate-limits the real actuator) against shadow_curvature, once angle mode is
-    // confirmed engaged via Lane_Assist_Data1. If desired_curvature == 0 but angle mode is NOT
-    // confirmed, this is skipped -- that's ordinary curvature mode at zero (straight driving or
-    // the reset/human-turn frame below), which needs no shadow-curvature check; it's still
-    // bounded by the tight path_angle range above and steer_control_enabled's own checks.
-    if ((desired_curvature == 0) && ford_bp_angle_mode_engaged) {
+    // genuinely active (corroborated bit AND controls_allowed). If desired_curvature == 0 but
+    // angle mode is not active, this is skipped -- that's ordinary curvature mode at zero (straight
+    // driving or the reset/human-turn frame below), which needs no shadow-curvature check; it's
+    // still bounded by the tight path_angle range above and steer_control_enabled's own checks.
+    // This is a static per-frame proximity check with no rate component -- it accumulates into
+    // `violation`, never latch-relaxable (see test_angle_mode_value_range_survives_latch_amnesty).
+    if ((desired_curvature == 0) && angle_mode_active) {
       int shadow_curvature_can = FORD_BP_SHADOW_CURVATURE_TO_CAN(ford_bp_shadow_curvature_raw);
       violation |= ford_shadow_curvature_error_check(shadow_curvature_can, steer_control_enabled, FORD_STEERING_LIMITS);
     }
 
     // Check path angle rate of change limits. angle2pnw: use the dedicated angle-mode ROC table
-    // only when angle mode is confirmed engaged -- see FORD_PATH_ANGLE_LIMITS_ANGLE's comment for
-    // why this must be a separate table, not a runtime-widened shared one.
-    const AngleSteeringLimits *path_angle_limits = ford_bp_angle_mode_engaged ? &FORD_PATH_ANGLE_LIMITS_ANGLE : &FORD_PATH_ANGLE_LIMITS;
-    violation |= path_angle_cmd_checks(desired_path_angle, steer_control_enabled, *path_angle_limits);
+    // only when angle mode is genuinely active -- see FORD_PATH_ANGLE_LIMITS_ANGLE's comment for
+    // why this must be a separate table, not a runtime-widened shared one. ROC-class check --
+    // accumulates into roc_violation, the latch's one legitimate relaxation target.
+    const AngleSteeringLimits *path_angle_limits = angle_mode_active ? &FORD_PATH_ANGLE_LIMITS_ANGLE : &FORD_PATH_ANGLE_LIMITS;
+    roc_violation |= path_angle_cmd_checks(desired_path_angle, steer_control_enabled, *path_angle_limits);
     if (test) {
-      FORD_SAFETY_DBG("CAN Out: 2. desired_path_angle violation: %d\n", (int)violation);
+      FORD_SAFETY_DBG("CAN Out: 2. desired_path_angle violation: %d\n", (int)(violation || roc_violation));
     }
 
-    // Check path offset rate of change limits
-    violation |= path_offset_cmd_checks(desired_path_offset, steer_control_enabled, FORD_PATH_OFFSET_LIMITS);
+    // Check path offset rate of change limits (ROC-class, latch-relaxable)
+    roc_violation |= path_offset_cmd_checks(desired_path_offset, steer_control_enabled, FORD_PATH_OFFSET_LIMITS);
     if (test) {
-      FORD_SAFETY_DBG("CAN Out: 3. desired_path_offset violation: %d\n", (int)violation);
+      FORD_SAFETY_DBG("CAN Out: 3. desired_path_offset violation: %d\n", (int)(violation || roc_violation));
     }
 
-    // Check curvature rate rate of change limits
-    violation |= curvature_rate_cmd_checks(desired_curvature_rate, steer_control_enabled, FORD_CURVATURE_RATE_LIMITS_CAN);
+    // Check curvature rate rate of change limits (ROC-class, latch-relaxable)
+    roc_violation |= curvature_rate_cmd_checks(desired_curvature_rate, steer_control_enabled, FORD_CURVATURE_RATE_LIMITS_CAN);
     if (test) {
-      FORD_SAFETY_DBG("CAN Out: 4. desired_curvature_rate violation: %d\n", (int)violation);
+      FORD_SAFETY_DBG("CAN Out: 4. desired_curvature_rate violation: %d\n", (int)(violation || roc_violation));
     }
 
-    // Reset latch: activate when both curvature and path_angle are zero (reset/neutral state)
-    // This allows smooth ramp-up after human turn detection without blocked messages
+    // Reset latch: activate when both curvature and path_angle are zero (reset/neutral state).
+    // This allows smooth ramp-up after human turn detection without blocking otherwise-legitimate
+    // rate-of-change steps.
     // pnw-hardening (2026-07-11): the reset latch is gated on controls_allowed. Its only legitimate
     // job is to relax rate-of-change checks during the human-turn-reset ramp, which ALWAYS happens
     // while engaged. BluePilot's original set violation=false unconditionally, and because openpilot
@@ -691,19 +763,28 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // could steer while "off" and the panda would allow it). Forcing the counter to 0 whenever
     // !controls_allowed makes the disengaged-steering block fully enforced again, with ZERO loss of
     // the engaged ramp behavior. (Proven by test_reset_latch_blocked_when_disengaged.)
+    // angle2pnw hardening round 2 (Fable finding): the latch used to zero the SAME `violation` bool
+    // that value-range and shadow-curvature-deviation checks fed into, so an armed latch (which
+    // re-arms on every straight-road neutral frame, not just after a human-turn) also wiped those
+    // checks for the whole ~3s window -- a single frame could then carry a path_angle at the raw
+    // DBC extreme (only reachable in angle mode, which is exactly when this mattered most). The
+    // latch now only ever zeroes `roc_violation`; `violation` (value ranges + shadow-curvature
+    // deviation) is accumulated above and enforced unconditionally, in both modes, latch or no
+    // latch. See test_angle_mode_value_range_survives_latch_amnesty and
+    // test_reset_latch_roc_relaxation_still_works (the latch's intended relaxation, unchanged).
     if (!controls_allowed) {
       reset_bypass_latch_counter = 0;                        // disengaged: latch inert, full checks
     } else if ((desired_curvature == 0) && (desired_path_angle == 0)) {
       // Reset detected, activate latch for ramp period (engaged only)
       reset_bypass_latch_counter = RESET_BYPASS_LATCH_DURATION;
-      violation = false;  // Immediate bypass for reset state
+      roc_violation = false;  // Immediate bypass for reset state -- ROC checks only
     } else if (reset_bypass_latch_counter > 0) {
-      // Latch active, allow bypass during ramp-up period
+      // Latch active, allow bypass during ramp-up period -- ROC checks only
       reset_bypass_latch_counter--;
-      violation = false;
+      roc_violation = false;
     }
 
-    if (violation) {
+    if (violation || roc_violation) {
       tx = false;
     }
   }
@@ -720,7 +801,12 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     unsigned int raw_path_offset = ((msg->data[4] & 0x3U) << 8) | msg->data[5];
     // unsigned int raw_ramp_type = (msg->data[0] >> 1) & 0x3U;  // Extract bits 1-2 from byte 0
 
+    // angle2pnw hardening round 2: see the identical comment in the LMC (non-CANFD) block above --
+    // `violation` (value ranges + shadow-curvature deviation) is never latch-relaxable;
+    // `roc_violation` (rate-of-change checks) is the latch's only legitimate relaxation target.
     bool violation = false;
+    bool roc_violation = false;
+    bool angle_mode_active = ford_bp_angle_mode_engaged && controls_allowed;
 
     // Check curvature value limits (convert to signed values first)
     int desired_curvature = raw_curvature - FORD_INACTIVE_CURVATURE;
@@ -762,9 +848,10 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     int desired_path_angle = raw_path_angle - FORD_INACTIVE_PATH_ANGLE;
     // Convert physical limits to CAN units using DBC scaling: physical = (raw * 0.0005) - 0.5
     // So: raw = (physical + 0.5) / 0.0005 = (physical + 0.5) * 2000
-    // angle2pnw: see the identical comment in the LMC (non-CANFD) block above.
-    float path_angle_min_phys = ford_bp_angle_mode_engaged ? FORD_DBC_PATH_ANGLE_MIN : FORD_PATH_ANGLE_MIN;
-    float path_angle_max_phys = ford_bp_angle_mode_engaged ? FORD_DBC_PATH_ANGLE_MAX : FORD_PATH_ANGLE_MAX;
+    // angle2pnw: see the identical comment in the LMC (non-CANFD) block above -- VALUE-RANGE
+    // check, never latch-relaxable.
+    float path_angle_min_phys = angle_mode_active ? FORD_DBC_PATH_ANGLE_MIN : FORD_PATH_ANGLE_MIN;
+    float path_angle_max_phys = angle_mode_active ? FORD_DBC_PATH_ANGLE_MAX : FORD_PATH_ANGLE_MAX;
     int path_angle_min_can = (int)(path_angle_min_phys * FORD_PATH_ANGLE_LIMITS.angle_deg_to_can);
     int path_angle_max_can = (int)(path_angle_max_phys * FORD_PATH_ANGLE_LIMITS.angle_deg_to_can);
     violation |= (desired_path_angle < path_angle_min_can) || (desired_path_angle > path_angle_max_can);
@@ -774,69 +861,72 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     }
 
     // Check angle error and steer_control_enabled for curvature
-    // angle2pnw: see the identical comment in the LMC (non-CANFD) block above.
+    // angle2pnw: see the identical comment in the LMC (non-CANFD) block above -- gated on
+    // angle_mode_active (not just desired_curvature==0) so plain curvature mode stays
+    // byte-identical to the pre-angle2pnw baseline, and the controls_allowed substitution in the
+    // angle-mode branch accumulates into `violation` (never latch-relaxable), while the ordinary
+    // curvature_violation result accumulates into `roc_violation` (latch-relaxable, as always).
     bool curvature_violation = steer_angle_cmd_checks(desired_curvature, steer_control_enabled, FORD_CANFD_STEERING_LIMITS);
-    if (desired_curvature != 0) {
-      violation |= curvature_violation;
-    } else {
+    if (angle_mode_active && (desired_curvature == 0)) {
       violation |= steer_control_enabled && !controls_allowed;
+    } else {
+      roc_violation |= curvature_violation;
     }
     if (test) {
-      FORD_SAFETY_DBG("CANFD Out: 1. desired_curvature violation: %d\n", (int)violation);
+      FORD_SAFETY_DBG("CANFD Out: 1. desired_curvature violation: %d\n", (int)(violation || roc_violation));
     }
 
-    // angle2pnw: shadow-curvature deviation check -- see the identical comment in the LMC block above.
-    if ((desired_curvature == 0) && ford_bp_angle_mode_engaged) {
+    // angle2pnw: shadow-curvature deviation check -- see the identical comment in the LMC block
+    // above. Static per-frame proximity check, no rate component -- `violation`, never
+    // latch-relaxable.
+    if ((desired_curvature == 0) && angle_mode_active) {
       int shadow_curvature_can = FORD_BP_SHADOW_CURVATURE_TO_CAN(ford_bp_shadow_curvature_raw);
       violation |= ford_shadow_curvature_error_check(shadow_curvature_can, steer_control_enabled, FORD_CANFD_STEERING_LIMITS);
     }
 
-    // Check path angle rate of change limits. angle2pnw: dedicated angle-mode ROC table, see LMC block above.
-    const AngleSteeringLimits *path_angle_limits = ford_bp_angle_mode_engaged ? &FORD_PATH_ANGLE_LIMITS_ANGLE : &FORD_PATH_ANGLE_LIMITS;
-    violation |= path_angle_cmd_checks(desired_path_angle, steer_control_enabled, *path_angle_limits);
+    // Check path angle rate of change limits. angle2pnw: dedicated angle-mode ROC table, see LMC
+    // block above. ROC-class -- `roc_violation`, latch-relaxable.
+    const AngleSteeringLimits *path_angle_limits = angle_mode_active ? &FORD_PATH_ANGLE_LIMITS_ANGLE : &FORD_PATH_ANGLE_LIMITS;
+    roc_violation |= path_angle_cmd_checks(desired_path_angle, steer_control_enabled, *path_angle_limits);
     if (test) {
-      FORD_SAFETY_DBG("CANFD Out: 2. desired_path_angle violation: %d\n", (int)violation);
+      FORD_SAFETY_DBG("CANFD Out: 2. desired_path_angle violation: %d\n", (int)(violation || roc_violation));
     }
 
-    // Check path offset rate of change limits
-    violation |= path_offset_cmd_checks(desired_path_offset, steer_control_enabled, FORD_PATH_OFFSET_LIMITS);
+    // Check path offset rate of change limits (ROC-class, latch-relaxable)
+    roc_violation |= path_offset_cmd_checks(desired_path_offset, steer_control_enabled, FORD_PATH_OFFSET_LIMITS);
     if (test) {
-      FORD_SAFETY_DBG("CANFD Out: 3. desired_path_offset violation: %d\n", (int)violation);
+      FORD_SAFETY_DBG("CANFD Out: 3. desired_path_offset violation: %d\n", (int)(violation || roc_violation));
     }
 
-    // Check curvature rate rate of change limits
-    violation |= curvature_rate_cmd_checks(desired_curvature_rate, steer_control_enabled, FORD_CURVATURE_RATE_LIMITS_CANFD);
+    // Check curvature rate rate of change limits (ROC-class, latch-relaxable)
+    roc_violation |= curvature_rate_cmd_checks(desired_curvature_rate, steer_control_enabled, FORD_CURVATURE_RATE_LIMITS_CANFD);
     if (test) {
-      FORD_SAFETY_DBG("CANFD Out: 4. desired_curvature_rate violation: %d\n", (int)violation);
+      FORD_SAFETY_DBG("CANFD Out: 4. desired_curvature_rate violation: %d\n", (int)(violation || roc_violation));
     }
 
-    // Reset latch: activate when both curvature and path_angle are zero (reset/neutral state)
-    // This allows smooth ramp-up after human turn detection without blocked messages
-    // pnw-hardening (2026-07-11): the reset latch is gated on controls_allowed. Its only legitimate
-    // job is to relax rate-of-change checks during the human-turn-reset ramp, which ALWAYS happens
-    // while engaged. BluePilot's original set violation=false unconditionally, and because openpilot
-    // sends neutral (curvature==0 && path_angle==0) frames continuously WHILE DISENGAGED, the latch
-    // was ~permanently armed when disengaged -> a full bypass of controls_allowed (a buggy process
-    // could steer while "off" and the panda would allow it). Forcing the counter to 0 whenever
-    // !controls_allowed makes the disengaged-steering block fully enforced again, with ZERO loss of
-    // the engaged ramp behavior. (Proven by test_reset_latch_blocked_when_disengaged.)
+    // Reset latch: activate when both curvature and path_angle are zero (reset/neutral state).
+    // pnw-hardening (2026-07-11): gated on controls_allowed -- see the identical comment in the LMC
+    // (non-CANFD) block above. angle2pnw hardening round 2: the latch now only ever zeroes
+    // roc_violation (rate-of-change checks, its stated job); `violation` (value ranges +
+    // shadow-curvature deviation) is enforced unconditionally regardless of latch state, in both
+    // modes.
     if (!controls_allowed) {
       reset_bypass_latch_counter = 0;                        // disengaged: latch inert, full checks
     } else if ((desired_curvature == 0) && (desired_path_angle == 0)) {
       // Reset detected, activate latch for ramp period (engaged only)
       reset_bypass_latch_counter = RESET_BYPASS_LATCH_DURATION;
-      violation = false;  // Immediate bypass for reset state
+      roc_violation = false;  // Immediate bypass for reset state -- ROC checks only
     } else if (reset_bypass_latch_counter > 0) {
-      // Latch active, allow bypass during ramp-up period
+      // Latch active, allow bypass during ramp-up period -- ROC checks only
       reset_bypass_latch_counter--;
-      violation = false;
+      roc_violation = false;
     }
 
-    if (violation) {
+    if (violation || roc_violation) {
       tx = false;
     }
     if(test) {
-      FORD_SAFETY_DBG("CANFD Out - final: violation: %d\n", (int)violation);
+      FORD_SAFETY_DBG("CANFD Out - final: violation: %d\n", (int)(violation || roc_violation));
     }
   }
 

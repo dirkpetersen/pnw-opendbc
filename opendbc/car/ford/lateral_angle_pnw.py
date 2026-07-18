@@ -34,6 +34,16 @@ Everything else -- the kappa->path_angle mapping, the curvature-deviation clip (
 apply_ford_curvature_limits_ext exactly), the PSCM saturation clamp, the soft ROC, the human-turn
 override (ported to human_turn_pnw.HumanTurnDetector), and the shadow_curvature output panda's
 ford.h cross-checks -- is a faithful port.
+
+Known residual limitation (round-2 safety review, 2026-07-18): ``bp_kappa_cmd`` (sent to ford.h as
+``shadow_curvature``) is self-reported by this file, not derived from ``path_angle`` by panda, so
+ford.h's ``ford_shadow_curvature_error_check`` corroborates self-reported intent against measured
+motion -- it is NOT a binding between the actual actuator (``path_angle``) and reality. The real,
+always-enforced bound on what gets sent to the PSCM is ``path_angle``'s own value-range check
+(tight +-0.25 rad by default, the wide DBC range only when ``ford_bp_angle_mode_engaged &&
+controls_allowed``) and its own ROC (``FORD_PATH_ANGLE_LIMITS_ANGLE``) -- see the extended comment
+on ``ford_shadow_curvature_error_check`` in ford.h for the full reasoning and why a direct
+path_angle<->shadow_curvature numeric cross-check was not added this round.
 """
 import numpy as np
 from numpy import clip, interp

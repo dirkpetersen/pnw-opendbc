@@ -394,9 +394,13 @@ class CarController(CarControllerBase):
         # Negated to match the sign convention path_angle/apply_curvature use on the wire (see the
         # -lat.* sends just below and in the 4-signal branch above). ford.h's angle_meas (measured
         # curvature, from raw yaw rate, no negation) is calibrated against that wire convention —
-        # confirmed by BluePilot via safety_replay against a real route: un-negated,
-        # shadow_curvature and angle_meas were consistently opposite-signed and the deviation
-        # check found a spurious "divergence" every frame above angle_error_min_speed.
+        # per BluePilot's bp-7.0 source comment, confirmed via safety_replay against a real route:
+        # un-negated, shadow_curvature and angle_meas were consistently opposite-signed and the
+        # deviation check found a spurious "divergence" every frame above angle_error_min_speed.
+        # TODO verify on-car: this sign convention is carried forward from BluePilot's source
+        # comment, not independently re-derived or re-tested against real Lightning CAN traffic in
+        # this port (first pass, opendbc-layer only, angle_lat hardcoded off — see pnw_vehicle.py).
+        # Confirm with a live safety_replay / cabana capture before this ever flashes.
         self._shadow_curvature = -self._latext_angle.bp_kappa_cmd if self._angle_mode_engaged else 0.0
 
         if self.CP.flags & FordFlags.CANFD:
