@@ -42,17 +42,29 @@ class PnwVehicle:
     # when openpilot owns longitudinal, so gate on op_long: inert until Alpha Long is enabled.
     self.bp_long_follow: bool = self.op_long and fp == "FORD_F_150_LIGHTNING_MK1"
 
-    # angle2pnw (FIRST PASS, 2026-07-18): BluePilot (alan-polk) bp-7.0 angle-primary lateral
-    # strategy (LateralAngleExt) — derives path_angle directly from kappa*v*gain instead of the
-    # 4-signal curvature stack (see docs/pnw/ANGLE2PNW.md). Mutually exclusive with
-    # four_signal_lat; requires the matching ford.h angle-mode safety additions (shadow_curvature
-    # cross-check + corroborated wide-range path_angle gate) from the same port.
+    # angle2pnw (2026-07-18): BluePilot (alan-polk) bp-7.0 angle-primary lateral strategy
+    # (LateralAngleExt) — derives path_angle directly from kappa*v*gain instead of the 4-signal
+    # curvature stack (see docs/pnw/ANGLE2PNW.md). Mutually exclusive with four_signal_lat;
+    # requires the matching ford.h angle-mode safety additions (shadow_curvature cross-check +
+    # corroborated wide-range path_angle gate) from the same port.
     #
-    # angle_lat is the master gate and is HARD-DISABLED in this first pass — no
-    # FordPrefLateralControl UI toggle has been wired yet (deliberately out of scope; a later
-    # pass adds it). Do not flip this to a fingerprint check without also wiring that toggle:
-    # the whole point of this pass is opendbc-layer build+test only, nothing live.
+    # angleenable: angle_lat is the master gate, now driver-flippable via the FordAngleLateral
+    # settings toggle (default OFF — deployed behavior is unchanged until the driver opts in).
+    # It is GATED on four_signal_lat rather than a bare fingerprint check: four_signal_lat is
+    # already the capability that identifies "this car has the flashed 4-signal/angle-mode ford.h
+    # panda safety" (see its comment above), so angle_lat can only ever be True on a car that both
+    # (a) is the Lightning and (b) is running the matching safety build — the same guarantee the
+    # first pass's hardcoded False gave, now conditional on an explicit opt-in instead of always
+    # off. The Params() read/import is RUNTIME-GUARDED (opendbc cannot assume openpilot.* is
+    # importable on a bare checkout): any failure — bare opendbc, missing param, anything — leaves
+    # angle_lat False, matching every other params-gated capability in this tree.
     self.angle_lat: bool = False
+    if self.four_signal_lat:
+      try:
+        from openpilot.common.params import Params
+        self.angle_lat = bool(Params().get_bool("FordAngleLateral"))
+      except Exception:
+        self.angle_lat = False
 
     # Per-platform path_angle gain defaults (low-curvature, high-curvature), BluePilot bp-7.0
     # values — not user-tunable in BP either, fixed to body style. Populated for every Ford body

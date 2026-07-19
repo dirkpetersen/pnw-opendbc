@@ -3,13 +3,14 @@ angle2pnw — engaged-path smoke test for the bp-7.0 angle-primary lateral strat
 (LateralAngleExt), mirroring test_engaged_smoke_pnw.py's discipline for the 4-signal path (born
 from the 2026-07-11 numpy/capnp field failure that test closes).
 
-FIRST PASS: PnwVehicle.angle_lat is hardcoded False (see pnw_vehicle.py), so CarController never
-constructs LateralAngleExt in production. This file proves two separate things that must BOTH
-hold before this port is safe to flip live:
+angleenable: PnwVehicle.angle_lat now mirrors the driver-facing FordAngleLateral settings toggle
+(default OFF — see pnw_vehicle.py); with the param unset/False (this test's environment), a normal
+CarInterface must still never construct LateralAngleExt in production. This file proves two
+separate things that must BOTH hold:
 
-  1. The master gate is genuinely off — a normal CarInterface never constructs the angle-mode
-     extension (test_angle_mode_off_by_default). Silently skipping this and only testing #2 would
-     miss a bug where the capability accidentally activates.
+  1. The master gate is genuinely off BY DEFAULT — a normal CarInterface never constructs the
+     angle-mode extension (test_angle_mode_off_by_default). Silently skipping this and only
+     testing #2 would miss a bug where the capability accidentally activates.
   2. The MECHANISM itself is correct when exercised directly (bypassing the gate by assigning
      ci.CC._latext_angle post-construction, exactly as fordsafety2pnw's own
      test_ext_failures_fall_back_not_crash bypasses _longext/_latext) — full engaged loop at real
@@ -61,10 +62,11 @@ def _engaged_cc(curvature):
 
 
 def test_angle_mode_off_by_default():
-  """The master gate (PnwVehicle.angle_lat) is hardcoded False this pass — a normal
-  CarInterface must NEVER construct LateralAngleExt. Guards against the capability
-  accidentally activating (e.g. a future edit to pnw_vehicle.py flipping the fingerprint gate
-  without also wiring the runtime toggle this pass deliberately omits)."""
+  """angleenable: PnwVehicle.angle_lat reads the FordAngleLateral settings toggle, which is
+  unset/False in this test environment — a normal CarInterface must NEVER construct
+  LateralAngleExt without the driver having opted in. Guards against the capability
+  accidentally activating (e.g. a future edit dropping the four_signal_lat gate or the param
+  read raising and silently defaulting to True instead of False)."""
   ci = _make_interface(FORD.FORD_F_150_LIGHTNING_MK1)
   ci.update([])
   assert ci.CC._latext_angle is None, \

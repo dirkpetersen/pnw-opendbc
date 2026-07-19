@@ -2,10 +2,11 @@
 angle2pnw — BluePilot (alan-polk) bp-7.0 Ford angle-primary lateral control, ported from
 bluepilotdev/bp-7.0 opendbc_repo/opendbc/sunnypilot/car/ford/lateral_angle_ext.py.
 
-FIRST PASS (2026-07-18): opendbc-layer build+test only. Not wired live — the master gate
-(``PnwVehicle.angle_lat``) is hardcoded False in pnw_vehicle.py; nothing in this file runs on the
-road until a later pass wires a runtime toggle and flips that capability. See
-docs/pnw/ANGLE2PNW.md for the full port notes and what was deliberately trimmed.
+angleenable: the master gate (``PnwVehicle.angle_lat``) is now driver-flippable via the
+``FordAngleLateral`` settings toggle (default OFF, gated on the Lightning's ``four_signal_lat``
+capability — see pnw_vehicle.py), so this file only runs on the road once the driver has
+explicitly opted in on that car. See docs/pnw/ANGLE2PNW.md for the full port notes and what was
+deliberately trimmed.
 
 Where this diverges from a fresh drive, an actual second look is needed before flipping the toggle.
 

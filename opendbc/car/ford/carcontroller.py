@@ -169,14 +169,14 @@ class CarController(CarControllerBase):
 
     self._pcblend_enabled = veh.pc_blend and self._latext is None
 
-    # angle2pnw (FIRST PASS — hardcoded OFF, no UI toggle wired yet; see
-    # docs/pnw/ANGLE2PNW.md). BluePilot (alan-polk) bp-7.0 angle-primary lateral strategy
-    # (LateralAngleExt): derives path_angle directly from kappa*v*gain instead of the 4-signal
-    # curvature stack. Mutually exclusive with the 4-signal path — only one lateral strategy
-    # object is ever constructed. veh.angle_lat is hardcoded False in pnw_vehicle.py this pass,
-    # so this branch never actually imports/constructs anything in production; kept guarded the
-    # same way as every other capability here so flipping the gate later needs no carcontroller
-    # change beyond wiring a runtime toggle.
+    # angle2pnw (see docs/pnw/ANGLE2PNW.md). BluePilot (alan-polk) bp-7.0 angle-primary lateral
+    # strategy (LateralAngleExt): derives path_angle directly from kappa*v*gain instead of the
+    # 4-signal curvature stack. Mutually exclusive with the 4-signal path — only one lateral
+    # strategy object is ever constructed. angleenable: veh.angle_lat now mirrors the driver-facing
+    # FordAngleLateral settings toggle (default OFF, gated on the Lightning's four_signal_lat
+    # capability — see pnw_vehicle.py), so this branch only constructs LateralAngleExt once the
+    # driver has explicitly opted in on that car; guarded the same way as every other capability
+    # here.
     self._latext_angle = None
     if veh.angle_lat and self._latext is None:
       try:
