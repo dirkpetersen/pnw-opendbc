@@ -389,6 +389,11 @@ class CarController(CarControllerBase):
         carlog.exception("LateralAngleExt failed — falling back to stock lateral for this drive")
         self._latext_angle = None
         lat = None
+        # The wire is curvature again from here on -- the LKA corroboration bit and shadow must
+        # drop with it, or ford.h would keep judging the stock curvature frames under angle-mode
+        # rules (blocked lateral). Part of the never-kill-card fallback deviation (manifest c).
+        self._angle_mode_engaged = False
+        self._shadow_curvature = 0.0
       if lat is None:
         pass  # one 20Hz frame without a lat msg; stock path resumes next STEER_STEP
       else:
@@ -399,7 +404,12 @@ class CarController(CarControllerBase):
         # winding path_angle into a stale command (see lateral_angle_pnw.py's module docstring).
         lat_active = CC.latActive and not (self._latext_angle.angle_human_turn_active
                                             or self._latext_angle.angle_stall_blip_active)
-        self._angle_mode_engaged = lat_active
+        # Alan Polk's semantics (bp-7.0 carcontroller.py line 223, review finding M1): the LKA
+        # corroboration bit asserts whenever angle MODE is selected -- NOT only while lateral is
+        # active. During human-turn/stall-blip mode-0 frames the bit stays set (bp_kappa_cmd is 0
+        # there, so shadow_curvature is 0 regardless); ford.h sees "angle mode, zero shadow" exactly
+        # as it does on his fork. Our previous narrowing to lat_active was an unlisted deviation.
+        self._angle_mode_engaged = True
         # SIGN CONVENTION (see SIGN-CONVENTION-TRACE.md): negated here to match the sign
         # convention path_angle/apply_curvature use on the wire (see the -lat.* sends just below,
         # and in the 4-signal branch above -- both negate all four LMC/LMC2 signals). ford.h's
