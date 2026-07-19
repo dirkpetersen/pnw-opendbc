@@ -151,34 +151,24 @@ class CarController(CarControllerBase):
     # (driver report 2026-07-11). Guarded imports: bare opendbc checkout -> blend off, pure stock.
     veh = PnwVehicle(CP)  # capability view — no fingerprint checks in feature code (driver directive)
 
-    # fordsafety2pnw: BluePilot's (alan-polk) full 4-signal lateral control (LateralCurvExt).
-    # REQUIRES the matching 4-signal ford.h panda safety from this branch — with STOCK ford safety
-    # the nonzero curvature_rate would be blocked on the bus and lateral would go dead, so this
-    # capability must only ship together with the panda rebuild. Guarded imports: on a bare opendbc
-    # checkout (no cereal / modeld constants) construction fails and we fall back to the stock
-    # curvature-only path below. When active, LateralCurvExt OWNS lateral: it contains its own
-    # predicted-curvature blend and human-turn reset, so the standalone pc_blend/ht_reset helpers
-    # below are bypassed to avoid double-applying them.
-    self._latext = None
-    if veh.four_signal_lat:
-      try:
-        from opendbc.car.ford.lateral_curv_pnw import LateralCurvExt
-        self._latext = LateralCurvExt(CP)
-      except Exception:
-        self._latext = None
-
-    self._pcblend_enabled = veh.pc_blend and self._latext is None
-
-    # angle2pnw (see docs/pnw/ANGLE2PNW.md). BluePilot (alan-polk) bp-7.0 angle-primary lateral
-    # strategy (LateralAngleExt): derives path_angle directly from kappa*v*gain instead of the
-    # 4-signal curvature stack. Mutually exclusive with the 4-signal path — only one lateral
-    # strategy object is ever constructed. angleenable: veh.angle_lat now mirrors the driver-facing
-    # FordAngleLateral settings toggle (default OFF, gated on the Lightning's four_signal_lat
-    # capability — see pnw_vehicle.py), so this branch only constructs LateralAngleExt once the
-    # driver has explicitly opted in on that car; guarded the same way as every other capability
-    # here.
+    # angleenable (fixes a construction-order bug caught in review — see below): angle-primary
+    # (LateralAngleExt) and 4-signal curvature-primary (LateralCurvExt) are MUTUALLY EXCLUSIVE
+    # lateral strategies, and this ordering is what actually enforces that. angle2pnw (BluePilot
+    # (alan-polk) bp-7.0 angle-primary lateral strategy — docs/pnw/ANGLE2PNW.md): derives
+    # path_angle directly from kappa*v*gain instead of the 4-signal curvature stack. veh.angle_lat
+    # mirrors the driver-facing FordAngleLateral settings toggle (default OFF, gated on the
+    # Lightning's four_signal_lat capability — see pnw_vehicle.py); angle_lat==True implies
+    # four_signal_lat==True (angle_lat can only be True where four_signal_lat already is), so
+    # LateralAngleExt is constructed FIRST here, before the four_signal_lat check below decides
+    # whether to construct LateralCurvExt at all.
+    #
+    # BUG this fixes (Gemini review, 2026-07-18): the previous ordering unconditionally
+    # constructed LateralCurvExt whenever four_signal_lat was True (which angle_lat requires), so
+    # by the time the angle_lat check ran, self._latext was never None and LateralAngleExt was
+    # NEVER constructed — flipping the toggle changed nothing on the wire. Constructing the angle
+    # path first and gating LateralCurvExt on "angle path is not already live" below closes that.
     self._latext_angle = None
-    if veh.angle_lat and self._latext is None:
+    if veh.angle_lat:
       try:
         from opendbc.car.ford.lateral_angle_pnw import LateralAngleExt
         self._latext_angle = LateralAngleExt(CP)
@@ -190,6 +180,31 @@ class CarController(CarControllerBase):
     # are unread (and the wire is byte-identical to stock) whenever angle mode is off.
     self._angle_mode_engaged = False
     self._shadow_curvature = 0.0
+
+    # fordsafety2pnw: BluePilot's (alan-polk) full 4-signal lateral control (LateralCurvExt).
+    # REQUIRES the matching 4-signal ford.h panda safety from this branch — with STOCK ford safety
+    # the nonzero curvature_rate would be blocked on the bus and lateral would go dead, so this
+    # capability must only ship together with the panda rebuild. Guarded imports: on a bare opendbc
+    # checkout (no cereal / modeld constants) construction fails and we fall back to the stock
+    # curvature-only path below. When active, LateralCurvExt OWNS lateral: it contains its own
+    # predicted-curvature blend and human-turn reset, so the standalone pc_blend/ht_reset helpers
+    # below are bypassed to avoid double-applying them. angleenable: also skipped when the angle
+    # path is already live (self._latext_angle is not None) — mutual exclusivity with LateralAngleExt.
+    # If angle-mode construction FAILED above (exception, _latext_angle stayed None) this still runs
+    # and falls back to the 4-signal curvature path rather than bare stock, since four_signal_lat is
+    # already known True whenever angle_lat is.
+    self._latext = None
+    if veh.four_signal_lat and self._latext_angle is None:
+      try:
+        from opendbc.car.ford.lateral_curv_pnw import LateralCurvExt
+        self._latext = LateralCurvExt(CP)
+      except Exception:
+        self._latext = None
+
+    # pc_blend/ht_reset below are the standalone (non-4-signal, non-angle) curvature helpers — both
+    # must stay off whenever EITHER extended lateral strategy owns lateral (each owns its own
+    # equivalent internally), not just when the 4-signal path does.
+    self._pcblend_enabled = veh.pc_blend and self._latext is None and self._latext_angle is None
 
     # fordlong2pnw: BluePilot highway follow control. Needs the radarState SubMaster that
     # LateralCurvExt owns, so it activates only alongside a live 4-signal path; falls back to
@@ -203,7 +218,7 @@ class CarController(CarControllerBase):
         self._longext = None
     # fordlat_pnw human-turn reset (see fordlat_pnw.py) — guarded like everything else
     self._htreset = None
-    if veh.ht_reset and self._latext is None:
+    if veh.ht_reset and self._latext is None and self._latext_angle is None:
       try:
         from opendbc.car.ford.fordlat_pnw import HumanTurnHold
         self._htreset = HumanTurnHold()

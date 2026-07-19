@@ -5,13 +5,21 @@ from the 2026-07-11 numpy/capnp field failure that test closes).
 
 angleenable: PnwVehicle.angle_lat now mirrors the driver-facing FordAngleLateral settings toggle
 (default OFF — see pnw_vehicle.py); with the param unset/False (this test's environment), a normal
-CarInterface must still never construct LateralAngleExt in production. This file proves two
-separate things that must BOTH hold:
+CarInterface must still never construct LateralAngleExt in production. This file proves three
+separate things that must ALL hold:
 
   1. The master gate is genuinely off BY DEFAULT — a normal CarInterface never constructs the
      angle-mode extension (test_angle_mode_off_by_default). Silently skipping this and only
-     testing #2 would miss a bug where the capability accidentally activates.
-  2. The MECHANISM itself is correct when exercised directly (bypassing the gate by assigning
+     testing #2/#3 would miss a bug where the capability accidentally activates.
+  2. The gate ACTUALLY ENABLES the angle path through the REAL construction path when flipped on
+     (test_angle_mode_real_construction_when_enabled) — no bypassing __init__. This closes a real
+     BLOCKER caught in review (2026-07-18): the original construction order built LateralCurvExt
+     unconditionally whenever four_signal_lat was True (which angle_lat requires), so the angle
+     path was NEVER actually constructed or dispatched even with the toggle on. This test
+     constructs for real, asserts the two strategies are mutually exclusive (_latext_angle is not
+     None AND _latext is None), and drives real frames through apply() to prove update()'s
+     dispatch — not just __init__ — takes the angle path (path_angle_last actually moves).
+  3. The MECHANISM itself is correct when exercised directly (bypassing the gate by assigning
      ci.CC._latext_angle post-construction, exactly as fordsafety2pnw's own
      test_ext_failures_fall_back_not_crash bypasses _longext/_latext) — full engaged loop at real
      speeds/curvatures, asserting the angle path is actually ACTIVE (no silent-fallback false
@@ -23,6 +31,8 @@ Run: pytest opendbc/car/ford/tests/test_engaged_smoke_angle_pnw.py -q
 """
 
 import importlib.util
+from unittest import mock
+
 import pytest
 
 from opendbc.car import DT_CTRL, structs
@@ -30,6 +40,7 @@ from opendbc.car.car_helpers import interfaces
 from opendbc.car.ford.values import CAR as FORD
 
 HAVE_CEREAL = importlib.util.find_spec("cereal") is not None
+HAVE_PARAMS = importlib.util.find_spec("openpilot.common.params") is not None
 
 V_EGO_SWEEP = [0.0, 5.0, 15.0, 31.0]
 CURVATURE_SWEEP = [0.0, 0.002, -0.002, 0.02, -0.02]
@@ -74,6 +85,61 @@ def test_angle_mode_off_by_default():
   # the 4-signal path must still be the live default (untouched by this port)
   if HAVE_CEREAL:
     assert ci.CC._latext is not None
+
+
+def _mock_params_angle_true():
+  """Patch openpilot.common.params.Params (the class PnwVehicle imports and constructs) so
+  Params().get_bool("FordAngleLateral") reads True through the REAL construction path -- no
+  bypassing __init__, no post-construction attribute swap."""
+  mock_instance = mock.MagicMock()
+  mock_instance.get_bool.return_value = True
+  return mock.patch("openpilot.common.params.Params", return_value=mock_instance)
+
+
+@pytest.mark.skipif(not HAVE_CEREAL or not HAVE_PARAMS,
+                     reason="needs cereal + openpilot.common.params on PYTHONPATH — run from the pnw-pilot venv")
+def test_angle_mode_real_construction_when_enabled():
+  """angleenable — regression test for the construction-order BLOCKER caught in review
+  (2026-07-18): the original __init__ ordering unconditionally constructed LateralCurvExt
+  whenever four_signal_lat was True (which angle_lat REQUIRES), so by the time the angle_lat
+  check ran, self._latext was never None and LateralAngleExt was NEVER constructed -- flipping
+  the FordAngleLateral toggle changed nothing on the wire; the car kept steering via the 4-signal
+  curvature path. This test does NOT bypass the gate (unlike test_angle_mode_engaged_smoke below,
+  which assigns _latext_angle directly onto an already-constructed CarController) -- it drives the
+  toggle through the REAL PnwVehicle -> CarController.__init__ construction path with
+  FordAngleLateral mocked True, and proves the angle path is both (a) what actually gets built and
+  (b) what actually gets DISPATCHED on a normal drive frame -- not just constructed and ignored."""
+  from opendbc.car.ford.lateral_angle_pnw import FORD_DBC_PATH_ANGLE_MAX, FORD_DBC_PATH_ANGLE_MIN
+
+  with _mock_params_angle_true():
+    ci = _make_interface(FORD.FORD_F_150_LIGHTNING_MK1)
+    ci.update([])
+
+  assert ci.CC._latext_angle is not None, \
+    "angle_lat=True did not construct LateralAngleExt through real CarController.__init__"
+  assert ci.CC._latext is None, (
+    "LateralCurvExt (4-signal curvature) was ALSO constructed while angle mode is enabled -- the " +
+    "two lateral strategies must be mutually exclusive, or update()'s dispatch (which checks " +
+    "self._latext first) silently keeps using the curvature path -- the exact bug this test closes"
+  )
+
+  # Drive real frames through apply() (not the extension directly) so update()'s dispatch itself
+  # is exercised, not just __init__. >= one STEER_STEP (20Hz) cycle guarantees a real lat_ctl send.
+  _set_speed(ci, 15.0)
+  cc = _engaged_cc(0.01)
+  now_nanos = 0
+  for _ in range(25):
+    ci.apply(cc, now_nanos)
+    now_nanos += int(DT_CTRL * 1e9)
+
+  assert ci.CC._latext_angle is not None, "angle path silently fell back to stock during dispatch"
+  pa = ci.CC._latext_angle.path_angle_last
+  assert FORD_DBC_PATH_ANGLE_MIN <= pa <= FORD_DBC_PATH_ANGLE_MAX
+  # path_angle_last only moves off its 0.0 initial value if update() was genuinely CALLED by
+  # CarController.update()'s dispatch (not just constructed and left idle) -- proves the angle
+  # path is actually taken, the precise gap the BLOCKER left open.
+  assert pa != 0.0, \
+    "LateralAngleExt was constructed but never actually dispatched -- path_angle never moved"
 
 
 @pytest.mark.skipif(not HAVE_CEREAL, reason="cereal not on PYTHONPATH — run from the pnw-pilot venv")
