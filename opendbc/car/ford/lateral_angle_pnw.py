@@ -198,8 +198,17 @@ class LateralAngleExt:
       lane_change_factor_high_ang=1.0,
       path_angle_blend_ratio=_FORD_PATH_ANGLE_BLEND_RATIO_DEFAULT,
       vlt_extra_max=_VLT_T_EXTRA_MAX,
-      gain_speed_lo_ms=13.5,
-      gain_speed_hi_ms=26.82,
+      # AUTHOR-CONFIRMED CORRECTION (2026-07-19), not a deviation: bp-7.0 ships 13.5 / 26.82 m/s
+      # (30.2 / 60.0 mph) in BOTH lateral_angle_ext.py:445-446 and his own angle_factor_adjuster.py
+      # :33-34, but Alan Polk confirmed directly that the intended anchors are 15 / 70 mph and that
+      # "30/60 is not enough". The shipped values are an upstream bug affecting every BluePilot Ford
+      # user. It matters because interp() CLAMPS: at 13.5 the curve gain is FLAT at
+      # 1.30*low_speed_curv_factor from 30 mph all the way down to 0, so no knob can separate 18 mph
+      # from 30 mph behaviour — which is exactly how a low-speed "fix" produced a 30 mph lane
+      # departure on 2026-07-19. Baked in as the DEFAULT (not left to the device-local JSON overlay)
+      # so a car with no overlay file gets the corrected behaviour rather than the buggy one.
+      gain_speed_lo_ms=15.0 * 0.44704,   # 6.7056 m/s = 15 mph
+      gain_speed_hi_ms=70.0 * 0.44704,   # 31.2928 m/s = 70 mph
       low_speed_boost=1.30,
       curvature_factor_bp_lo=0.0007,
       curvature_factor_bp_hi=0.001,
@@ -549,7 +558,7 @@ class LateralAngleExt:
     lateral_uncertainty = 0.0  # no curvature-limit ladder until angle-mode torque display is defined
 
     # Speed-interpolated gain: at low speed both curves use 1.0; at high speed the params take effect.
-    # Breakpoints / low-speed boost come from the tuning overlay (defaults: [13.5, 26.82] m/s, 1.30).
+    # Breakpoints / low-speed boost come from the tuning overlay (defaults: [6.7056, 31.2928] m/s = 15/70 mph, 1.30).
     self.low_gain_calc = interp(v_ego, self._gain_speed_bp, [1.0, self.path_angle_gain_lowC_highV])
     self.high_gain_calc = interp(v_ego, self._gain_speed_bp,
                                  [(self._low_speed_boost * self.low_speed_curv_factor),

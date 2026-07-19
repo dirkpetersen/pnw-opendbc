@@ -18,8 +18,10 @@ _DEFAULTS = AngleTuning(
   lane_change_factor_high_ang=1.0,
   path_angle_blend_ratio=0.50,
   vlt_extra_max=0.10,
-  gain_speed_lo_ms=13.5,
-  gain_speed_hi_ms=26.82,
+  # 15 / 70 mph — the author-confirmed correction to bp-7.0's shipped 13.5 / 26.82 (30 / 60 mph).
+  # See lateral_angle_pnw.py's _tuning_defaults for the full rationale.
+  gain_speed_lo_ms=15.0 * 0.44704,
+  gain_speed_hi_ms=70.0 * 0.44704,
   low_speed_boost=1.30,
   curvature_factor_bp_lo=0.0007,
   curvature_factor_bp_hi=0.001,

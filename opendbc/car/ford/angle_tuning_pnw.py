@@ -21,7 +21,8 @@ Only tuning-relevant, non-safety constants are exposed here (see the driver's br
       (bp-7.0's user-tunable "feel" multipliers; same clip ranges bp-7.0 itself enforces)
   - path_angle_blend_ratio                 (_FORD_PATH_ANGLE_BLEND_RATIO_DEFAULT, 0.50)
   - vlt_extra_max                          (_VLT_T_EXTRA_MAX, 0.10)
-  - gain_speed_lo_ms / gain_speed_hi_ms    (the [13.5, 26.82] gain-interp speed breakpoints)
+  - gain_speed_lo_ms / gain_speed_hi_ms    (gain-interp speed breakpoints; defaults 6.7056/31.2928
+    m/s = 15/70 mph — the AUTHOR-CONFIRMED correction to bp-7.0's shipped 13.5/26.82 = 30/60 mph)
   - low_speed_boost                        (the 1.30 low-speed-curvature boost, line 446)
   - curvature_factor_bp_lo / curvature_factor_bp_hi  (the [0.0007, 0.001] gain-boost breakpoints)
 
