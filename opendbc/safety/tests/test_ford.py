@@ -230,6 +230,21 @@ class TestFordSafetyBase(common.CarSafetyTest):
     }
     return self.packer.make_can_msg_safety("Lane_Assist_Data1", 0, values)
 
+  # angle2pnw: angle_mode_engaged + shadow_curvature, packed into Lane_Assist_Data1 bits with no
+  # DBC signal mapped to them (see fordcan_pnw.create_lka_msg / ford.h's FORD_Lane_Assist_Data1
+  # tx_hook check). No named-signal packer path exists for these bits, so build the raw bytes the
+  # same way fordcan_pnw.create_lka_msg does, then wrap with libsafety_py.make_CANPacket directly
+  # (bypassing make_can_msg_safety, which only knows named DBC signals).
+  def _lka_angle_msg(self, angle_mode_engaged: bool, shadow_curvature: float = 0.0):
+    addr, dat, bus = self.packer.make_can_msg("Lane_Assist_Data1", 0, {"LkaActvStats_D2_Req": 0})
+    dat = bytearray(dat)
+    raw = int(round(shadow_curvature / 1e-6))
+    raw = max(-32768, min(32767, raw)) & 0xFFFF
+    dat[4] |= 1 if angle_mode_engaged else 0
+    dat[5] = (raw >> 8) & 0xFF
+    dat[6] = raw & 0xFF
+    return libsafety_py.make_CANPacket(addr, bus, bytes(dat))
+
   # LCA command
   def _lat_ctl_msg(self, enabled: bool, path_offset: float, path_angle: float, curvature: float, curvature_rate: float):
     if self.STEER_MESSAGE == MSG_LateralMotionControl:
@@ -334,11 +349,18 @@ class TestFordSafetyBase(common.CarSafetyTest):
 
   def test_steer_allowed(self):
     # fordsafety2pnw: expectations rewritten for the BluePilot (alan-polk) 4-signal ford.h.
-    # Semantics under the ported safety:
-    #   - a frame with curvature == 0 AND path_angle == 0 is a "reset frame": it is ALWAYS
-    #     allowed (even with controls_allowed=False — the reset latch bypass, asserted here
-    #     deliberately to pin the ported behavior) and arms a 60-frame bypass latch, which we
-    #     drain before the next assertion.
+    # angle2pnw hardening round 2 (Fable finding, 2026-07-18): the "reset frame" branch below was
+    # rewritten. It used to assert curv0&&pa0&&controls_allowed is ALWAYS allowed regardless of
+    # path_offset/curvature_rate -- which was exactly BLOCKER #2 from the round-2 safety review:
+    # the reset-bypass latch was wiping the path_offset VALUE-RANGE check too, not just its ROC.
+    # After the fix, the latch only relaxes ROC-class checks; path_offset's value-range check
+    # (|path_offset| <= 1.0 m) now survives a reset frame exactly like it survives any other frame.
+    # Semantics under the ported (and now round-2-hardened) safety:
+    #   - a frame with curvature == 0 AND path_angle == 0 is a "reset frame" while engaged: its
+    #     RATE-OF-CHANGE checks are bypassed (arms a 60-frame ROC-relaxation latch, drained before
+    #     the next assertion) but its VALUE-RANGE checks are NOT -- curvature/path_angle are
+    #     trivially in-range at curv0/pa0, so only path_offset's own value range can still block it.
+    #     (Disengaged reset frames are untested here — see test_reset_latch_blocked_when_disengaged.)
     #   - otherwise, with steer request off everything must be zero (and curvature==0&&pa==0 is
     #     the reset frame case), so all remaining request-off combos are blocked.
     #   - with steer request on: controls must be allowed; path_angle and path_offset must be
@@ -386,8 +408,13 @@ class TestFordSafetyBase(common.CarSafetyTest):
                   # latch is inert and each frame is judged by the normal per-signal checks (stock
                   # semantics): only an all-zero steer command is allowed while controls_allowed=False.
                   if curv0 and pa0 and controls_allowed:
-                    # reset frame while engaged: bypass all checks, arms the 60-frame latch
-                    should_tx = True
+                    # reset frame while engaged: bypasses ROC checks (arms the 60-frame latch,
+                    # unconditionally -- the latch arms regardless of whether the frame itself ends
+                    # up blocked), but path_offset's VALUE-RANGE check survives (angle2pnw hardening
+                    # round 2 -- see this test's docstring). curvature_rate's value range is vacuous
+                    # (never blocks, see test_curvature_rate_signal_checks); curvature/path_angle
+                    # are trivially in-range at curv0/pa0.
+                    should_tx = po0
                     latch_armed = True
                   elif not steer_control_enabled:
                     # steer request off: the frame must be FULLY neutral (all four signals zero);
@@ -521,6 +548,187 @@ class TestFordSafetyBase(common.CarSafetyTest):
     # and again right after another neutral frame (no arming path exists while disengaged)
     self._tx(self._lat_ctl_msg(True, 0, 0, 0, 0))
     self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.2, 0.01, 0)))
+
+  # angle2pnw: dedicated tests for the angle-primary lateral mode safety additions (bp-7.0 port,
+  # first pass). Mirrors the fordsafety2pnw doctrine above -- BluePilot shipped no test coverage
+  # for its own angle-mode ford.h either; these pin the ported-and-hardened behavior exactly as
+  # compiled, and specifically the two ANTI-HOLE properties this merge had to preserve: the
+  # corroborated wide-range path_angle value gate cannot be forged by a curvature-only frame, and
+  # neither it nor the reset-bypass latch can ever substitute for controls_allowed.
+
+  def test_angle_mode_value_range_requires_engaged_flag(self):
+    """ANTI-HOLE: the wide DBC path_angle range (+-0.5/0.5235 rad) only applies once
+    ford_bp_angle_mode_engaged is corroborated via Lane_Assist_Data1 -- a frame cannot unlock it by
+    merely sending curvature=0. 0.35 rad is inside the wide DBC range but outside the tight
+    curvature-mode +-0.25 rad cap that applies whenever the corroboration is absent."""
+    self._drain_reset_latch()
+    self.safety.set_controls_allowed(True)
+    speed = 5.
+    self._reset_curvature_measurement(0, speed)
+
+    self._tx(self._lka_angle_msg(False))  # ensure the static starts disarmed
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.35, 0, 0)))
+
+    # Corroborate angle mode -- desired_path_angle_last is already primed to 0.35 from the blocked
+    # frame above (state updates even on blocked frames, see test_path_angle_limits), so this is a
+    # zero-delta repeat and isolates the value check specifically (no ROC interaction).
+    self._tx(self._lka_angle_msg(True))
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0.35, 0, 0)))
+
+    # Revoking the flag re-tightens the value range on the very next frame.
+    self._tx(self._lka_angle_msg(False))
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.35, 0, 0)))
+
+  def test_angle_mode_curvature_zero_requires_controls_allowed(self):
+    """ANTI-HOLE: when desired_curvature == 0 (angle mode's normal operating point -- it holds
+    curvature at the inactive sentinel while path_angle does the real steering),
+    steer_angle_cmd_checks's deviation-vs-measured logic goes moot, so this port substitutes an
+    explicit controls_allowed gate in its place (bp-7.0 used `controls_allowed ||
+    controls_allowed_lateral` here for MADS; this tree has none, so plain controls_allowed --
+    strictly narrower -- is substituted; see the identical comment at both call sites in ford.h).
+    Prove the substitution actually gates: a small path_angle command, comfortably inside both the
+    ROC and (engaged, widened) value budgets so nothing else could explain a block, is allowed
+    while engaged and blocked while disengaged.
+
+    angle2pnw hardening round 2: the LKA corroboration must happen WHILE controls_allowed is
+    True (see ford_bp_angle_mode_engaged's assignment gate in ford.h) -- so
+    set_controls_allowed(True) now runs before the corroborating LKA send, not after."""
+    self._drain_reset_latch()
+    self._reset_curvature_measurement(0, 5.)
+    self.safety.set_controls_allowed(True)
+    self._tx(self._lka_angle_msg(True))  # corroborate angle mode -- the realistic operating point
+
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0.03, 0, 0)))
+
+    self.safety.set_controls_allowed(False)
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.03, 0, 0)))
+
+  def test_angle_mode_reset_latch_blocked_when_disengaged(self):
+    """ANTI-HOLE: the reset-bypass latch's pnw-hardening (see
+    test_reset_latch_blocked_when_disengaged above) must hold identically when angle mode is
+    corroborated engaged -- the widened path_angle value range must never interact with or weaken
+    the latch's controls_allowed gate. Mirrors that test exactly (same 0.2 rad / 0.01 curvature
+    probe, chosen there so only the latch bypass -- not the ROC budget -- could explain a pass),
+    with ford_bp_angle_mode_engaged=True threaded through the whole sequence."""
+    self._drain_reset_latch()
+    self._reset_curvature_measurement(0, 5.)
+    self._tx(self._lka_angle_msg(True))
+
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0, 0, 0)))       # arms latch
+    self.safety.set_controls_allowed(False)
+
+    for _ in range(5):
+      self._tx(self._lat_ctl_msg(True, 0, 0, 0, 0))
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.2, 0.01, 0)))
+    self._tx(self._lat_ctl_msg(True, 0, 0, 0, 0))
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.2, 0.01, 0)))
+
+  def test_angle_mode_shadow_curvature_deviation_check(self):
+    """angle2pnw: ford_shadow_curvature_error_check fires when angle mode is confirmed engaged and
+    the commanded shadow_curvature diverges from measured curvature by more than the tolerance,
+    above angle_error_min_speed -- the only cross-check angle mode has against reality, since
+    desired_curvature stays pinned at the inactive sentinel (0) on the wire in that mode."""
+    self._drain_reset_latch()
+    speed = 15.  # > FORD_STEERING_LIMITS.angle_error_min_speed (10.0)
+    self._reset_curvature_measurement(0, speed)  # measured curvature ~= 0
+    self.safety.set_controls_allowed(True)
+
+    self._tx(self._lka_angle_msg(True, shadow_curvature=0.0))
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0.03, 0, 0)))
+
+    # shadow_curvature far from measured (0.015 1/m, well beyond MAX_CURVATURE_ERROR=0.002): the
+    # corroborated deviation check blocks it even though desired_curvature is 0 on the wire.
+    self._tx(self._lka_angle_msg(True, shadow_curvature=0.015))
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.03, 0, 0)))
+
+    # Dropping the engaged flag (curvature mode) skips the check entirely -- same frame passes.
+    self._tx(self._lka_angle_msg(False))
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0.03, 0, 0)))
+
+  # angle2pnw hardening round 2 (Gemini + Fable safety review, 2026-07-18): pinning tests for the
+  # 2 BLOCKER + 1 SHOULD-FIX findings from that review. See the matching ford.h comments at each
+  # fix's call site for the full reasoning.
+
+  def test_curvature_zero_step_still_roc_checked(self):
+    """BLOCKER (Gemini): in CURVATURE mode (angle mode NOT corroborated), a command of exactly 0
+    must NOT skip steer_angle_cmd_checks's result. The pre-fix code (`if (desired_curvature != 0)
+    { violation |= curvature_violation }`) applied regardless of mode, so curvature == 0 always
+    skipped applying the check -- a one-frame step from full-lock curvature straight to 0 defeated
+    the deployed unwind-rate limit. A nonzero path_angle keeps this frame out of the neutral/
+    reset-frame classification (which has its own, separately-tested latch amnesty), isolating the
+    curvature ROC/deviation check specifically."""
+    self._drain_reset_latch()
+    self.safety.set_controls_allowed(True)
+    speed = 25.
+    self._reset_curvature_measurement(self.MAX_CURVATURE, speed)
+    self._set_prev_desired_angle(self.MAX_CURVATURE)  # prime desired_angle_last at full lock
+    self._tx(self._lka_angle_msg(False))  # ensure curvature mode (angle NOT corroborated)
+
+    # a one-frame step from MAX_CURVATURE to 0; a 1-CAN-unit path_angle avoids the neutral/reset
+    # classification without itself being able to trip any path_angle check.
+    tiny_path_angle = 1 / self.PATH_ANGLE_DEG_TO_CAN
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, tiny_path_angle, 0, 0)))
+
+  def test_angle_mode_value_range_survives_latch_amnesty(self):
+    """BLOCKER (Fable): the reset-bypass latch must relax ONLY ROC-class checks, never the
+    path_angle value-range check -- even in plain CURVATURE mode (angle mode not corroborated),
+    where the tight +-0.25 rad cap applies. Previously a single `violation` bool meant an armed
+    latch (which re-arms on every straight-road neutral frame, in EITHER mode, not just after a
+    human-turn) also wiped the value-range check for the whole ~3s window, so a single frame with
+    path_angle beyond the tight cap -- but still representable on the wire (the raw 11-bit field
+    spans the full angle-mode DBC range) -- would pass."""
+    self._drain_reset_latch()
+    self.safety.set_controls_allowed(True)
+    speed = 5.
+    self._reset_curvature_measurement(0, speed)
+    self._tx(self._lka_angle_msg(False))  # curvature mode: angle NOT corroborated, tight cap applies
+
+    # a genuine neutral frame arms the latch
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0, 0, 0)))
+
+    # latch is now armed -- 0.4 rad exceeds the tight 0.25 cap but is representable on the wire
+    # (within the 11-bit field's full range) -- must STILL be blocked by the value-range check.
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.4, 0, 0)))
+
+  def test_angle_mode_shadow_curvature_survives_latch_amnesty(self):
+    """BLOCKER (Fable): the shadow-curvature deviation check must survive the reset-latch amnesty
+    too -- an armed latch (routine on any straight stretch in angle mode) must not wave through a
+    divergent shadow_curvature just because a neutral frame happened to arm it."""
+    self._drain_reset_latch()
+    speed = 15.  # > angle_error_min_speed
+    self._reset_curvature_measurement(0, speed)
+    self._tx(self._lka_angle_msg(True, shadow_curvature=0.0))
+    self.safety.set_controls_allowed(True)
+
+    # a genuine neutral frame (curvature==0, path_angle==0) arms the latch
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0, 0, 0)))
+
+    # latch is now armed -- a divergent shadow_curvature must still be blocked
+    self._tx(self._lka_angle_msg(True, shadow_curvature=0.015))
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.03, 0, 0)))
+
+  def test_angle_mode_wide_range_requires_controls_allowed(self):
+    """SHOULD-FIX (Fable + Gemini): the corroborating angle_mode_engaged bit alone must never
+    unlock the wide DBC path_angle range -- controls_allowed must ALSO be true, both at the moment
+    the bit is read (LKA TX) and at the moment the range is selected (LMC/LMC2 TX). Set the LKA
+    angle bit while disengaged, then probe: the tight range must still apply."""
+    self._drain_reset_latch()
+    speed = 5.
+    self._reset_curvature_measurement(0, speed)
+
+    self.safety.set_controls_allowed(False)
+    self._tx(self._lka_angle_msg(True))  # bit set, but controls_allowed is False right now
+
+    self.safety.set_controls_allowed(True)
+    # 0.35 rad: inside the wide DBC range, outside the tight +-0.25 cap. If the flag had latched
+    # True despite being set while disengaged, this would incorrectly pass now.
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.35, 0, 0)))
+
+    # sanity: corroborating the SAME bit while controls_allowed is True DOES unlock the wide range
+    # (state from the blocked frame above already primed desired_path_angle_last=0.35).
+    self._tx(self._lka_angle_msg(True))
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0.35, 0, 0)))
 
   def test_path_angle_limits(self):
     """Path angle: per-frame rate-of-change limit + |0.25| rad value limit (BluePilot values)."""

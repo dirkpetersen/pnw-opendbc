@@ -41,3 +41,47 @@ class PnwVehicle:
     # gas/accel by lead state above ~50 mph, split brake/precharge hysteresis. Only meaningful
     # when openpilot owns longitudinal, so gate on op_long: inert until Alpha Long is enabled.
     self.bp_long_follow: bool = self.op_long and fp == "FORD_F_150_LIGHTNING_MK1"
+
+    # angle2pnw-faithful2 (2026-07-19): BluePilot bp-7.0 angle-primary lateral strategy
+    # (LateralAngleExt) — Alan Polk's "Return of Angle Control" design (bluepilot.dev, 2026-07-15;
+    # spec archived in drives/2026-07-18/lightning-angle-steering/). Sets c2 (curvature) and c3
+    # (curvature_rate) to ZERO on the LMC/LMC2 wire and derives path_angle (c1) directly as
+    # path_angle = kappa_cmd * v_ego * curvature_factor(...) — see lateral_angle_pnw.py for the
+    # full, faithfully-ported control law. Independent of four_signal_lat (does not require the
+    # 4-signal curvature_rate panda safety); requires only the angle-mode value-range + ROC
+    # additions carried into this port's opendbc/safety/modes/ford.h.
+    #
+    # angle_lat is the master gate, driver-flippable via the FordAngleLateral settings toggle
+    # (default OFF — common/params_keys.h registers it PERSISTENT/BOOL/"0"). Gated directly on
+    # carFingerprint here (not on four_signal_lat, a DIFFERENT and unrelated capability for the
+    # old 4-signal curvature-rate path) because angle mode's panda safety is a self-contained
+    # addition that does not depend on four_signal_lat's curvature_rate machinery being flashed.
+    # Params() read/import is RUNTIME-GUARDED (opendbc cannot assume openpilot.* is importable on a
+    # bare checkout): any failure leaves angle_lat False, matching every other params-gated
+    # capability in this tree.
+    self.angle_lat: bool = False
+    if fp == "FORD_F_150_LIGHTNING_MK1":
+      try:
+        from openpilot.common.params import Params
+        self.angle_lat = bool(Params().get_bool("FordAngleLateral"))
+      except Exception:
+        self.angle_lat = False
+
+    # Per-platform path_angle gain defaults (low-curvature, high-curvature gain-table endpoints),
+    # Alan Polk's bp-7.0 values verbatim (his _GAIN_CAN / _GAIN_CANFD_BOF / _GAIN_CANFD_SUV and
+    # their _CANFD_BOF_CARS / _CANFD_SUV_CARS set membership, opendbc/sunnypilot/car/ford/
+    # lateral_angle_ext.py lines 36-52) — not user-tunable in his code either, fixed to body style.
+    # He drives an F-150 Lightning himself, so the CANFD_BOF pair applies to our truck directly
+    # with no reinterpretation. Populated for every Ford body style (not just the Lightning)
+    # because pnw_vehicle is the correct home for ANY carFingerprint-conditioned data, even for a
+    # platform we don't currently drive; consumed only when angle_lat is enabled for that platform
+    # (see lateral_angle_pnw.LateralAngleExt.__init__, which also allows on-road JSON-overlay
+    # tuning of this pair without moving the fingerprint check out of this file).
+    _canfd_bof_cars = ("FORD_F_150_MK14", "FORD_F_150_LIGHTNING_MK1", "FORD_EXPEDITION_MK4", "FORD_RANGER_MK2")
+    _canfd_suv_cars = ("FORD_MUSTANG_MACH_E_MK1", "FORD_ESCAPE_MK4_5")
+    if fp in _canfd_bof_cars:
+      self.angle_gain: tuple[float, float] = (0.95, 0.95)
+    elif fp in _canfd_suv_cars:
+      self.angle_gain = (1.00, 1.05)
+    else:
+      self.angle_gain = (1.00, 1.15)
