@@ -65,10 +65,10 @@ class Footnote(Enum):
     Column.MODEL,
   )
   LIGHTNING = CarFootnote(
-    "PNW: driven daily on this fork, but NOT shown in upstream comma docs — the Ford Q4 harness triggers " +
-    "Traction Control / Park Assist / One Pedal Drive errors on Lightnings while openpilot is not running " +
-    "(commaai/openpilot#30302, still open). Listed here because this fork targets this vehicle; be aware of " +
-    "the harness issue before installing.",
+    "REQUIRES the BluePilot Lightning Coupler (https://bluepilot.dev/) in addition to the Ford Q4 harness. " +
+    "Without it the truck throws Traction Control / Park Assist / One Pedal Drive errors whenever openpilot " +
+    "is not running (commaai/openpilot#30302, still open upstream — which is why comma hides this car from " +
+    "its own docs). With the coupler fitted the Lightning is driven daily on this fork.",
     Column.MODEL,
   )
 
@@ -124,7 +124,8 @@ class FordF150LightningPlatform(FordCANFDPlatformConfig):
   # commaai/openpilot#30302 (Ford Q4 harness triggers Traction Control / Park Assist / One Pedal
   # Drive errors while openpilot is NOT running). That issue is still open, but this fork exists
   # to drive this exact vehicle, so we keep the entry and carry the caveat as Footnote.LIGHTNING
-  # instead of hiding the car. The suppression is deliberately NOT reinstated -- see the footnote.
+  # instead of hiding the car (the coupler from bluepilot.dev resolves it). The suppression is
+  # deliberately NOT reinstated -- see Footnote.LIGHTNING for the required hardware.
   pass
 
 
