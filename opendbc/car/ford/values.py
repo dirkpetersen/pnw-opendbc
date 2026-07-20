@@ -64,6 +64,13 @@ class Footnote(Enum):
     "North and South America/Southeast Asia.",
     Column.MODEL,
   )
+  LIGHTNING = CarFootnote(
+    "PNW: driven daily on this fork, but NOT shown in upstream comma docs — the Ford Q4 harness triggers " +
+    "Traction Control / Park Assist / One Pedal Drive errors on Lightnings while openpilot is not running " +
+    "(commaai/openpilot#30302, still open). Listed here because this fork targets this vehicle; be aware of " +
+    "the harness issue before installing.",
+    Column.MODEL,
+  )
 
 
 @dataclass
@@ -113,11 +120,12 @@ class FordCANFDPlatformConfig(FordPlatformConfig):
 
 @dataclass
 class FordF150LightningPlatform(FordCANFDPlatformConfig):
-  def init(self):
-    super().init()
-
-    # Don't show in docs until this issue is resolved. See https://github.com/commaai/openpilot/issues/30302
-    self.car_docs = []
+  # PNW: upstream clears car_docs here so the Lightning never appears in CARS.md, pending
+  # commaai/openpilot#30302 (Ford Q4 harness triggers Traction Control / Park Assist / One Pedal
+  # Drive errors while openpilot is NOT running). That issue is still open, but this fork exists
+  # to drive this exact vehicle, so we keep the entry and carry the caveat as Footnote.LIGHTNING
+  # instead of hiding the car. The suppression is deliberately NOT reinstated -- see the footnote.
+  pass
 
 
 class CAR(Platforms):
@@ -156,7 +164,7 @@ class CAR(Platforms):
     CarSpecs(mass=2000, wheelbase=3.69, steerRatio=17.0),
   )
   FORD_F_150_LIGHTNING_MK1 = FordF150LightningPlatform(
-    [FordCarDocs("Ford F-150 Lightning 2022-25", "Co-Pilot360 Assist 2.0")],
+    [FordCarDocs("Ford F-150 Lightning 2022-25", "Co-Pilot360 Assist 2.0", footnotes=[Footnote.LIGHTNING])],
     CarSpecs(mass=2948, wheelbase=3.70, steerRatio=16.9),
   )
   FORD_FOCUS_MK4 = FordPlatformConfig(
