@@ -11,6 +11,7 @@ from opendbc.car.fw_versions import ObdCallback, get_fw_versions_ordered, get_pr
 from opendbc.car.mock.values import CAR as MOCK
 from opendbc.car.values import BRANDS
 from opendbc.car.vin import get_vin, is_valid_vin, VIN_UNKNOWN
+from opendbc.car.vin_fallbacks import decode_vin_platform
 
 FRAME_FINGERPRINT = 100  # 1s
 
@@ -47,8 +48,20 @@ interfaces = load_interfaces(interface_names)
 #   breaking exact FW matching (the 2025 Lightning is exact-match-only: its EPS answers no Ford
 #   platform-code query, so fuzzy matching can never rescue it). The VIN never changes.
 # "no_vin_platform": two-car-fleet inference — when everything failed AND the live-queried VIN reads
-#   UNKNOWN, assume the fleet car whose VIN is unreadable over CAN (the Tesla Raven).
+#   UNKNOWN, assume the fleet car whose VIN is unreadable over CAN (the Tesla Raven). This is also
+#   the ONLY identity path for a car whose platform split isn't encoded in the VIN at all (Tesla
+#   HW2/HW3/HW4 — see vin_fallbacks.py's module docstring, §4.4 of the design doc).
 # Missing/unparseable file, or a platform name not in `interfaces` -> stock behavior (MOCK).
+#
+# vinfp2pnw (2026-08): a THIRD layer sits between the two above — decode_vin_platform()
+# (opendbc/car/vin_fallbacks.py) is an IN-REPO (not on-device, not personal data), declarative
+# registry that recognizes an entire vehicle CLASS (make/model/year) by decoding fixed VIN
+# positions, so a known-unreliable-fingerprint model doesn't need every individual VIN enumerated
+# in fleet_vins.json. "vins" (exact-VIN) still wins when both match — it's the more specific,
+# manually-curated override; the decode registry is the generalization beneath it. See
+# docs/VIN-FINGERPRINT2PNW.md §6 for the full precedence and §7 for the safety analysis (this
+# selects the panda safety model indirectly via the fingerprint, so it stays conservative-or-nothing
+# throughout: any ambiguity in either layer resolves to "assign nothing", never a guess).
 PNW_FLEET_FILE = "/data/pnw/fleet_vins.json"
 
 
@@ -183,17 +196,33 @@ def fingerprint(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_mu
   # CarParamsCache is CLEAR_ON_MANAGER_START so cache can't cross a swap anyway — belt and braces).
   # Logged loudly so a fallback hit is visible and the new FW strings get captured + added to
   # fingerprints.py (see pnw-pilot-deploy skill, vendor-OTA recipe).
+  #
+  # vinfp2pnw precedence (design doc §6): exact-VIN safety net (fleet_vins.json "vins") first — it's
+  # the manually-curated, most-specific override — THEN the in-repo decode registry (any instance of
+  # a known make/model/year, matched by decoding the live VIN), THEN "no_vin_platform" for a car
+  # whose VIN is unreadable/undecodable (the Raven; VIN decode can never identify it — see
+  # vin_fallbacks.py §4.4). Only ONE of these three ever supplies `fallback`, in that order.
   if car_fingerprint is None and not cached:
     fleet = pnw_fleet_config()
-    fallback = fleet.get("vins", {}).get(vin) if vin != VIN_UNKNOWN else fleet.get("no_vin_platform")
+    fallback = None
+    fallback_kind = None
+    if vin != VIN_UNKNOWN:
+      fallback = fleet.get("vins", {}).get(vin)
+      fallback_kind = "exact_vin"
+      if fallback is None:
+        fallback = decode_vin_platform(vin)
+        fallback_kind = "vin_decode"
+    else:
+      fallback = fleet.get("no_vin_platform")
+      fallback_kind = "no_vin"
     if fallback is not None and fallback in interfaces:
       car_fingerprint = fallback
       source = CarParams.FingerprintSource.fixed
       exact_match = True
       carlog.error({"event": "PNW fleet identity fallback", "vin": vin, "car_fingerprint": car_fingerprint,
-                    "fw_count": len(car_fw)})
+                    "fw_count": len(car_fw), "fallback_kind": fallback_kind})
     elif fallback is not None:
-      carlog.error({"event": "PNW fleet fallback IGNORED - unknown platform in fleet_vins.json", "platform": str(fallback)})
+      carlog.error({"event": "PNW fleet fallback IGNORED - unknown platform", "platform": str(fallback), "fallback_kind": fallback_kind})
 
   if fixed_fingerprint:
     car_fingerprint = fixed_fingerprint
