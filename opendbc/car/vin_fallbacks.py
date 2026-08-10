@@ -157,13 +157,38 @@ def _expand_years(year) -> set[int]:
   return set(year)
 
 
-def _char_at(vin: str, position_1_indexed: int) -> str:
-  return vin[position_1_indexed - 1]
+# N2 (adversarial-review should-fix, fixed 2026-08-10): a registry row is DATA — a future typo
+# (a string-vs-int position key, an out-of-range position, a dash-less span key, an unparseable
+# `year`) must never crash `fingerprint()` at car startup. `_normalize_position` below is the one
+# place a `pos`/`span` position is turned into a bounds-checked int; it's used by BOTH `pos` (via
+# `_char_at`) and `span` (via `_span_at`), and it deliberately RAISES ValueError on anything it
+# can't make sense of rather than silently guessing — `_entry_matches`'s try/except (below) is what
+# turns that raise into a safe "skip this one malformed entry" instead of a propagated exception.
+def _normalize_position(position) -> int:
+  """Normalize a 1-indexed VIN position key to int, accepting either a native int or a numeric
+  string — the design doc's own JSONC illustration (§2.3) writes `pos` keys as strings
+  (e.g. `{"8": [...]}`), so `8` and `"8"` must be treated identically, not as a malformed shape.
+  Raises ValueError/TypeError if the key isn't int-parseable or falls outside the valid 1-17 VIN
+  character range; the caller is always wrapped by `_entry_matches`'s fail-safe try/except, so this
+  raising is what marks "this registry entry is malformed" — it is never allowed to escape this
+  module."""
+  position_int = int(position)
+  if not (1 <= position_int <= 17):
+    raise ValueError(f"VIN position {position_int} is outside the valid 1-17 range")
+  return position_int
+
+
+def _char_at(vin: str, position_1_indexed) -> str:
+  return vin[_normalize_position(position_1_indexed) - 1]
 
 
 def _span_at(vin: str, span_1_indexed: str) -> str:
-  start_str, _, end_str = span_1_indexed.partition('-')
-  start, end = int(start_str), int(end_str)
+  start_str, sep, end_str = str(span_1_indexed).partition('-')
+  if not sep:
+    raise ValueError(f"span key {span_1_indexed!r} is missing the required 'a-b' separator")
+  start, end = _normalize_position(start_str), _normalize_position(end_str)
+  if start > end:
+    raise ValueError(f"span key {span_1_indexed!r} has start > end")
   return vin[start - 1:end]
 
 
@@ -181,18 +206,45 @@ VIN_FALLBACK_REGISTRY: list[VinFallbackEntry] = [
   # — design doc §4.1: "F-150 Lightning" is its own model, not an F-150 trim).
   #
   # wmi: "1FT" = Ford Motor Co., truck, USA (design doc §3.1). Covers both the 2022-23 "1FTVW..."
-  #   and 2024-25 "1FT6W..." generations — position 4 (body/GVWR code) differs by generation and is
-  #   deliberately NOT constrained here; only the 3-char WMI prefix is required.
+  #   and 2024-25 "1FT6W..." generations, but ALSO every other Ford truck/van built off the same
+  #   WMI family — F-150 (ICE), Super Duty, Transit, E-Transit, E-Series. wmi alone is NOT
+  #   sufficient to isolate the Lightning; see the pos{4: ...} gate below (B1).
   #
-  # pos {8: [...]}: THE EV-VS-ICE DISCRIMINATOR. Position 8 is the engine/battery code, and this is
-  #   the ONLY reliable way to tell a Lightning from a gas F-150 by VIN (design doc §4.2-§4.3): the
-  #   series/trim code at positions 5-7 is NOT usable for this because the ICE F-150 and the
-  #   Lightning literally SHARE several series letters (e.g. "W3L"/"W5L"/"W7L" appear on both an ICE
-  #   XLT/Lariat/Platinum and an EV Flash/Lariat/Platinum) — keying EV detection on the series code
-  #   would risk mis-assigning a GAS truck to the Lightning platform, which is a safety-relevant
-  #   fingerprinting error (wrong actuator messages / wrong panda safety expectations). Position 8's
-  #   codes are electric-only for this model: L/V (2022-23 SR/ER), K/S (2024-25 SR/SR-LFP), 7/M
-  #   (2024-25 ER retail/fleet). See design doc §3.2 for the full per-code battery/chemistry table.
+  # pos {4: [...], 8: [...]}: THE EV-VS-ICE-AND-VAN DISCRIMINATOR — TOGETHER, position 4 AND
+  #   position 8 are what isolate "F-150 Lightning" from the rest of the 1FT family. BOTH are
+  #   SAFETY-LOAD-BEARING: a wrong match here selects the wrong car interface / panda safety
+  #   expectations.
+  #
+  #   pos 8 alone is NOT enough (B1, adversarial-review-caught 2026-08-10): position 8 is
+  #   electric-only for the Lightning (see the code list below), but position 8 is NOT unique to the
+  #   Lightning within the 1FT WMI — e.g. a real 2023 Ford E-TRANSIT ("1FTBW3XKXPKB78450", a BEV
+  #   van, NOT the Lightning) shares Lightning electric position-8 code 'K'. Since 1FT covers ALL
+  #   Ford trucks/vans (§4.2-§4.3 of the design doc did not anticipate the E-Transit/Super-Duty
+  #   overlap), position 8 alone over-matches the whole 1FT family's BEV variants.
+  #
+  #   pos 4 (body/GVWR code) is what actually narrows it to the Lightning body: 'V' (2022-23
+  #   generation) / '6' (2024-25 generation) — see design doc §3.1 (position 4 field) and §3.4 (the
+  #   reference VIN "1FT6W3L78SWG05094" has pos4='6'). The E-Transit's body code is 'B' (van);
+  #   Super Duty trucks use '7'/'8' body codes that are DIFFERENT from the Lightning's — so pos4
+  #   excludes both. NOTE: pos4 '7'/'8' ALSO happen to appear as Lightning-electric codes at position
+  #   8 (see the list below) — that is a coincidence of the two independent code tables, not a
+  #   contradiction; pos4 and pos8 are checked against different VIN characters.
+  #
+  #   ⚠ TODO(§9, design doc): the pos4 code set {'V', '6'} is NOT yet independently verified against
+  #   the Ford Pro VIN guide (Rev 11) the way pos8 was cross-checked — it is inferred from the single
+  #   reference VIN + the design doc's position-4 field description. Like the ⚠ R/U pos8 codes
+  #   below, treat {'V', '6'} as the best-known set, not a guaranteed-complete one, until it's been
+  #   checked against the Ford VIN guide + more real Lightning VINs (both generations, multiple
+  #   trims). If a real, valid Lightning VIN is ever seen with a pos4 code outside {'V', '6'}, this
+  #   set is incomplete and must be updated — until then an unrecognized pos4 code fails safe (no
+  #   match -> MOCK, not a wrong assignment), never a wrong assignment.
+  #
+  #   Position 8's codes are electric-only for this model: L/V (2022-23 SR/ER), K/S (2024-25
+  #   SR/SR-LFP), 7/M (2024-25 ER retail/fleet). See design doc §3.2 for the full per-code
+  #   battery/chemistry table. The series/trim code at positions 5-7 remains unusable as a
+  #   discriminator (design doc §4.2): the ICE F-150 and the Lightning literally SHARE several
+  #   series letters (e.g. "W3L"/"W5L"/"W7L" appear on both an ICE XLT/Lariat/Platinum and an EV
+  #   Flash/Lariat/Platinum).
   #
   #   NOT INCLUDED: position-8 codes 'R' and 'U'. The design doc (§3.2, §9.1) flags these as
   #   ⚠ UNVERIFIED — sourced only from forum/decoder threads and conflicting with the
@@ -214,14 +266,20 @@ VIN_FALLBACK_REGISTRY: list[VinFallbackEntry] = [
     platform='FORD_F_150_LIGHTNING_MK1',
     match={
       'wmi': ['1FT'],
-      'pos': {8: ['L', 'V', 'K', 'S', '7', 'M']},
+      'pos': {4: ['V', '6'], 8: ['L', 'V', 'K', 'S', '7', 'M']},
     },
   ),
 ]
 
 
-def _entry_matches(vin: str, entry: VinFallbackEntry) -> bool:
-  """§5 steps 2-5: evaluate one entry's declarative `match` spec (+ year) against a valid VIN."""
+def _entry_matches_unsafe(vin: str, entry: VinFallbackEntry) -> bool:
+  """§5 steps 2-5: evaluate one entry's declarative `match` spec (+ year) against a valid VIN.
+
+  "Unsafe" = this function may raise (TypeError/ValueError/AttributeError/IndexError/KeyError) on a
+  malformed entry (bad `match` shape, unparseable `pos`/`span` keys, an unparseable `year`). It is
+  never called directly outside this module — `_entry_matches` (below) is the fail-safe wrapper
+  every caller actually uses.
+  """
   match = entry.match
 
   wmi_list = match.get('wmi')
@@ -247,6 +305,24 @@ def _entry_matches(vin: str, entry: VinFallbackEntry) -> bool:
       return False
 
   return True
+
+
+def _entry_matches(vin: str, entry: VinFallbackEntry) -> bool:
+  """N2 (adversarial-review should-fix, fixed 2026-08-10): fail-safe wrapper around
+  `_entry_matches_unsafe`. The registry is DATA reviewed as data, not code — a future typo (a `year`
+  that isn't one of the three documented shapes, a dash-less `span` key, a `pos` key outside 1-17,
+  a non-dict `match`, ...) must never propagate out of this module and crash `fingerprint()` at car
+  startup (car_helpers.py calls `decode_vin_platform()` with no guard of its own beyond the one this
+  wrapper provides — see also car_helpers.py's own try/except around that call, defense in depth).
+  A malformed entry is treated as simply not matching (skipped), exactly like a well-formed entry
+  that legitimately doesn't match this VIN — it never poisons evaluation of the OTHER entries in the
+  registry. Every skip is logged loudly so a real typo gets caught and fixed."""
+  try:
+    return _entry_matches_unsafe(vin, entry)
+  except Exception as e:
+    carlog.error({"event": "VIN decode registry entry malformed - skipping entry (fail-safe)",
+                  "entry": repr(entry), "error": repr(e)})
+    return False
 
 
 def _specificity(entry: VinFallbackEntry) -> int:
