@@ -24,20 +24,21 @@ LIGHTNING = "FORD_F_150_LIGHTNING_MK1"
 REFERENCE_VIN = "1FT6W3L78SWG05094"
 
 
-def _vin(wmi='1FT', pos4='6', pos8='7', pos10='S', filler='A'):
-  """Build a 17-char synthetic test VIN with an explicit WMI (positions 1-3), body/GVWR code
-  (position 4), engine/battery code (position 8), and model-year code (position 10); every other
+def _vin(wmi='1FT', series='W3L', pos8='7', pos10='S', filler='A'):
+  """Build a 17-char synthetic test VIN with an explicit WMI (positions 1-3), series/trim code
+  (positions 5-7), engine/battery code (position 8), and model-year code (position 10); every other
   position is a charset-legal filler character. All positions are 1-indexed to match the design doc
   / vin_fallbacks.py convention.
 
-  pos4 defaults to '6' (a valid Lightning body code, design doc §3.1/§3.4) rather than the generic
-  filler so every EXISTING "expect a Lightning match" test keeps passing after the B1 fix added a
-  pos4 gate to the shipped registry row - callers that want to test the pos4 gate itself (e.g. an
-  E-Transit/Super-Duty negative case) pass an explicit pos4.
+  series defaults to 'W3L' (a valid F-150 Lightning series code, design doc §3.1 - also the
+  reference VIN's own series code) rather than the generic filler so every EXISTING "expect a
+  Lightning match" test keeps passing after the B1 fix added a span{5-7} gate to the shipped
+  registry row - callers that want to test the span gate itself (e.g. an E-Transit/Super-Duty
+  negative case) pass an explicit series code outside the F-150 set.
   """
   chars = [filler] * 17
   chars[0:3] = list(wmi)
-  chars[3] = pos4
+  chars[4:7] = list(series)
   chars[7] = pos8
   chars[9] = pos10
   vin = ''.join(chars)
@@ -60,38 +61,56 @@ class TestLightningRegistryRow:
     assert decode_vin_platform(REFERENCE_VIN) == LIGHTNING
 
   def test_negative_etransit_same_wmi_and_shared_electric_engine_code(self):
-    # B1 (adversarial-review-caught, real safety defect, fixed 2026-08-10): a REAL 2023 Ford
-    # E-Transit VIN. The 1FT WMI covers every Ford truck/van (F-150, Super Duty, Transit, E-Transit,
-    # E-Series), and the E-Transit's BEV variant SHARES the Lightning's electric position-8 code 'K'
-    # - so position 8 alone is provably not enough to isolate the Lightning within the 1FT family.
-    # Before the fix this decoded to FORD_F_150_LIGHTNING_MK1 (wrong car interface / wrong panda
-    # safety expectations for an E-Transit). Must now be None.
+    # B1 (adversarial-review-caught, real safety defect, fixed 2026-08-10, revised 2026-08-10 to use
+    # the series-code (pos 5-7) discriminator per driver feedback): a REAL 2023 Ford E-Transit VIN.
+    # The 1FT WMI covers every Ford truck/van (F-150, Super Duty, Transit, E-Transit, E-Series), and
+    # the E-Transit's BEV variant SHARES the Lightning's electric position-8 code 'K' - so position 8
+    # alone is provably not enough to isolate the Lightning within the 1FT family. Before the fix
+    # this decoded to FORD_F_150_LIGHTNING_MK1 (wrong car interface / wrong panda safety expectations
+    # for an E-Transit). Now excluded by the span{5-7} gate: the E-Transit's series code is 'W3X',
+    # which is NOT in the F-150 series set {W1E,W1B,W3L,W5L,W7L} - it fails on the MODEL-LINE
+    # discriminator, not the EV discriminator (pos8 'K' would otherwise pass). Must be None.
     e_transit_vin = "1FTBW3XKXPKB78450"
     assert is_valid_vin(e_transit_vin)
-    assert e_transit_vin[3] == 'B'  # E-Transit (van) body code - NOT 'V'/'6' (Lightning)
+    assert e_transit_vin[4:7] == 'W3X'  # E-Transit series code - NOT in the F-150 set
     assert e_transit_vin[7] == 'K'  # shares the Lightning's electric position-8 code
     assert decode_vin_platform(e_transit_vin) is None
 
-  def test_negative_super_duty_style_same_wmi_and_electric_engine_code_wrong_body_code(self):
-    # Same B1 mechanism, isolating the pos4 gate specifically: position 8 is deliberately set to a
+  def test_negative_super_duty_style_same_wmi_and_electric_engine_code_non_f150_series(self):
+    # Same B1 mechanism, isolating the span gate specifically: position 8 is deliberately set to a
     # VALID Lightning electric code ('7') so the ONLY reason either VIN below must fail to match is
-    # the position-4 body-code gate (Super Duty uses '7'/'8', not the Lightning's 'V'/'6').
-    for super_duty_pos4 in ('7', '8'):
-      vin = _vin(wmi='1FT', pos4=super_duty_pos4, pos8='7', pos10='S')
-      assert decode_vin_platform(vin) is None, f"pos4={super_duty_pos4} (Super-Duty-style) must not match"
+    # the span{5-7} model-line gate (a non-F-150 series code, illustrative of Super Duty/Transit -
+    # NOT one of the verified F-150 series codes {W1E,W1B,W3L,W5L,W7L}).
+    for non_f150_series in ('W2B', 'F3H'):
+      vin = _vin(wmi='1FT', series=non_f150_series, pos8='7', pos10='S')
+      assert decode_vin_platform(vin) is None, f"series={non_f150_series} (non-F-150) must not match"
 
-  def test_positive_both_lightning_generation_body_codes_still_match(self):
-    # The pos4 gate must not be so tight it excludes real Lightnings: both generations' body codes
-    # (2022-23 'V', 2024-25 '6' - design doc §3.1/§3.4) must still match.
-    for pos4 in ('V', '6'):
-      vin = _vin(wmi='1FT', pos4=pos4, pos8='7', pos10='S')
-      assert decode_vin_platform(vin) == LIGHTNING, f"body code {pos4} should match"
+  def test_positive_all_lightning_series_codes_still_match(self):
+    # The span gate must not be so tight it excludes real Lightnings: every documented series code
+    # (2022-23 single code 'W1E'; 2024-25 per-trim 'W1B'/'W3L'/'W5L'/'W7L' - design doc §3.1/§9) must
+    # still match when paired with a valid electric pos8 code.
+    for series in ('W1E', 'W1B', 'W3L', 'W5L', 'W7L'):
+      vin = _vin(wmi='1FT', series=series, pos8='7', pos10='S')
+      assert decode_vin_platform(vin) == LIGHTNING, f"series code {series} should match"
+
+  def test_negative_gas_f150_same_wmi_same_series_non_electric_engine_code(self):
+    # B1 follow-up (driver feedback 2026-08-10): proves the span{5-7} gate ALONE is not enough -
+    # a GAS F-150 XLT is ALSO series 'W3L' (design doc §4.2: the ICE and EV F-150 share series
+    # letters), same WMI (1FT), same model year (S=2025) as the reference truck, but position 8 =
+    # 'T' (an EcoBoost-style ICE engine code), which is NOT in the Lightning's electric code set
+    # {L,V,K,S,7,M}. Must NOT match - pos8 is what stops a gas F-150 sharing the Lightning's series
+    # code from being mapped onto the Lightning platform (wrong panda safety expectations).
+    vin = _vin(wmi='1FT', series='W3L', pos8='T', pos10='S')
+    assert vin[4:7] == 'W3L'  # same series as a real Lightning - proves span alone is insufficient
+    assert decode_vin_platform(vin) is None
 
   def test_negative_ice_f150_same_wmi_non_electric_engine_code(self):
-    # Safety-critical case (design doc §4.2/§4.3/§7): same WMI (1FT) and same model year (S=2025)
-    # as the reference truck, but position 8 = 'T', which is NOT in the Lightning's electric code
-    # set {L,V,K,S,7,M}. Must NOT match - this is what stops a gas F-150 from being mapped onto the
-    # Lightning platform (wrong panda safety expectations).
+    # Safety-critical case (design doc §4.2/§4.3/§7): same WMI (1FT), same F-150 series ('W3L'), and
+    # same model year (S=2025) as the reference truck, but position 8 = 'T', which is NOT in the
+    # Lightning's electric code set {L,V,K,S,7,M}. Must NOT match - this is what stops a gas F-150
+    # from being mapped onto the Lightning platform (wrong panda safety expectations). (See also
+    # test_negative_gas_f150_same_wmi_same_series_non_electric_engine_code above, which makes the
+    # same point with explicit series-membership assertions.)
     vin = _vin(wmi='1FT', pos8='T', pos10='S')
     assert decode_vin_platform(vin) is None
 
