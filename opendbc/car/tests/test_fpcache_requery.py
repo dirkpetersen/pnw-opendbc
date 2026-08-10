@@ -82,8 +82,13 @@ class TestFpCacheRequery:
 
   def test_requery_runs_at_most_once(self):
     # Nothing matches and no fleet config: session ends at None (MOCK) after ONE requery.
+    # vinfp2pnw: the live-requeried VIN must be one the vin_fallbacks decode registry does NOT
+    # recognize either (LIVE_VIN is the real Lightning reference truck, which the registry now
+    # correctly resolves by class - see test_vin_fallbacks.py - so it's no longer a "nothing
+    # matches" fixture on its own; a non-Ford VIN keeps this test's original intent).
     (candidate, _, _, _, _, _), get_vin, get_fw, match = _run(
-      _cached_params(), match_side_effect=lambda *a: (True, set()), fleet_cfg={})
+      _cached_params(), match_side_effect=lambda *a: (True, set()), fleet_cfg={},
+      live_vin="5YJSA1E26FF123456")
     assert candidate is None
     assert get_vin.call_count == 1
     assert get_fw.call_count == 1
