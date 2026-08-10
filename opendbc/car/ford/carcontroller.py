@@ -406,9 +406,10 @@ class CarController(CarControllerBase):
                                             or self._latext_angle.angle_stall_blip_active)
         # Alan Polk's semantics (bp-7.0 carcontroller.py line 223, review finding M1): the LKA
         # corroboration bit asserts whenever angle MODE is selected -- NOT only while lateral is
-        # active. During human-turn/stall-blip mode-0 frames the bit stays set (bp_kappa_cmd is 0
-        # there, so shadow_curvature is 0 regardless); ford.h sees "angle mode, zero shadow" exactly
-        # as it does on his fork. Our previous narrowing to lat_active was an unlisted deviation.
+        # active. During human-turn/stall-blip mode-0 frames the bit stays set; bp_kappa_cmd there
+        # carries the measured curvature (see lateral_angle_pnw.get_current_curvature, ported from
+        # bp-dev 699c17d9fd), so ford.h validates the shadow against fresh reality -- matching his
+        # fork -- rather than a stale zero. Our previous narrowing to lat_active was an unlisted deviation.
         self._angle_mode_engaged = True
         # SIGN CONVENTION (see SIGN-CONVENTION-TRACE.md): negated here to match the sign
         # convention path_angle/apply_curvature use on the wire (see the -lat.* sends just below,
