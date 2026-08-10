@@ -208,43 +208,40 @@ VIN_FALLBACK_REGISTRY: list[VinFallbackEntry] = [
   # wmi: "1FT" = Ford Motor Co., truck, USA (design doc §3.1). Covers both the 2022-23 "1FTVW..."
   #   and 2024-25 "1FT6W..." generations, but ALSO every other Ford truck/van built off the same
   #   WMI family — F-150 (ICE), Super Duty, Transit, E-Transit, E-Series. wmi alone is NOT
-  #   sufficient to isolate the Lightning; see the pos{4: ...} gate below (B1).
+  #   sufficient to isolate the Lightning; see the span{5-7} + pos{8} gates below (B1).
   #
-  # pos {4: [...], 8: [...]}: THE EV-VS-ICE-AND-VAN DISCRIMINATOR — TOGETHER, position 4 AND
-  #   position 8 are what isolate "F-150 Lightning" from the rest of the 1FT family. BOTH are
-  #   SAFETY-LOAD-BEARING: a wrong match here selects the wrong car interface / panda safety
-  #   expectations.
+  # span {5-7: [...]} + pos {8: [...]}: TWO INDEPENDENT, SAFETY-LOAD-BEARING DISCRIMINATORS are
+  #   required together to isolate "F-150 Lightning" from the rest of the 1FT family — neither one
+  #   alone is sufficient, and a wrong match here selects the wrong car interface / panda safety
+  #   expectations:
   #
-  #   pos 8 alone is NOT enough (B1, adversarial-review-caught 2026-08-10): position 8 is
-  #   electric-only for the Lightning (see the code list below), but position 8 is NOT unique to the
-  #   Lightning within the 1FT WMI — e.g. a real 2023 Ford E-TRANSIT ("1FTBW3XKXPKB78450", a BEV
-  #   van, NOT the Lightning) shares Lightning electric position-8 code 'K'. Since 1FT covers ALL
-  #   Ford trucks/vans (§4.2-§4.3 of the design doc did not anticipate the E-Transit/Super-Duty
-  #   overlap), position 8 alone over-matches the whole 1FT family's BEV variants.
+  #   span 5-7 (series/trim code) = the MODEL-LINE discriminator. It identifies "this is an F-150"
+  #   and rejects the REST of the 1FT family: the E-Transit's series is 'W3X' (not in this set),
+  #   and Super Duty / Transit / E-Series use their own series codes — none are F-150 codes. Series
+  #   set (design doc §3.1/§9): 'W1E' = ALL 2022-23 Lightning trims (single code, no per-trim
+  #   split); 2024-25 splits by trim: 'W1B'=Pro, 'W3L'=XLT and Flash, 'W5L'=Lariat, 'W7L'=Platinum.
   #
-  #   pos 4 (body/GVWR code) is what actually narrows it to the Lightning body: 'V' (2022-23
-  #   generation) / '6' (2024-25 generation) — see design doc §3.1 (position 4 field) and §3.4 (the
-  #   reference VIN "1FT6W3L78SWG05094" has pos4='6'). The E-Transit's body code is 'B' (van);
-  #   Super Duty trucks use '7'/'8' body codes that are DIFFERENT from the Lightning's — so pos4
-  #   excludes both. NOTE: pos4 '7'/'8' ALSO happen to appear as Lightning-electric codes at position
-  #   8 (see the list below) — that is a coincidence of the two independent code tables, not a
-  #   contradiction; pos4 and pos8 are checked against different VIN characters.
+  #   pos 8 (engine/battery code) = the EV discriminator. Series ALONE is not enough (B1,
+  #   adversarial-review-caught 2026-08-10, revised 2026-08-10 per driver feedback): a GAS F-150
+  #   XLT is ALSO series 'W3L' — the ICE and EV F-150 literally share several series letters
+  #   ("W3L"/"W5L"/"W7L" appear on both an ICE XLT/Lariat/Platinum and an EV Flash/Lariat/Platinum,
+  #   design doc §4.2) — so pos8's electric-only code set is what separates the Lightning from a
+  #   gas F-150 sharing the same series code. Position 8's codes are electric-only for this model:
+  #   L/V (2022-23 SR/ER), K/S (2024-25 SR/SR-LFP), 7/M (2024-25 ER retail/fleet). See design doc
+  #   §3.2 for the full per-code battery/chemistry table.
   #
-  #   ⚠ TODO(§9, design doc): the pos4 code set {'V', '6'} is NOT yet independently verified against
-  #   the Ford Pro VIN guide (Rev 11) the way pos8 was cross-checked — it is inferred from the single
-  #   reference VIN + the design doc's position-4 field description. Like the ⚠ R/U pos8 codes
-  #   below, treat {'V', '6'} as the best-known set, not a guaranteed-complete one, until it's been
-  #   checked against the Ford VIN guide + more real Lightning VINs (both generations, multiple
-  #   trims). If a real, valid Lightning VIN is ever seen with a pos4 code outside {'V', '6'}, this
-  #   set is incomplete and must be updated — until then an unrecognized pos4 code fails safe (no
-  #   match -> MOCK, not a wrong assignment), never a wrong assignment.
+  #   Together: span 5-7 rejects the rest of the 1FT family (E-Transit, Super Duty, Transit,
+  #   E-Series); pos 8 rejects a gas F-150 sharing an F-150 series code. Either gate alone
+  #   under-constrains; both together isolate exactly the Lightning.
   #
-  #   Position 8's codes are electric-only for this model: L/V (2022-23 SR/ER), K/S (2024-25
-  #   SR/SR-LFP), 7/M (2024-25 ER retail/fleet). See design doc §3.2 for the full per-code
-  #   battery/chemistry table. The series/trim code at positions 5-7 remains unusable as a
-  #   discriminator (design doc §4.2): the ICE F-150 and the Lightning literally SHARE several
-  #   series letters (e.g. "W3L"/"W5L"/"W7L" appear on both an ICE XLT/Lariat/Platinum and an EV
-  #   Flash/Lariat/Platinum).
+  #   ⚠ TODO(§9, design doc): the series set {'W1E','W1B','W3L','W5L','W7L'} is NOT yet
+  #   independently verified against the Ford Pro VIN guide (Rev 11) — it is transcribed from the
+  #   owner-provided reference table + forum sources (design doc §3.1). Like the ⚠ R/U pos8 codes
+  #   below, treat it as the best-known set, not a guaranteed-complete one, until checked against
+  #   the Ford VIN guide + more real Lightning VINs (both generations, multiple trims). If a real,
+  #   valid Lightning VIN is ever seen with a series code outside this set, the set is incomplete
+  #   and must be updated — until then an unrecognized series code fails safe (no match -> MOCK,
+  #   not a wrong assignment), never a wrong assignment.
   #
   #   NOT INCLUDED: position-8 codes 'R' and 'U'. The design doc (§3.2, §9.1) flags these as
   #   ⚠ UNVERIFIED — sourced only from forum/decoder threads and conflicting with the
@@ -266,7 +263,8 @@ VIN_FALLBACK_REGISTRY: list[VinFallbackEntry] = [
     platform='FORD_F_150_LIGHTNING_MK1',
     match={
       'wmi': ['1FT'],
-      'pos': {4: ['V', '6'], 8: ['L', 'V', 'K', 'S', '7', 'M']},
+      'span': {'5-7': ['W1E', 'W1B', 'W3L', 'W5L', 'W7L']},
+      'pos': {8: ['L', 'V', 'K', 'S', '7', 'M']},
     },
   ),
 ]
