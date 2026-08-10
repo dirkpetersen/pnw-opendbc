@@ -24,12 +24,20 @@ LIGHTNING = "FORD_F_150_LIGHTNING_MK1"
 REFERENCE_VIN = "1FT6W3L78SWG05094"
 
 
-def _vin(wmi='1FT', pos8='7', pos10='S', filler='A'):
-  """Build a 17-char synthetic test VIN with an explicit WMI (positions 1-3), engine/battery code
-  (position 8), and model-year code (position 10); every other position is a charset-legal filler
-  character. All positions are 1-indexed to match the design doc / vin_fallbacks.py convention."""
+def _vin(wmi='1FT', pos4='6', pos8='7', pos10='S', filler='A'):
+  """Build a 17-char synthetic test VIN with an explicit WMI (positions 1-3), body/GVWR code
+  (position 4), engine/battery code (position 8), and model-year code (position 10); every other
+  position is a charset-legal filler character. All positions are 1-indexed to match the design doc
+  / vin_fallbacks.py convention.
+
+  pos4 defaults to '6' (a valid Lightning body code, design doc §3.1/§3.4) rather than the generic
+  filler so every EXISTING "expect a Lightning match" test keeps passing after the B1 fix added a
+  pos4 gate to the shipped registry row - callers that want to test the pos4 gate itself (e.g. an
+  E-Transit/Super-Duty negative case) pass an explicit pos4.
+  """
   chars = [filler] * 17
   chars[0:3] = list(wmi)
+  chars[3] = pos4
   chars[7] = pos8
   chars[9] = pos10
   vin = ''.join(chars)
@@ -50,6 +58,34 @@ class TestVinFallbacksSanity:
 class TestLightningRegistryRow:
   def test_positive_reference_truck_matches_lightning(self):
     assert decode_vin_platform(REFERENCE_VIN) == LIGHTNING
+
+  def test_negative_etransit_same_wmi_and_shared_electric_engine_code(self):
+    # B1 (adversarial-review-caught, real safety defect, fixed 2026-08-10): a REAL 2023 Ford
+    # E-Transit VIN. The 1FT WMI covers every Ford truck/van (F-150, Super Duty, Transit, E-Transit,
+    # E-Series), and the E-Transit's BEV variant SHARES the Lightning's electric position-8 code 'K'
+    # - so position 8 alone is provably not enough to isolate the Lightning within the 1FT family.
+    # Before the fix this decoded to FORD_F_150_LIGHTNING_MK1 (wrong car interface / wrong panda
+    # safety expectations for an E-Transit). Must now be None.
+    e_transit_vin = "1FTBW3XKXPKB78450"
+    assert is_valid_vin(e_transit_vin)
+    assert e_transit_vin[3] == 'B'  # E-Transit (van) body code - NOT 'V'/'6' (Lightning)
+    assert e_transit_vin[7] == 'K'  # shares the Lightning's electric position-8 code
+    assert decode_vin_platform(e_transit_vin) is None
+
+  def test_negative_super_duty_style_same_wmi_and_electric_engine_code_wrong_body_code(self):
+    # Same B1 mechanism, isolating the pos4 gate specifically: position 8 is deliberately set to a
+    # VALID Lightning electric code ('7') so the ONLY reason either VIN below must fail to match is
+    # the position-4 body-code gate (Super Duty uses '7'/'8', not the Lightning's 'V'/'6').
+    for super_duty_pos4 in ('7', '8'):
+      vin = _vin(wmi='1FT', pos4=super_duty_pos4, pos8='7', pos10='S')
+      assert decode_vin_platform(vin) is None, f"pos4={super_duty_pos4} (Super-Duty-style) must not match"
+
+  def test_positive_both_lightning_generation_body_codes_still_match(self):
+    # The pos4 gate must not be so tight it excludes real Lightnings: both generations' body codes
+    # (2022-23 'V', 2024-25 '6' - design doc §3.1/§3.4) must still match.
+    for pos4 in ('V', '6'):
+      vin = _vin(wmi='1FT', pos4=pos4, pos8='7', pos10='S')
+      assert decode_vin_platform(vin) == LIGHTNING, f"body code {pos4} should match"
 
   def test_negative_ice_f150_same_wmi_non_electric_engine_code(self):
     # Safety-critical case (design doc §4.2/§4.3/§7): same WMI (1FT) and same model year (S=2025)
@@ -183,6 +219,117 @@ class TestGenericMatcherMechanics:
       assert decode_vin_platform(vin) is None
 
 
+class TestMalformedRegistryEntriesFailSafe:
+  """N2 (adversarial-review should-fix, fixed 2026-08-10): a malformed registry row (a future data
+  typo) must never crash `fingerprint()` - it must be SKIPPED (treated as non-matching) instead.
+  Each test below installs ONE row as the whole registry, on a VIN that would otherwise satisfy
+  every OTHER gate, so the only thing under test is whether the malformed field is handled safely
+  (or, for the string-pos-key case, handled CORRECTLY - that shape is explicitly supported, not
+  malformed)."""
+
+  def test_string_pos_key_is_normalized_not_treated_as_malformed(self):
+    # The design doc's own JSONC illustration (§2.3) writes `pos` keys as strings: {"8": [...]}.
+    # A string key must be NORMALIZED and MATCH exactly like an int key - this is a documented,
+    # supported shape, not a malformed one.
+    entry = VinFallbackEntry(make='Test', model='Widget', platform='TEST_WIDGET', year=None,
+                              match={'wmi': ['9TE'], 'pos': {'8': ['X']}})  # string key '8'
+    vin = _vin(wmi='9TE', pos8='X', pos10='S')
+    with mock.patch.object(vin_fallbacks, 'VIN_FALLBACK_REGISTRY', [entry]):
+      assert decode_vin_platform(vin) == 'TEST_WIDGET'
+
+  def test_pos_key_out_of_range_skips_entry_instead_of_raising(self):
+    entry = VinFallbackEntry(make='Test', model='Widget', platform='TEST_WIDGET', year=None,
+                              match={'wmi': ['9TE'], 'pos': {18: ['X']}})  # VIN position 18 doesn't exist
+    vin = _vin(wmi='9TE', pos8='X', pos10='S')
+    with mock.patch.object(vin_fallbacks, 'VIN_FALLBACK_REGISTRY', [entry]):
+      assert decode_vin_platform(vin) is None  # must not raise IndexError
+
+  def test_dash_less_span_key_skips_entry_instead_of_raising(self):
+    entry = VinFallbackEntry(make='Test', model='Widget', platform='TEST_WIDGET', year=None,
+                              match={'wmi': ['9TE'], 'span': {'5': ['ABC']}})  # missing the 'a-b' separator
+    vin = _vin(wmi='9TE', pos8='X', pos10='S')
+    with mock.patch.object(vin_fallbacks, 'VIN_FALLBACK_REGISTRY', [entry]):
+      assert decode_vin_platform(vin) is None  # must not raise ValueError
+
+  def test_single_year_string_skips_entry_instead_of_raising(self):
+    # "2025" (no dash) is NOT one of the three documented `year` shapes (single int / list of ints /
+    # "start-end" range string) - must fail safe, not crash trying to parse it as a range.
+    entry = VinFallbackEntry(make='Test', model='Widget', platform='TEST_WIDGET', year="2025",
+                              match={'wmi': ['9TE'], 'pos': {8: ['X']}})
+    vin = _vin(wmi='9TE', pos8='X', pos10='S')
+    with mock.patch.object(vin_fallbacks, 'VIN_FALLBACK_REGISTRY', [entry]):
+      assert decode_vin_platform(vin) is None  # must not raise ValueError
+
+  def test_non_dict_match_skips_entry_instead_of_raising(self):
+    entry = VinFallbackEntry(make='Test', model='Widget', platform='TEST_WIDGET', year=None, match=None)
+    vin = _vin(wmi='9TE', pos8='X', pos10='S')
+    with mock.patch.object(vin_fallbacks, 'VIN_FALLBACK_REGISTRY', [entry]):
+      assert decode_vin_platform(vin) is None  # must not raise AttributeError
+
+  def test_non_numeric_pos_key_skips_entry_instead_of_raising(self):
+    entry = VinFallbackEntry(make='Test', model='Widget', platform='TEST_WIDGET', year=None,
+                              match={'wmi': ['9TE'], 'pos': {'not-a-number': ['X']}})
+    vin = _vin(wmi='9TE', pos8='X', pos10='S')
+    with mock.patch.object(vin_fallbacks, 'VIN_FALLBACK_REGISTRY', [entry]):
+      assert decode_vin_platform(vin) is None  # must not raise ValueError
+
+  def test_one_malformed_entry_does_not_poison_a_good_entry_elsewhere_in_the_registry(self):
+    bad = VinFallbackEntry(make='Test', model='Bad', platform='TEST_BAD', year=None,
+                            match={'wmi': ['9TE'], 'pos': {'not-a-number': ['X']}})
+    good = VinFallbackEntry(make='Test', model='Good', platform='TEST_GOOD', year=None,
+                             match={'wmi': ['9TE'], 'pos': {8: ['X']}})
+    vin = _vin(wmi='9TE', pos8='X', pos10='S')
+    with mock.patch.object(vin_fallbacks, 'VIN_FALLBACK_REGISTRY', [bad, good]):
+      assert decode_vin_platform(vin) == 'TEST_GOOD'
+
+  def test_malformed_entry_is_logged(self):
+    entry = VinFallbackEntry(make='Test', model='Bad', platform='TEST_BAD', year=None,
+                              match={'wmi': ['9TE'], 'pos': {18: ['X']}})
+    vin = _vin(wmi='9TE', pos8='X', pos10='S')
+    with mock.patch.object(vin_fallbacks, 'VIN_FALLBACK_REGISTRY', [entry]), \
+         mock.patch.object(vin_fallbacks.carlog, 'error') as log_mock:
+      assert decode_vin_platform(vin) is None
+    assert log_mock.call_count == 1
+    logged = log_mock.call_args[0][0]
+    assert logged["event"] == "VIN decode registry entry malformed - skipping entry (fail-safe)"
+
+
+class TestRegistryShapeValidation:
+  """A structural sanity check over the REAL shipped registry (not synthetic rows) - independent of
+  whether the matcher happens to fail safe on a bad row at runtime, this catches a malformed shipped
+  row directly (registry-shape validation, per the task's N2 requirement)."""
+
+  def test_every_shipped_entry_has_well_formed_match_spec(self):
+    assert len(vin_fallbacks.VIN_FALLBACK_REGISTRY) > 0, "registry should not be empty"
+    for entry in vin_fallbacks.VIN_FALLBACK_REGISTRY:
+      assert isinstance(entry.match, dict), f"{entry!r} .match must be a dict"
+
+      wmi_list = entry.match.get('wmi')
+      if wmi_list is not None:
+        assert all(isinstance(w, str) and len(w) == 3 for w in wmi_list), f"{entry!r} wmi entries must be 3-char strings"
+
+      pos_map = entry.match.get('pos', {})
+      for position, allowed in pos_map.items():
+        position_int = int(position)  # must be int-parseable (accepts int or numeric string)
+        assert 1 <= position_int <= 17, f"{entry!r} pos key {position!r} out of the 1-17 VIN range"
+        assert len(allowed) > 0, f"{entry!r} pos key {position!r} has an empty allowed-chars list"
+
+      span_map = entry.match.get('span', {})
+      for span, allowed in span_map.items():
+        assert '-' in str(span), f"{entry!r} span key {span!r} missing the required 'a-b' separator"
+        start_str, end_str = str(span).split('-', 1)
+        start, end = int(start_str), int(end_str)
+        assert 1 <= start <= end <= 17, f"{entry!r} span key {span!r} out of the 1-17 VIN range"
+        assert len(allowed) > 0, f"{entry!r} span key {span!r} has an empty allowed-substrings list"
+
+      if entry.year is not None:
+        # must be parseable by the shared expander without raising, and non-empty
+        years = vin_fallbacks._expand_years(entry.year)
+        assert len(years) > 0, f"{entry!r} year {entry.year!r} expanded to an empty set"
+
+      assert entry.platform, f"{entry!r} platform must be a non-empty string"
+
+
 # ---------------------------------------------------------------------------------------------
 # Integration: verify car_helpers.py::fingerprint() actually reaches decode_vin_platform() at the
 # fallback slot, with the documented precedence (fleet_vins.json "vins" > decode registry >
@@ -258,3 +405,17 @@ class TestCarHelpersIntegration:
     assert candidate is None
     assert vin == tesla_vin
     decode_mock.assert_called_once_with(tesla_vin)
+
+  def test_decode_registry_raising_falls_through_to_mock_not_crash(self):
+    # N2 (adversarial-review should-fix, fixed 2026-08-10): even if decode_vin_platform() itself
+    # raises (e.g. a future bug bypasses vin_fallbacks.py's own internal fail-safe), car_helpers.py's
+    # own try/except around the call must catch it and treat it as "no match" - fingerprint() must
+    # NEVER crash on this fallback path. If car_helpers.py's guard were missing or broken, this test
+    # would fail with the RuntimeError propagating out of car_helpers.fingerprint() instead of being
+    # caught here.
+    raising_mock = mock.Mock(side_effect=RuntimeError("simulated vin_fallbacks bug"))
+    (candidate, _, vin, _, source, _), decode_mock = _run_fingerprint(
+      live_vin=REFERENCE_VIN, fleet_cfg={"vins": {}}, decode_mock=raising_mock)
+    assert candidate is None  # falls through toward MOCK (caller maps None -> mock), no crash
+    assert vin == REFERENCE_VIN
+    decode_mock.assert_called_once_with(REFERENCE_VIN)

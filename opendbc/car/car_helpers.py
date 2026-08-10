@@ -210,8 +210,17 @@ def fingerprint(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_mu
       fallback = fleet.get("vins", {}).get(vin)
       fallback_kind = "exact_vin"
       if fallback is None:
-        fallback = decode_vin_platform(vin)
         fallback_kind = "vin_decode"
+        # N2 (adversarial-review should-fix, fixed 2026-08-10): defense in depth. vin_fallbacks.py's
+        # own matcher already fails safe on a malformed registry ROW (skips just that row), but this
+        # is the outermost guard against decode_vin_platform() itself somehow raising (a bug in the
+        # matcher, an unexpected type, ...) - fingerprinting must NEVER crash on this fallback path;
+        # any exception here is treated exactly like "no match" and falls through toward MOCK.
+        try:
+          fallback = decode_vin_platform(vin)
+        except Exception as e:
+          carlog.error({"event": "VIN decode registry raised - treating as no match (fail-safe)", "vin": vin, "error": repr(e)})
+          fallback = None
     else:
       fallback = fleet.get("no_vin_platform")
       fallback_kind = "no_vin"
