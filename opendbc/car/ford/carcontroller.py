@@ -328,7 +328,12 @@ class CarController(CarControllerBase):
                             if c is not None and getattr(c, "dir", "dec") == "inc"], now)
     restoring = pending_inc is not None
     ceiling = pending_inc.ceiling_ms if pending_inc is not None else None
-    intent = self._icbm_guard.filter(intent, stock_set, now, restoring, ceiling)
+    # Fable fail-safe fix: tell the guard whether THIS tick's arbitrated winner (`cmd`, not `intent` —
+    # `cmd` reflects who owns the bus even on ticks decide_press stays silent, e.g. between taps) is a
+    # dec, so it freezes movement-judgment rather than mistaking a dec interlude's own SET- taps for a
+    # driver SET- and falsely latching the restore veto — see RestoreGuard.filter's docstring.
+    dec_owns_bus = cmd is not None and getattr(cmd, "dir", "dec") == "dec"
+    intent = self._icbm_guard.filter(intent, stock_set, now, restoring, ceiling, dec_owns_bus)
     return self._icbm_governor.update(self.frame, intent)
 
   def update(self, CC, CS, now_nanos):

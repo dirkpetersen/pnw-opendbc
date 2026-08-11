@@ -357,6 +357,41 @@ def test_guard_fully_idle_clears_latch_even_with_stale_ceiling():
   assert g.filter("inc", 44 * MPH_TO_MS, NOW + 1.5, True, ceil) == "inc"   # fresh episode, same ceiling ok
 
 
+# ---- Fable fail-safe fix: dec_owns_bus freezes movement-judgment during a dec interlude ---------------
+
+def test_guard_dec_interlude_no_false_latch():
+  # Reproduces Fable's sim proof: an OPEN restore (ceiling 75, not yet blocked) crossed by a benign
+  # curve-ICBM dec interlude (target 55, NO driver input) must NOT falsely latch the veto -- only a
+  # genuine driver movement may. Before the fix, the interlude's own ~13 SET- taps (moving stock_set_ms
+  # down each tick, indistinguishable from a driver SET- to the old unconditional judgment) tripped
+  # guard.blocked=True permanently, and the restore never resumed.
+  g = RestoreGuard()
+  ceil = 75 * MPH_TO_MS
+  assert g.filter("inc", 55 * MPH_TO_MS, NOW, True, ceil) == "inc"
+  assert not g.blocked
+  # the dec interlude wins the bus repeatedly: caller reports restoring=True/ceiling unchanged (the
+  # SAME episode is still pending underneath, per the carcontroller contract) and dec_owns_bus=True
+  t, s = NOW + 0.1, 55 * MPH_TO_MS
+  for _ in range(13):
+    t += 0.3
+    s -= STEP_MS
+    assert g.filter("dec", s, t, True, ceil, dec_owns_bus=True) == "dec"   # dec never filtered
+    assert not g.blocked                                                  # and never falsely latched
+  # interlude ends -- the SAME restore resumes toward the ceiling, no manual SET+ needed
+  assert g.filter("inc", s, t + 0.5, True, ceil) == "inc"
+  assert not g.blocked
+
+
+def test_guard_genuine_set_minus_during_restore_still_vetoes():
+  # unchanged path: a GENUINE driver SET- during an inc/restore tick (dec_owns_bus=False, the default —
+  # no dec owns the bus) must still veto.
+  g = RestoreGuard()
+  ceil = 60 * MPH_TO_MS
+  assert g.filter("inc", 45 * MPH_TO_MS, NOW, True, ceil) == "inc"
+  assert g.filter("inc", 44 * MPH_TO_MS, NOW + 0.5, True, ceil) is None
+  assert g.blocked
+
+
 # ---- restore2pnw-hardening: math.isfinite guard on the shared mem-param parser ----------------------
 # _parse_button_cmd lives on FordCarController (carcontroller.py), not icbm_pnw.py -- exercised via a
 # minimal stand-in since constructing a full CarController needs CarParams/CAN plumbing this test file

@@ -184,7 +184,19 @@ class RestoreGuard:
   if the driver's earlier SET- veto had never happened. Callers must pass `restoring`/`ceiling`
   derived from whether ANY brain still has a live inc offer pending (see
   carcontroller.py:_icbm_buttons's `pending_inc`), not just whichever command arbitrate() picked to
-  press THIS tick — that is what lets the SAME episode survive a preempting dec interlude here."""
+  press THIS tick — that is what lets the SAME episode survive a preempting dec interlude here.
+
+  Fable fail-safe fix (2026-08): movement-judgment is FROZEN on ticks where a dec command owns the
+  shared bus (`dec_owns_bus=True`, whether that dec is a different brain's cap during this episode's
+  restore window, or this episode's own cap). Without this, the dec interlude's OWN SET- taps move
+  stock_set_ms down exactly like a driver SET- would — the judgment below can't tell the difference —
+  and would falsely latch `_blocked` on an otherwise-clean restore, permanently vetoing it (the truck
+  never resumes toward the ceiling until the driver manually taps SET+). A genuine driver decrease
+  DURING a dec interlude is already covered independently by the brain-side 1.7-step `_pub_ceiling`
+  ratchets on both brains (speedadjust_controller.py) backing off their own target, so this guard does
+  not need to (and must not) judge movement while a dec owns the bus — it just drops its movement
+  baseline (`_last_set = None`) so the next inc/restore tick re-baselines cleanly against the
+  post-interlude set speed instead of comparing across the interlude."""
 
   def __init__(self):
     self._blocked = False
@@ -197,13 +209,16 @@ class RestoreGuard:
     return self._blocked
 
   def filter(self, intent: str | None, stock_set_ms: float, now: float, restoring: bool,
-             ceiling: float | None = None) -> str | None:
+             ceiling: float | None = None, dec_owns_bus: bool = False) -> str | None:
     """Pass every frame. `restoring` = SOME brain still has a live inc/restore offer pending (not
     merely "the command arbitrate() picked to press this exact tick is an inc" — see class docstring).
     `ceiling` identifies WHICH restore episode is being offered; a change in ceiling while restoring
     is treated as a genuinely NEW episode (fresh latch); the SAME ceiling persisting across a dec
     interlude (restoring stays True, ceiling unchanged) preserves the latch instead of clearing it.
-    `dec` (or no) intent is NEVER filtered by this latch, regardless of `_blocked`."""
+    `dec_owns_bus` = the command arbitrate() picked to press THIS tick is a dec (see class docstring's
+    Fable fail-safe fix): movement-judgment is skipped entirely on these ticks — the latch is neither
+    set NOR cleared, only the movement baseline is dropped. `dec` (or no) intent is NEVER filtered by
+    this latch, regardless of `_blocked`."""
     if not restoring:
       # no brain has a live inc offer at all -> fully stand down, clear the latch, never filter dec
       self._blocked = False
@@ -219,15 +234,24 @@ class RestoreGuard:
       self._last_set = None
       self._last_t = None
       self._episode_ceiling = ceiling
-    if self._last_set is not None and stock_set_ms > 0:
-      dt = max(now - (self._last_t or now), 0.0)
-      if stock_set_ms < self._last_set - 0.6 * STEP_MS:
-        self._blocked = True                            # set went DOWN while we only press up
-      elif stock_set_ms > self._last_set + STEP_MS * (dt / TAP_PERIOD_S + 1.6):
-        self._blocked = True                            # rose faster than our own taps can
-    if stock_set_ms > 0:
-      self._last_set = stock_set_ms
-      self._last_t = now
+    if dec_owns_bus:
+      # Fable fail-safe fix: a dec owns the bus this tick (a curve-ICBM cap interlude, or this
+      # episode's own cap) — its own SET- taps would look identical to a driver SET- to the judgment
+      # below, so freeze judgment entirely (no latch, no clear) and just drop the movement baseline;
+      # see class docstring. Genuine driver decreases during the interlude are already covered by the
+      # brain-side ratchets, not this guard.
+      self._last_set = None
+      self._last_t = None
+    else:
+      if self._last_set is not None and stock_set_ms > 0:
+        dt = max(now - (self._last_t or now), 0.0)
+        if stock_set_ms < self._last_set - 0.6 * STEP_MS:
+          self._blocked = True                          # set went DOWN while we only press up
+        elif stock_set_ms > self._last_set + STEP_MS * (dt / TAP_PERIOD_S + 1.6):
+          self._blocked = True                          # rose faster than our own taps can
+      if stock_set_ms > 0:
+        self._last_set = stock_set_ms
+        self._last_t = now
     if intent != "inc":
       return intent            # dec (or no intent) is NEVER filtered by the restore veto latch
     return None if self._blocked else intent
