@@ -242,11 +242,16 @@ class CarController(CarControllerBase):
     # icbm2pnw: stock-ACC set-speed steering for the F-150 Lightning (Tier 1, no op-long). The brain
     # (target selection from CES/VTSC curve logic) runs in the pnw layer and publishes the IcbmTarget
     # mem-param; this side is only the closed-loop executor (see icbm_pnw.py for the safety envelope).
+    # speedadjust-exec2pnw: a SECOND brain (speedadjust2pnw: police-ahead / lower-speed-limit cap)
+    # shares the SAME executor + SAME buttons via a second mem-param, SpeedAdjustTarget, in the
+    # identical {target, ceiling, ts, dir?} shape. arbitrate() (icbm_pnw.py) picks between the two
+    # brains' commands every poll before decide_press() runs — see its docstring for the rule.
     # Params import is runtime-only and guarded: on a bare opendbc checkout ICBM simply stays off.
     self._icbm_enabled = veh.icbm
     self._icbm_governor = None
     self._icbm_guard = None
     self._icbm_cmd = None
+    self._sa_cmd = None          # speedadjust-exec2pnw: the SpeedAdjustTarget-derived command
     self._icbm_params = None
     if self._icbm_enabled:
       try:
@@ -258,39 +263,52 @@ class CarController(CarControllerBase):
       except Exception:
         self._icbm_enabled = False
 
-  def _icbm_buttons(self, CS) -> str | None:
-    """Poll the brain's target at ~4 Hz, run the executor at 100 Hz. Returns 'dec'/'inc'/None."""
+  def _parse_icbm_cmd(self, raw):
+    """speedadjust-exec2pnw: shared parser for both IcbmTarget and SpeedAdjustTarget — both mem-params
+    use the identical {target, ceiling, ts, dir?} JSON shape. Returns an IcbmCommand or None; NEVER
+    raises (fail-closed: any malformed/missing/unknown-dir payload -> None, no press)."""
     import json
+    from opendbc.car.ford.icbm_pnw import IcbmCommand
+    try:
+      if isinstance(raw, (bytes, str)) and raw:
+        raw = json.loads(raw)
+      # params_pyx returns a dict for JSON keys; require all fields or stand down
+      if isinstance(raw, dict) and all(k in raw for k in ("target", "ceiling", "ts")):
+        # icbmrestore2pnw: optional "dir" marks a guarded restore ("inc"); anything else is a cap.
+        # An unknown value stands down entirely (fail-closed on protocol drift).
+        d = str(raw.get("dir", "dec"))
+        if d in ("dec", "inc"):
+          return IcbmCommand(target_ms=float(raw["target"]), ceiling_ms=float(raw["ceiling"]),
+                             ts=float(raw["ts"]), dir=d)
+    except Exception:
+      pass
+    return None
+
+  def _icbm_buttons(self, CS) -> str | None:
+    """Poll both brains' targets at ~4 Hz, arbitrate, run the executor at 100 Hz. Returns 'dec'/'inc'/None."""
     import time
-    from opendbc.car.ford.icbm_pnw import IcbmCommand, decide_press
+    from opendbc.car.ford.icbm_pnw import arbitrate, decide_press
     if (self.frame % 25) == 0:  # 4 Hz mem-param read
       try:
-        raw = self._icbm_params.get("IcbmTarget")
-        if isinstance(raw, (bytes, str)) and raw:
-          raw = json.loads(raw)
-        # params_pyx returns a dict for JSON keys; require all fields or stand down
-        if isinstance(raw, dict) and all(k in raw for k in ("target", "ceiling", "ts")):
-          # icbmrestore2pnw: optional "dir" marks a guarded restore ("inc"); anything else is a cap.
-          # An unknown value stands down entirely (fail-closed on protocol drift).
-          icbm_dir = str(raw.get("dir", "dec"))
-          if icbm_dir in ("dec", "inc"):
-            self._icbm_cmd = IcbmCommand(target_ms=float(raw["target"]), ceiling_ms=float(raw["ceiling"]),
-                                         ts=float(raw["ts"]), dir=icbm_dir)
-          else:
-            self._icbm_cmd = None
-        else:
-          self._icbm_cmd = None
+        self._icbm_cmd = self._parse_icbm_cmd(self._icbm_params.get("IcbmTarget"))
       except Exception:
         self._icbm_cmd = None
+      try:
+        self._sa_cmd = self._parse_icbm_cmd(self._icbm_params.get("SpeedAdjustTarget"))
+      except Exception:
+        self._sa_cmd = None
     driver_override = bool(CS.out.gasPressed or CS.out.brakePressed)
     now = time.time()
     stock_set = float(CS.out.cruiseState.speed)
-    intent = decide_press(stock_set, self._icbm_cmd, now,
+    # speedadjust-exec2pnw: pick ONE command off the two brains before deciding what to press —
+    # see arbitrate()'s docstring (DEC always wins; more-restrictive dec wins between two decs).
+    cmd = arbitrate(self._icbm_cmd, self._sa_cmd, now)
+    intent = decide_press(stock_set, cmd, now,
                           bool(CS.out.cruiseState.enabled), driver_override)
     # icbmrestore2pnw: the guard runs EVERY frame while a restore command is active (it tracks the
     # set-speed trajectory even when no press is intended) and swallows inc intents for the rest of
     # the episode once a human touched the buttons. Caps ('dec') are never filtered.
-    restoring = self._icbm_cmd is not None and getattr(self._icbm_cmd, "dir", "dec") == "inc"
+    restoring = cmd is not None and getattr(cmd, "dir", "dec") == "inc"
     intent = self._icbm_guard.filter(intent, stock_set, now, restoring)
     return self._icbm_governor.update(self.frame, intent)
 

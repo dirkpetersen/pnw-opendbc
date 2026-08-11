@@ -174,3 +174,70 @@ def test_governor_inc_tap_pattern_matches_dec_cadence():
   assert frames[:PRESS_FRAMES] == ["inc"] * PRESS_FRAMES
   assert all(b is None for b in frames[PRESS_FRAMES:PRESS_FRAMES + GAP_FRAMES])
   assert "inc" in frames[PRESS_FRAMES + GAP_FRAMES:]
+
+
+# ---- speedadjust-exec2pnw: arbitrate() between icbm2pnw (curve) and speedadjust2pnw (police/limit) --
+from opendbc.car.ford.icbm_pnw import arbitrate
+
+
+def test_arbitrate_only_icbm_dec():
+  assert arbitrate(cmd(45, 60), None, NOW) == cmd(45, 60)
+
+
+def test_arbitrate_only_speedadjust_dec():
+  assert arbitrate(None, cmd(50, 60), NOW) == cmd(50, 60)
+
+
+def test_arbitrate_both_dec_lower_target_wins():
+  # icbm wants 45 (curve), speedadjust wants 50 (limit drop) -> the MORE restrictive (lower) wins
+  icbm, sa = cmd(45, 60), cmd(50, 60)
+  assert arbitrate(icbm, sa, NOW) == icbm
+  # reversed: speedadjust more restrictive
+  icbm2, sa2 = cmd(55, 60), cmd(40, 60)
+  assert arbitrate(icbm2, sa2, NOW) == sa2
+
+
+def test_arbitrate_dec_always_wins_over_inc():
+  # icbm finished its curve and wants to restore (inc); speedadjust independently needs a NEW dec
+  # (police report just appeared) -> the dec must win, never the inc, even though icbm "had the bus"
+  restoring = rcmd(60, 60)
+  new_cap = cmd(50, 60)
+  assert arbitrate(restoring, new_cap, NOW) == new_cap
+  assert arbitrate(new_cap, restoring, NOW) == new_cap
+
+
+def test_arbitrate_inc_only_when_neither_wants_dec():
+  restoring = rcmd(60, 60)
+  assert arbitrate(restoring, None, NOW) == restoring
+  assert arbitrate(None, restoring, NOW) == restoring
+
+
+def test_arbitrate_both_inc_lower_wins():
+  a, b = rcmd(60, 60), rcmd(55, 55)
+  assert arbitrate(a, b, NOW) == b
+  assert arbitrate(b, a, NOW) == b
+
+
+def test_arbitrate_both_none():
+  assert arbitrate(None, None, NOW) is None
+
+
+def test_arbitrate_stale_dec_ignored():
+  # a stale icbm heartbeat must not be able to veto or out-compete a fresh speedadjust dec
+  stale_icbm = cmd(30, 60, ts=NOW - STALE_LIMIT_S - 0.1)   # would "win" on target alone (30 < 50)
+  fresh_sa = cmd(50, 60)
+  assert arbitrate(stale_icbm, fresh_sa, NOW) == fresh_sa
+
+
+def test_arbitrate_stale_inc_ignored():
+  stale_restore = rcmd(60, 60, ts=NOW - STALE_LIMIT_S - 0.1)
+  assert arbitrate(stale_restore, None, NOW) is None
+
+
+def test_arbitrate_malformed_input_treated_as_absent():
+  # dir isn't validated by arbitrate() itself (icbm_buttons only ever hands it a real IcbmCommand or
+  # None), but a defensive check costs nothing: an object without .dir/.ts must not raise.
+  class _Bad:
+    pass
+  assert arbitrate(_Bad(), None, NOW) is None
+  assert arbitrate(None, cmd(50, 60), NOW) == cmd(50, 60)

@@ -21,6 +21,13 @@ class PnwVehicle:
     # ICBM executor runs: buttons available AND openpilot does NOT own longitudinal
     self.icbm: bool = self.stock_acc_buttons and not self.op_long
 
+    # speedadjust-exec2pnw: the stock-ACC button executor ALSO reads a second brain's target
+    # (SpeedAdjustTarget, police-ahead / lower-speed-limit reduce-only cap) and arbitrates between
+    # the two — see icbm_pnw.arbitrate(). Same gating condition as `icbm` today (one executor, one
+    # set of buttons, shared by both brains); kept as its own named capability so the two features
+    # can diverge independently later without re-deriving the gate at each call site.
+    self.speedadjust_buttons: bool = self.stock_acc_buttons and not self.op_long
+
     # predicted-curvature blend (fordlat2pnw): Ford curvature-only lateral cars where the
     # BluePilot-derived turn-exit blend is validated
     self.pc_blend: bool = fp == "FORD_F_150_LIGHTNING_MK1"

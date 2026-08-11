@@ -23,6 +23,13 @@ Safety envelope (enforced HERE, independent of the brain) — Gemini-hardened 20
   - stale/absent target (no fresh brain heartbeat) => no presses at all
   - driver gas/brake pauses pressing (driver always wins); a press aborts MID-PRESS the instant its
     preconditions vanish (cruise off / override / stale) rather than completing the tap
+
+speedadjust-exec2pnw: this module's decide_press/PressGovernor/RestoreGuard are shared by a SECOND
+brain, speedadjust2pnw (police-ahead / lower-speed-limit reduce-only cap), which publishes a
+SpeedAdjustTarget mem-param in the exact same {target, ceiling, ts, dir?} shape as IcbmTarget. Only
+one command can be asserted on the shared SET+/SET- buttons at a time, so carcontroller.py calls
+arbitrate() (below) to pick between the two brains' commands before calling decide_press() — see
+arbitrate()'s docstring for the rule (DEC always wins; more-restrictive dec wins between two decs).
 """
 
 from dataclasses import dataclass
@@ -71,6 +78,58 @@ def decide_press(stock_set_ms: float, cmd: IcbmCommand | None, now: float,
   if stock_set_ms > target + DEADBAND_MS:
     return "dec"
   return None                     # caps stay DEC-ONLY: never press up on a cap command
+
+
+def arbitrate(icbm_cmd: "IcbmCommand | None", sa_cmd: "IcbmCommand | None", now: float) -> "IcbmCommand | None":
+  """speedadjust-exec2pnw: the truck has exactly ONE set of stock-ACC buttons, shared by TWO brains —
+  icbm2pnw (curve slow-downs, ces_pnw.py) and speedadjust2pnw (police/limit slow-downs,
+  speedadjust_controller.py). Only one command may be asserted per frame; this picks it.
+
+  Rule (mirrors the icbm2pnw episode machine's own "a NEW cap (DEC ALWAYS WINS...)" principle,
+  extended across sources instead of within one source's episodes):
+    1. If EITHER source has a fresh ("dir" == "dec", heartbeat within STALE_LIMIT_S) cap command,
+       a reduction is required. Assert whichever of the two wants the LOWER target speed (the more
+       restrictive requirement always governs) — passed through UNCHANGED (its own ceiling/ts/dir),
+       no cross-source merging of ceiling values. Fresh vs stale is checked HERE (not left to
+       decide_press) precisely so a dead/stale source can never contribute a target to the min().
+    2. Only when NEITHER source currently wants a dec does an "inc" (restore) get to run. If both
+       sources simultaneously offer a fresh restore (two independent restores landing the same
+       tick — expected to be rare/never in practice today since only icbm2pnw's episode machine
+       emits "inc"), assert the one with the LOWER target/ceiling — restoring toward the more
+       conservative of the two ceilings can never overshoot either source's own bound.
+    3. Otherwise (both sources silent/idle/stale): None — the executor stays quiet.
+
+  Pure; never raises (bad input just fails the freshness/shape checks and is treated as absent).
+  decide_press() independently re-checks staleness/ceiling/etc. on whatever this returns — this
+  function only decides WHICH of the (at most) two live commands wins the shared bus."""
+  def _fresh(c, want_dir):
+    if c is None:
+      return None
+    if getattr(c, "dir", "dec") != want_dir:
+      return None
+    try:
+      if now - c.ts > STALE_LIMIT_S:
+        return None
+    except (TypeError, AttributeError):
+      return None
+    return c
+
+  a_dec, b_dec = _fresh(icbm_cmd, "dec"), _fresh(sa_cmd, "dec")
+  if a_dec is not None and b_dec is not None:
+    return a_dec if a_dec.target_ms <= b_dec.target_ms else b_dec
+  if a_dec is not None:
+    return a_dec
+  if b_dec is not None:
+    return b_dec
+
+  a_inc, b_inc = _fresh(icbm_cmd, "inc"), _fresh(sa_cmd, "inc")
+  if a_inc is not None and b_inc is not None:
+    return a_inc if a_inc.target_ms <= b_inc.target_ms else b_inc
+  if a_inc is not None:
+    return a_inc
+  if b_inc is not None:
+    return b_inc
+  return None
 
 
 class RestoreGuard:
