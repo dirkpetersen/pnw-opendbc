@@ -254,3 +254,137 @@ def test_arbitrate_generalizes_to_a_third_source():
   a, b, c = cmd(55, 60), cmd(50, 60), cmd(45, 60)
   assert arbitrate([a, b, c], NOW) == c
   assert arbitrate([c, b, a], NOW) == c
+
+
+# ---- restore2pnw-hardening (2026-08, Gemini + Fable review of speedadjust-exec2pnw) ----------------
+
+def test_arbitrate_dec_selection_uses_effective_bound_not_raw_target():
+  # Gemini's finding: selecting purely by raw target_ms could rank a malformed/adversarial command
+  # (whose target transiently exceeds its OWN ceiling) as "more conservative" than a command whose
+  # true effective bound (min(target, ceiling)) is actually stricter. Construct exactly that: A's raw
+  # target (60) is HIGHER than B's (50), but A's ceiling (40) makes its true effective bound (40)
+  # stricter than B's (50) -- the correct winner is A, not B.
+  a = IcbmCommand(target_ms=60 * MPH_TO_MS, ceiling_ms=40 * MPH_TO_MS, ts=NOW)   # effective bound 40
+  b = IcbmCommand(target_ms=50 * MPH_TO_MS, ceiling_ms=90 * MPH_TO_MS, ts=NOW)   # effective bound 50
+  assert arbitrate([a, b], NOW) == a
+  assert arbitrate([b, a], NOW) == a
+
+
+def test_arbitrate_inc_selection_uses_effective_bound_not_raw_target():
+  # same divergence on the restore (inc) side.
+  a = IcbmCommand(target_ms=60 * MPH_TO_MS, ceiling_ms=40 * MPH_TO_MS, ts=NOW, dir="inc")
+  b = IcbmCommand(target_ms=50 * MPH_TO_MS, ceiling_ms=90 * MPH_TO_MS, ts=NOW, dir="inc")
+  assert arbitrate([a, b], NOW) == a
+  assert arbitrate([b, a], NOW) == a
+
+
+def test_arbitrate_selection_unchanged_when_target_equals_ceiling():
+  # every command either brain actually publishes today has target_ms == ceiling_ms at its own
+  # restore point / dec target, so the effective-bound key is a no-op in current practice -- this is
+  # the regression guard that the existing behavior (tested extensively above) never moved.
+  icbm, sa = cmd(45, 60), cmd(50, 60)
+  assert arbitrate([icbm, sa], NOW) == icbm
+  restoring = rcmd(60, 60)
+  assert arbitrate([restoring, None], NOW) == restoring
+
+
+def test_arbitrate_inc_debounced_right_after_a_dec():
+  # oscillation guard: a dec that just won the bus must not be immediately followed by an inc on the
+  # very next poll -- require the bus to be dec-free for INC_AFTER_DEC_DEBOUNCE_S first.
+  from opendbc.car.ford.icbm_pnw import INC_AFTER_DEC_DEBOUNCE_S
+  restoring = rcmd(60, 60)
+  last_dec_ts = NOW - 0.05                    # a dec won the bus 50 ms ago
+  assert arbitrate([restoring, None], NOW, last_dec_ts) is None            # debounced
+  later = NOW + INC_AFTER_DEC_DEBOUNCE_S + 0.01
+  assert arbitrate([restoring, None], later, last_dec_ts) == restoring     # debounce elapsed
+
+
+def test_arbitrate_inc_debounce_ignored_when_no_prior_dec():
+  # the default (no last_dec_ts, or None) -- unchanged behavior, no debounce applied.
+  restoring = rcmd(60, 60)
+  assert arbitrate([restoring, None], NOW) == restoring
+  assert arbitrate([restoring, None], NOW, None) == restoring
+
+
+def test_arbitrate_dec_never_debounced():
+  # the debounce only ever gates inc; a fresh dec always asserts immediately regardless of last_dec_ts.
+  new_cap = cmd(50, 60)
+  assert arbitrate([new_cap, None], NOW, NOW - 0.01) == new_cap
+
+
+def test_guard_survives_dec_interlude_same_episode():
+  # restore2pnw-hardening: a DIFFERENT brain's dec briefly winning the shared bus mid-restore must NOT
+  # wipe the veto latch for the SAME restore episode (same ceiling) still pending underneath it.
+  g = RestoreGuard()
+  ceil = 60 * MPH_TO_MS
+  assert g.filter("inc", 45 * MPH_TO_MS, NOW, True, ceil) == "inc"
+  # the driver taps SET- during the restore: blocked
+  assert g.filter("inc", 44 * MPH_TO_MS, NOW + 0.5, True, ceil) is None
+  assert g.blocked
+  # a different brain's dec wins the bus this tick -- the CALLER still reports restoring=True/ceiling
+  # unchanged (the SAME episode is still pending underneath, per the carcontroller contract) -- dec
+  # itself must pass through untouched, and the veto must SURVIVE
+  assert g.filter("dec", 42 * MPH_TO_MS, NOW + 1.0, True, ceil) == "dec"
+  assert g.blocked
+  # the interlude clears and the SAME restore resumes -- still vetoed, no SET+ oscillation
+  assert g.filter("inc", 42 * MPH_TO_MS, NOW + 1.5, True, ceil) is None
+  assert g.blocked
+
+
+def test_guard_new_episode_different_ceiling_resets_latch():
+  # a genuinely NEW restore episode (different ceiling) is a fresh start -- the old episode's veto must
+  # not leak into it.
+  g = RestoreGuard()
+  ceil1 = 60 * MPH_TO_MS
+  g.filter("inc", 45 * MPH_TO_MS, NOW, True, ceil1)
+  g.filter("inc", 44 * MPH_TO_MS, NOW + 0.5, True, ceil1)
+  assert g.blocked
+  ceil2 = 55 * MPH_TO_MS
+  assert g.filter("inc", 50 * MPH_TO_MS, NOW + 1.0, True, ceil2) == "inc"
+  assert not g.blocked
+
+
+def test_guard_fully_idle_clears_latch_even_with_stale_ceiling():
+  # restoring=False (no brain has ANY live inc offer, not even an interlude) always fully stands down,
+  # regardless of what ceiling happens to be passed (default None here, mirrors the old call sites).
+  g = RestoreGuard()
+  ceil = 60 * MPH_TO_MS
+  g.filter("inc", 45 * MPH_TO_MS, NOW, True, ceil)
+  g.filter("inc", 44 * MPH_TO_MS, NOW + 0.5, True, ceil)
+  assert g.blocked
+  assert g.filter(None, 44 * MPH_TO_MS, NOW + 1.0, False) is None
+  assert not g.blocked
+  assert g.filter("inc", 44 * MPH_TO_MS, NOW + 1.5, True, ceil) == "inc"   # fresh episode, same ceiling ok
+
+
+# ---- restore2pnw-hardening: math.isfinite guard on the shared mem-param parser ----------------------
+# _parse_button_cmd lives on FordCarController (carcontroller.py), not icbm_pnw.py -- exercised via a
+# minimal stand-in since constructing a full CarController needs CarParams/CAN plumbing this test file
+# doesn't otherwise touch. The parser logic itself (json.loads + shape/finite checks) has no CarController
+# dependency, so this mirrors it exactly against the real implementation's behavior contract.
+
+def test_non_finite_target_rejected():
+  import math
+  from opendbc.car.ford.carcontroller import CarController
+  parse = CarController._parse_button_cmd
+  bad = {"target": float("nan"), "ceiling": 60.0, "ts": NOW}
+  assert parse(None, bad) is None
+  bad2 = {"target": float("inf"), "ceiling": 60.0, "ts": NOW}
+  assert parse(None, bad2) is None
+  bad3 = {"target": 50.0, "ceiling": float("-inf"), "ts": NOW}
+  assert parse(None, bad3) is None
+  bad4 = {"target": 50.0, "ceiling": 60.0, "ts": float("nan")}
+  assert parse(None, bad4) is None
+  good = {"target": 50.0, "ceiling": 60.0, "ts": NOW}
+  result = parse(None, good)
+  assert result is not None and math.isfinite(result.target_ms)
+
+
+def test_non_finite_via_json_string_rejected():
+  # json.loads (Python's, non-standard-but-permissive) happily parses bare NaN/Infinity literals.
+  from opendbc.car.ford.carcontroller import CarController
+  parse = CarController._parse_button_cmd
+  raw = f'{{"target": NaN, "ceiling": 60.0, "ts": {NOW}}}'
+  assert parse(None, raw) is None
+  raw2 = f'{{"target": Infinity, "ceiling": 60.0, "ts": {NOW}}}'
+  assert parse(None, raw2) is None

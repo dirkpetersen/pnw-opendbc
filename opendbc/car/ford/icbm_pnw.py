@@ -47,6 +47,11 @@ GAP_FRAMES = 30                   # 300 ms release between taps — clearly disc
                                   # merged "hold" (Ford holds step 5 mph; taps step 1 mph)
 STALE_LIMIT_S = 2.0               # brain heartbeat older than this => do nothing
 TAP_PERIOD_S = (PRESS_FRAMES + GAP_FRAMES) / 100.0   # min seconds between our own completed taps
+# restore2pnw-hardening (2026-08, Gemini + Fable review of speedadjust-exec2pnw): after ANY fresh dec
+# wins the shared bus, require it to stay clear this long before an inc may be asserted again — damps
+# a marginal candidate flapping at its own binding threshold against an open restore window
+# (SET-/SET+ oscillation).
+INC_AFTER_DEC_DEBOUNCE_S = 1.0
 
 
 @dataclass
@@ -83,7 +88,8 @@ def decide_press(stock_set_ms: float, cmd: IcbmCommand | None, now: float,
   return None                     # caps stay DEC-ONLY: never press up on a cap command
 
 
-def arbitrate(cmds: "list[IcbmCommand | None]", now: float) -> "IcbmCommand | None":
+def arbitrate(cmds: "list[IcbmCommand | None]", now: float,
+              last_dec_ts: float | None = None) -> "IcbmCommand | None":
   """The truck has exactly ONE set of stock-ACC buttons, shared by however many pnw brains want to
   steer the set speed — today icbm2pnw (curve slow-downs, ces_pnw.py) and speedadjust2pnw
   (police-ahead / lower-posted-limit slow-downs, speedadjust_controller.py), each publishing its own
@@ -95,16 +101,28 @@ def arbitrate(cmds: "list[IcbmCommand | None]", now: float) -> "IcbmCommand | No
   Rule (mirrors the icbm2pnw episode machine's own "a NEW cap (DEC ALWAYS WINS...)" principle,
   extended across sources instead of within one source's episodes):
     1. If ANY source has a fresh ("dir" == "dec", heartbeat within STALE_LIMIT_S) cap command, a
-       reduction is required. Assert whichever wants the LOWEST target speed (the single most-
-       restrictive requirement always governs) — passed through UNCHANGED (its own ceiling/ts/dir),
-       no cross-source merging of ceiling values. Fresh vs stale is checked HERE (not left to
-       decide_press) precisely so a dead/stale source can never contribute a target to the min().
-    2. Only when NO source currently wants a dec does an "inc" (restore) get to run. If more than one
-       source simultaneously offers a fresh restore (independent restores landing the same tick —
-       expected to be rare/never in practice today since only icbm2pnw's episode machine emits
-       "inc"), assert the one with the LOWEST target/ceiling — restoring toward the most conservative
-       of the offered ceilings can never overshoot any source's own bound.
-    3. Otherwise (every source silent/idle/stale): None — the executor stays quiet.
+       reduction is required. Assert whichever wants the most conservative EFFECTIVE bound (the
+       single most-restrictive requirement always governs) — passed through UNCHANGED (its own
+       ceiling/ts/dir), no cross-source merging of ceiling values. Fresh vs stale is checked HERE
+       (not left to decide_press) precisely so a dead/stale source can never contribute to the min().
+    2. Only when NO source currently wants a dec does an "inc" (restore) get to run, AND only after
+       the bus has been dec-free for INC_AFTER_DEC_DEBOUNCE_S (`last_dec_ts`, tracked by the caller
+       across polls — this function stays pure/stateless) — a marginal candidate flapping right at its
+       own binding threshold must not chatter the buttons SET-/SET+/SET-/... If more than one source
+       simultaneously offers a fresh restore (independent restores landing the same tick — expected to
+       be rare/never in practice today since only icbm2pnw's episode machine emits "inc"), assert the
+       one with the most conservative EFFECTIVE bound — restoring toward the most conservative of the
+       offered ceilings can never overshoot any source's own bound.
+    3. Otherwise (every source silent/idle/stale, or debounced): None — the executor stays quiet.
+
+  Selection key (both steps 1 and 2): `min(c.target_ms, c.ceiling_ms)`, NOT bare `c.target_ms` — every
+  command published today always has target_ms == ceiling_ms at its OWN restore point (a full restore
+  to the latched ceiling), so this is a no-op in current practice; it is still the correct key rather
+  than a coincidentally-equivalent one, because it is robust to a future brain whose target and ceiling
+  legitimately differ (e.g. a partial-restore step), or to a malformed command whose target
+  transiently exceeds its own ceiling — a raw-target comparison could rank such a command as "more
+  conservative" than it actually is. decide_press() independently re-clamps `min(target_ms, ceiling_ms)`
+  on whatever single command wins here, so this is defense-in-depth, not the only clamp.
 
   Pure; never raises (bad input just fails the freshness/shape checks and is treated as absent).
   decide_press() independently re-checks staleness/ceiling/etc. on whatever this returns — this
@@ -121,15 +139,27 @@ def arbitrate(cmds: "list[IcbmCommand | None]", now: float) -> "IcbmCommand | No
       return None
     return c
 
+  def _bound(c):
+    return min(c.target_ms, c.ceiling_ms)
+
   decs = [f for f in (_fresh(c, "dec") for c in cmds) if f is not None]
   if decs:
-    return min(decs, key=lambda c: c.target_ms)
+    return min(decs, key=_bound)
 
   incs = [f for f in (_fresh(c, "inc") for c in cmds) if f is not None]
   if incs:
-    return min(incs, key=lambda c: c.target_ms)
+    if last_dec_ts is not None:
+      try:
+        if now - last_dec_ts < INC_AFTER_DEC_DEBOUNCE_S:
+          return None       # a dec was live too recently — hold off on inc to avoid flapping
+      except TypeError:
+        pass
+    return min(incs, key=_bound)
 
   return None
+
+
+_UNSET = object()   # RestoreGuard episode-identity sentinel — distinct from a legitimate ceiling=None
 
 
 class RestoreGuard:
@@ -144,25 +174,51 @@ class RestoreGuard:
   BLOCK latches for the remainder of the restore episode: inc intents are swallowed until the
   episode ends (an empty command or a dec command clears the latch — dec is never filtered).
   Residual (documented): a single driver SET+ tap during restore is indistinguishable from our own
-  tap at this granularity; it is same-direction, still ceiling-bounded, and harmless."""
+  tap at this granularity; it is same-direction, still ceiling-bounded, and harmless.
+
+  restore2pnw-hardening (cross-brain dec-interlude fix): the veto latch is keyed to the restore
+  EPISODE's identity (its `ceiling`), not merely to the `restoring` flag toggling. Without this, a
+  brief dec from a DIFFERENT brain winning the shared bus mid-restore (e.g. a curve-ICBM dec while
+  speedadjust's restore is still logically in flight underneath) would report `restoring=False` for
+  those ticks under the old scheme, wiping `_blocked`/`_last_set` — resuming the restore afterward as
+  if the driver's earlier SET- veto had never happened. Callers must pass `restoring`/`ceiling`
+  derived from whether ANY brain still has a live inc offer pending (see
+  carcontroller.py:_icbm_buttons's `pending_inc`), not just whichever command arbitrate() picked to
+  press THIS tick — that is what lets the SAME episode survive a preempting dec interlude here."""
 
   def __init__(self):
     self._blocked = False
     self._last_set = None
     self._last_t = None
+    self._episode_ceiling = _UNSET   # identity of the restore episode currently being tracked
 
   @property
   def blocked(self) -> bool:
     return self._blocked
 
-  def filter(self, intent: str | None, stock_set_ms: float, now: float, restoring: bool) -> str | None:
-    """Pass every frame. `restoring` = the current brain command is an inc/restore command."""
+  def filter(self, intent: str | None, stock_set_ms: float, now: float, restoring: bool,
+             ceiling: float | None = None) -> str | None:
+    """Pass every frame. `restoring` = SOME brain still has a live inc/restore offer pending (not
+    merely "the command arbitrate() picked to press this exact tick is an inc" — see class docstring).
+    `ceiling` identifies WHICH restore episode is being offered; a change in ceiling while restoring
+    is treated as a genuinely NEW episode (fresh latch); the SAME ceiling persisting across a dec
+    interlude (restoring stays True, ceiling unchanged) preserves the latch instead of clearing it.
+    `dec` (or no) intent is NEVER filtered by this latch, regardless of `_blocked`."""
     if not restoring:
-      # episode over (silent) or a cap owns the bus (dec): clear the latch, never filter dec
+      # no brain has a live inc offer at all -> fully stand down, clear the latch, never filter dec
       self._blocked = False
       self._last_set = None
       self._last_t = None
+      self._episode_ceiling = _UNSET
       return intent
+    if self._episode_ceiling is _UNSET or self._episode_ceiling != ceiling:
+      # first restore ever, or a genuinely different episode (different ceiling) -> fresh latch. A
+      # same-ceiling dec interlude from a different brain never reaches this branch (restoring/ceiling
+      # reflect the still-pending inc offer underneath it, per the caller contract above).
+      self._blocked = False
+      self._last_set = None
+      self._last_t = None
+      self._episode_ceiling = ceiling
     if self._last_set is not None and stock_set_ms > 0:
       dt = max(now - (self._last_t or now), 0.0)
       if stock_set_ms < self._last_set - 0.6 * STEP_MS:
@@ -172,6 +228,8 @@ class RestoreGuard:
     if stock_set_ms > 0:
       self._last_set = stock_set_ms
       self._last_t = now
+    if intent != "inc":
+      return intent            # dec (or no intent) is NEVER filtered by the restore veto latch
     return None if self._blocked else intent
 
 

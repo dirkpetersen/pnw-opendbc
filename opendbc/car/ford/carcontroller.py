@@ -255,6 +255,9 @@ class CarController(CarControllerBase):
     self._icbm_guard = None
     self._icbm_cmd = None
     self._sa_cmd = None          # speedadjust-exec2pnw: the SpeedAdjustTarget-derived command
+    # restore2pnw-hardening: oscillation debounce -- last time ANY fresh dec won the shared bus (see
+    # icbm_pnw.arbitrate's last_dec_ts).
+    self._last_dec_ts = None
     self._icbm_params = None
     if self._icbm_enabled:
       try:
@@ -269,8 +272,10 @@ class CarController(CarControllerBase):
   def _parse_button_cmd(self, raw):
     """speedadjust-exec2pnw: shared parser for both IcbmTarget and SpeedAdjustTarget — both mem-params
     use the identical {target, ceiling, ts, dir?} JSON shape. Returns an IcbmCommand or None; NEVER
-    raises (fail-closed: any malformed/missing/unknown-dir payload -> None, no press)."""
-    import json
+    raises (fail-closed: any malformed/missing/unknown-dir/non-finite payload -> None, no press).
+    restore2pnw-hardening: `json.loads` happily parses NaN/Infinity (non-standard but accepted by
+    Python's json module) -- a non-finite target/ceiling/ts could poison a downstream min()/comparison,
+    so every numeric field is explicitly finite-checked before accepting the command."""
     from opendbc.car.ford.icbm_pnw import IcbmCommand
     try:
       if isinstance(raw, (bytes, str)) and raw:
@@ -281,8 +286,9 @@ class CarController(CarControllerBase):
         # An unknown value stands down entirely (fail-closed on protocol drift).
         d = str(raw.get("dir", "dec"))
         if d in ("dec", "inc"):
-          return IcbmCommand(target_ms=float(raw["target"]), ceiling_ms=float(raw["ceiling"]),
-                             ts=float(raw["ts"]), dir=d)
+          target, ceiling, ts = float(raw["target"]), float(raw["ceiling"]), float(raw["ts"])
+          if math.isfinite(target) and math.isfinite(ceiling) and math.isfinite(ts):
+            return IcbmCommand(target_ms=target, ceiling_ms=ceiling, ts=ts, dir=d)
     except Exception:
       pass
     return None
@@ -305,15 +311,24 @@ class CarController(CarControllerBase):
     stock_set = float(CS.out.cruiseState.speed)
     # reduce every brain's command to the ONE unified button-management target before deciding what
     # to press — see arbitrate()'s docstring (DEC always wins; most-restrictive dec wins across
-    # sources). Extensible: any future brain just adds its command to this list.
-    cmd = arbitrate([self._icbm_cmd, self._sa_cmd], now)
+    # sources, with a debounce before a fresh inc after a dec). Extensible: any future brain just adds
+    # its command to this list.
+    cmd = arbitrate([self._icbm_cmd, self._sa_cmd], now, self._last_dec_ts)
+    if cmd is not None and getattr(cmd, "dir", "dec") == "dec":
+      self._last_dec_ts = now
     intent = decide_press(stock_set, cmd, now,
                           bool(CS.out.cruiseState.enabled), driver_override)
-    # icbmrestore2pnw: the guard runs EVERY frame while a restore command is active (it tracks the
-    # set-speed trajectory even when no press is intended) and swallows inc intents for the rest of
-    # the episode once a human touched the buttons. Caps ('dec') are never filtered.
-    restoring = cmd is not None and getattr(cmd, "dir", "dec") == "inc"
-    intent = self._icbm_guard.filter(intent, stock_set, now, restoring)
+    # restore2pnw-hardening (cross-brain dec-interlude fix): the guard's veto latch must survive a
+    # brief dec interlude from a DIFFERENT brain while THIS restore episode is still being offered
+    # underneath — key `restoring`/`ceiling` to whether ANY brain still has a fresh inc command
+    # pending (re-arbitrated over inc-only candidates), not just whichever command WON the bus this
+    # exact tick. A dec that's actually the offering brain's OWN cap (cancelling its own restore) is
+    # handled naturally: that brain stops publishing "inc" at all, so it drops out of `pending_inc` too.
+    pending_inc = arbitrate([c for c in (self._icbm_cmd, self._sa_cmd)
+                            if c is not None and getattr(c, "dir", "dec") == "inc"], now)
+    restoring = pending_inc is not None
+    ceiling = pending_inc.ceiling_ms if pending_inc is not None else None
+    intent = self._icbm_guard.filter(intent, stock_set, now, restoring, ceiling)
     return self._icbm_governor.update(self.frame, intent)
 
   def update(self, CC, CS, now_nanos):
