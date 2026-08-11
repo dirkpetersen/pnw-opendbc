@@ -24,12 +24,15 @@ Safety envelope (enforced HERE, independent of the brain) — Gemini-hardened 20
   - driver gas/brake pauses pressing (driver always wins); a press aborts MID-PRESS the instant its
     preconditions vanish (cruise off / override / stale) rather than completing the tap
 
-speedadjust-exec2pnw: this module's decide_press/PressGovernor/RestoreGuard are shared by a SECOND
-brain, speedadjust2pnw (police-ahead / lower-speed-limit reduce-only cap), which publishes a
-SpeedAdjustTarget mem-param in the exact same {target, ceiling, ts, dir?} shape as IcbmTarget. Only
-one command can be asserted on the shared SET+/SET- buttons at a time, so carcontroller.py calls
-arbitrate() (below) to pick between the two brains' commands before calling decide_press() — see
-arbitrate()'s docstring for the rule (DEC always wins; more-restrictive dec wins between two decs).
+speedadjust-exec2pnw: this module's decide_press/PressGovernor/RestoreGuard are ONE generic executor,
+shared by however many pnw brains want to steer the stock set speed — today icbm2pnw (curve slow-
+downs) and speedadjust2pnw (police-ahead / lower-speed-limit reduce-only cap), each publishing its
+own mem-param in the identical {target, ceiling, ts, dir?} shape. Only one command can be asserted on
+the shared SET+/SET- buttons at a time, so carcontroller.py calls arbitrate() (below) to reduce every
+brain's command down to the ONE unified button-management target before calling decide_press() — see
+arbitrate()'s docstring for the rule (DEC always wins; most-restrictive/lowest dec wins across
+sources). decide_press()/PressGovernor/RestoreGuard themselves have no notion of "which brain" — they
+are fully generic over the winning command's source.
 """
 
 from dataclasses import dataclass
@@ -80,28 +83,32 @@ def decide_press(stock_set_ms: float, cmd: IcbmCommand | None, now: float,
   return None                     # caps stay DEC-ONLY: never press up on a cap command
 
 
-def arbitrate(icbm_cmd: "IcbmCommand | None", sa_cmd: "IcbmCommand | None", now: float) -> "IcbmCommand | None":
-  """speedadjust-exec2pnw: the truck has exactly ONE set of stock-ACC buttons, shared by TWO brains —
-  icbm2pnw (curve slow-downs, ces_pnw.py) and speedadjust2pnw (police/limit slow-downs,
-  speedadjust_controller.py). Only one command may be asserted per frame; this picks it.
+def arbitrate(cmds: "list[IcbmCommand | None]", now: float) -> "IcbmCommand | None":
+  """The truck has exactly ONE set of stock-ACC buttons, shared by however many pnw brains want to
+  steer the set speed — today icbm2pnw (curve slow-downs, ces_pnw.py) and speedadjust2pnw
+  (police-ahead / lower-posted-limit slow-downs, speedadjust_controller.py), each publishing its own
+  {target, ceiling, ts, dir?} mem-param. This is the ONE unified "button-management target": every
+  poll, exactly one command is asserted on the shared bus, chosen from `cmds` (any number of brains —
+  the list can grow) by this single rule. `decide_press()` never sees more than one command; it has
+  no notion of "which brain" — the executor is fully generic over the source.
 
   Rule (mirrors the icbm2pnw episode machine's own "a NEW cap (DEC ALWAYS WINS...)" principle,
   extended across sources instead of within one source's episodes):
-    1. If EITHER source has a fresh ("dir" == "dec", heartbeat within STALE_LIMIT_S) cap command,
-       a reduction is required. Assert whichever of the two wants the LOWER target speed (the more
+    1. If ANY source has a fresh ("dir" == "dec", heartbeat within STALE_LIMIT_S) cap command, a
+       reduction is required. Assert whichever wants the LOWEST target speed (the single most-
        restrictive requirement always governs) — passed through UNCHANGED (its own ceiling/ts/dir),
        no cross-source merging of ceiling values. Fresh vs stale is checked HERE (not left to
        decide_press) precisely so a dead/stale source can never contribute a target to the min().
-    2. Only when NEITHER source currently wants a dec does an "inc" (restore) get to run. If both
-       sources simultaneously offer a fresh restore (two independent restores landing the same
-       tick — expected to be rare/never in practice today since only icbm2pnw's episode machine
-       emits "inc"), assert the one with the LOWER target/ceiling — restoring toward the more
-       conservative of the two ceilings can never overshoot either source's own bound.
-    3. Otherwise (both sources silent/idle/stale): None — the executor stays quiet.
+    2. Only when NO source currently wants a dec does an "inc" (restore) get to run. If more than one
+       source simultaneously offers a fresh restore (independent restores landing the same tick —
+       expected to be rare/never in practice today since only icbm2pnw's episode machine emits
+       "inc"), assert the one with the LOWEST target/ceiling — restoring toward the most conservative
+       of the offered ceilings can never overshoot any source's own bound.
+    3. Otherwise (every source silent/idle/stale): None — the executor stays quiet.
 
   Pure; never raises (bad input just fails the freshness/shape checks and is treated as absent).
   decide_press() independently re-checks staleness/ceiling/etc. on whatever this returns — this
-  function only decides WHICH of the (at most) two live commands wins the shared bus."""
+  function only decides WHICH of the live commands wins the shared bus."""
   def _fresh(c, want_dir):
     if c is None:
       return None
@@ -114,21 +121,14 @@ def arbitrate(icbm_cmd: "IcbmCommand | None", sa_cmd: "IcbmCommand | None", now:
       return None
     return c
 
-  a_dec, b_dec = _fresh(icbm_cmd, "dec"), _fresh(sa_cmd, "dec")
-  if a_dec is not None and b_dec is not None:
-    return a_dec if a_dec.target_ms <= b_dec.target_ms else b_dec
-  if a_dec is not None:
-    return a_dec
-  if b_dec is not None:
-    return b_dec
+  decs = [f for f in (_fresh(c, "dec") for c in cmds) if f is not None]
+  if decs:
+    return min(decs, key=lambda c: c.target_ms)
 
-  a_inc, b_inc = _fresh(icbm_cmd, "inc"), _fresh(sa_cmd, "inc")
-  if a_inc is not None and b_inc is not None:
-    return a_inc if a_inc.target_ms <= b_inc.target_ms else b_inc
-  if a_inc is not None:
-    return a_inc
-  if b_inc is not None:
-    return b_inc
+  incs = [f for f in (_fresh(c, "inc") for c in cmds) if f is not None]
+  if incs:
+    return min(incs, key=lambda c: c.target_ms)
+
   return None
 
 

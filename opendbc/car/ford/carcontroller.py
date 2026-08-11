@@ -239,15 +239,18 @@ class CarController(CarControllerBase):
     except Exception:
       self._latstat_params = None
 
-    # icbm2pnw: stock-ACC set-speed steering for the F-150 Lightning (Tier 1, no op-long). The brain
-    # (target selection from CES/VTSC curve logic) runs in the pnw layer and publishes the IcbmTarget
-    # mem-param; this side is only the closed-loop executor (see icbm_pnw.py for the safety envelope).
-    # speedadjust-exec2pnw: a SECOND brain (speedadjust2pnw: police-ahead / lower-speed-limit cap)
-    # shares the SAME executor + SAME buttons via a second mem-param, SpeedAdjustTarget, in the
-    # identical {target, ceiling, ts, dir?} shape. arbitrate() (icbm_pnw.py) picks between the two
-    # brains' commands every poll before decide_press() runs — see its docstring for the rule.
-    # Params import is runtime-only and guarded: on a bare opendbc checkout ICBM simply stays off.
-    self._icbm_enabled = veh.icbm
+    # icbm2pnw / speedadjust-exec2pnw: ONE generic stock-ACC button-management executor for the
+    # F-150 Lightning (Tier 1, no op-long), gated on the car-agnostic `veh.button_management`
+    # capability (true today only for the Lightning's stock-ACC buttons; NOT a fingerprint check
+    # here — see opendbc/car/pnw_vehicle.py). Any number of car-agnostic pnw brains can publish a
+    # {target, ceiling, ts, dir?} mem-param and get slowdowns for free on any car that declares this
+    # capability and implements the (necessarily per-brand) tap executor below — today: icbm2pnw
+    # (curve slow-downs, ces_pnw.py -> IcbmTarget) and speedadjust2pnw (police-ahead / lower-speed-
+    # limit reduce-only cap, speedadjust_controller.py -> SpeedAdjustTarget). arbitrate() (icbm_pnw.py)
+    # reduces every brain's command to the ONE unified button-management target every poll, before
+    # decide_press() runs — see its docstring for the rule. Params import is runtime-only and guarded:
+    # on a bare opendbc checkout this simply stays off.
+    self._icbm_enabled = veh.button_management
     self._icbm_governor = None
     self._icbm_guard = None
     self._icbm_cmd = None
@@ -263,7 +266,7 @@ class CarController(CarControllerBase):
       except Exception:
         self._icbm_enabled = False
 
-  def _parse_icbm_cmd(self, raw):
+  def _parse_button_cmd(self, raw):
     """speedadjust-exec2pnw: shared parser for both IcbmTarget and SpeedAdjustTarget — both mem-params
     use the identical {target, ceiling, ts, dir?} JSON shape. Returns an IcbmCommand or None; NEVER
     raises (fail-closed: any malformed/missing/unknown-dir payload -> None, no press)."""
@@ -290,19 +293,20 @@ class CarController(CarControllerBase):
     from opendbc.car.ford.icbm_pnw import arbitrate, decide_press
     if (self.frame % 25) == 0:  # 4 Hz mem-param read
       try:
-        self._icbm_cmd = self._parse_icbm_cmd(self._icbm_params.get("IcbmTarget"))
+        self._icbm_cmd = self._parse_button_cmd(self._icbm_params.get("IcbmTarget"))
       except Exception:
         self._icbm_cmd = None
       try:
-        self._sa_cmd = self._parse_icbm_cmd(self._icbm_params.get("SpeedAdjustTarget"))
+        self._sa_cmd = self._parse_button_cmd(self._icbm_params.get("SpeedAdjustTarget"))
       except Exception:
         self._sa_cmd = None
     driver_override = bool(CS.out.gasPressed or CS.out.brakePressed)
     now = time.time()
     stock_set = float(CS.out.cruiseState.speed)
-    # speedadjust-exec2pnw: pick ONE command off the two brains before deciding what to press —
-    # see arbitrate()'s docstring (DEC always wins; more-restrictive dec wins between two decs).
-    cmd = arbitrate(self._icbm_cmd, self._sa_cmd, now)
+    # reduce every brain's command to the ONE unified button-management target before deciding what
+    # to press — see arbitrate()'s docstring (DEC always wins; most-restrictive dec wins across
+    # sources). Extensible: any future brain just adds its command to this list.
+    cmd = arbitrate([self._icbm_cmd, self._sa_cmd], now)
     intent = decide_press(stock_set, cmd, now,
                           bool(CS.out.cruiseState.enabled), driver_override)
     # icbmrestore2pnw: the guard runs EVERY frame while a restore command is active (it tracks the

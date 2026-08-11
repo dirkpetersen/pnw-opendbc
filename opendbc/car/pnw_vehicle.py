@@ -18,15 +18,25 @@ class PnwVehicle:
     # stock-ACC set-speed steering via SET +/- taps on the SCCM stream (icbm_pnw executor)
     self.stock_acc_buttons: bool = fp == "FORD_F_150_LIGHTNING_MK1"
 
-    # ICBM executor runs: buttons available AND openpilot does NOT own longitudinal
-    self.icbm: bool = self.stock_acc_buttons and not self.op_long
+    # speedadjust-exec2pnw: the ONE generic capability that gates the shared stock-ACC button-tap
+    # executor (icbm_pnw.py) — true whenever this car has stock-ACC buttons AND openpilot does NOT
+    # own longitudinal. Car-agnostic by construction (no per-feature fingerprint checks): ANY
+    # car-agnostic pnw brain that publishes a {target, ceiling, ts, dir?} mem-param gets slowdowns
+    # for free on any car declaring this capability, arbitrated against every other live brain's
+    # command by icbm_pnw.arbitrate() — the executor has no notion of "which feature" asked. Today
+    # only the Lightning declares it; the fingerprint check lives HERE ONLY (pnw_vehicle's whole job),
+    # never in feature/brain code (ces_pnw.py, speedadjust_controller.py, icbm_pnw.py all read only
+    # this boolean).
+    self.button_management: bool = self.stock_acc_buttons and not self.op_long
 
-    # speedadjust-exec2pnw: the stock-ACC button executor ALSO reads a second brain's target
-    # (SpeedAdjustTarget, police-ahead / lower-speed-limit reduce-only cap) and arbitrates between
-    # the two — see icbm_pnw.arbitrate(). Same gating condition as `icbm` today (one executor, one
-    # set of buttons, shared by both brains); kept as its own named capability so the two features
-    # can diverge independently later without re-deriving the gate at each call site.
-    self.speedadjust_buttons: bool = self.stock_acc_buttons and not self.op_long
+    # icbm2pnw: back-compat alias — same condition, kept in case anything still names it `icbm`
+    # specifically (the curve brain's own capability reads, e.g. icbm_map_scale/icbm_firm_decel
+    # below, are already unconditional / neutral-by-default and don't depend on this alias).
+    self.icbm: bool = self.button_management
+
+    # speedadjust-exec2pnw: same capability under the feature's own name too, for any call site that
+    # wants to name the feature rather than the umbrella mechanism.
+    self.speedadjust_buttons: bool = self.button_management
 
     # predicted-curvature blend (fordlat2pnw): Ford curvature-only lateral cars where the
     # BluePilot-derived turn-exit blend is validated
