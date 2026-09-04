@@ -87,3 +87,18 @@ class TestUncodedIsFiltered:
 
   def test_healthy_is_never_a_fault(self):
     assert not any(_run([HEALTHY] * 500))
+
+  def test_the_counter_cannot_go_negative(self):
+    """Fail-dangerous if it can. Without the lower clamp the count drifts to about -30,000 after a
+    few minutes of healthy driving, and a subsequent REAL sustained uncoded inhibit would then never
+    reach the report threshold inside the 3 s SOFT_DISABLE budget -- a silently swallowed fault.
+    Fable mutated the clamp away and all 12 previous tests still passed; this is the one that fails."""
+    reported = _run([HEALTHY] * 1000 + [UNCODED] * 10)
+    assert reported[-1], "a long healthy run drove the counter below zero and buried a real fault"
+
+  def test_report_latency_is_independent_of_how_long_we_were_healthy(self):
+    """The same 10-frame latency must hold whether we just started or have been driving for an hour."""
+    for healthy_prefix in (0, 1, 50, 5000):
+      reported = _run([HEALTHY] * healthy_prefix + [UNCODED] * 12)
+      first = next(i for i, r in enumerate(reported[healthy_prefix:]) if r)
+      assert first == 9, f"prefix={healthy_prefix}: first report at frame {first + 1}, expected 10"
