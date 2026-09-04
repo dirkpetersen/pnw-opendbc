@@ -10,28 +10,45 @@ from opendbc.car.tesla.values import DBC, CANBUS, GEAR_MAP, STEER_THRESHOLD, Tes
 ButtonType = structs.CarState.ButtonEvent.Type
 
 
-# steerdebounce2pnw: consecutive EAC_INHIBITED frames required before we report a temporary steering
-# fault. The Tesla EPS momentarily reports EAC_INHIBITED while it hands the rack over from
-# EAC_AVAILABLE to EAC_ACTIVE at engage. Measured on the car (I-5, 2026-09-03): exactly 4 frames out
-# of 6137 in a 61 s segment, all of them at the engage transition, ~40 ms total -- and openpilot
-# promoted that into a `steerTempUnavailable` SOFT_DISABLE and a driver-facing
-# "Steering Temporarily Unavailable" alert on EVERY engage.
-# 10 frames (~100 ms at the 100 Hz EPAS rate) is 2.5x the observed artifact while spending only ~3%
-# of the 3 s SOFT_DISABLE budget, so a genuinely sustained fault still disengages well within it.
-EAC_INHIBITED_MIN_FRAMES = 10
+# steerdebounce2pnw: separate the EPS's engage-handover artifact from a real steering inhibit.
+#
+# The Tesla EPS reports EAC_INHIBITED for a few frames while it hands the rack over from
+# EAC_AVAILABLE to EAC_ACTIVE at engage. carstate mapped ANY EAC_INHIBITED to steerFaultTemporary,
+# which is a SOFT_DISABLE event -- so that artifact produced a "Steering Temporarily Unavailable"
+# alert and an enabled->softDisabling->enabled flip at engage.
+#
+# The discriminator is the ERROR CODE, not the duration. Surveyed over ~18,600 EPAS frames across
+# four segments (2026-09-03, archived under drives/2026-09-03/hotspot-drive-tesla/, decoder
+# eac_runs.py): the only inhibited run near an engage was 4 frames carrying EAC_ERROR_IDLE -- the
+# EPS saying "inhibited, no reason". Every real inhibit observed (2026-08-31 seg58, driver override)
+# ran 19-20 frames and carried EAC_ERROR_HANDS_ON.
+#
+# So: a CODED inhibit is a real fault and is reported INSTANTLY, with no debounce and no added
+# latency -- strictly better than delaying every inhibit as the first cut did. Only the UNCODED
+# (IDLE) class, which is the artifact class, is filtered.
+#
+# The uncoded filter is a leaky counter rather than a consecutive count, on review: a consecutive
+# count that resets on one clean frame means an uncoded inhibit flapping faster than the threshold
+# is NEVER reported, however long it lasts. Rising 3 / decaying 1 makes anything above ~25% duty
+# ratchet up instead of hiding, and holds the fault ~300 ms after the last inhibit rather than
+# clearing on the first healthy sample (fail-safe for a fault flag is to hold, not to clear).
+# 10 consecutive uncoded frames still reports at frame 10, i.e. ~100 ms.
+EAC_IDLE_RISE = 3            # per uncoded-inhibit tick
+EAC_IDLE_DECAY = 1           # per healthy tick
+EAC_IDLE_REPORT = 30         # -> 10 consecutive uncoded ticks (~100 ms at the 100 Hz carState rate)
+EAC_IDLE_CAP = 60            # bounds the hold to ~300 ms after the last uncoded inhibit
 
 
-def debounce_eac_inhibited(count: int, inhibited: bool) -> tuple[bool, int]:
-  """(report_fault, new_count) for the EAC_INHIBITED -> steerFaultTemporary debounce.
+def next_steer_fault_temporary(count: int, inhibited: bool, err_idle: bool) -> tuple[bool, int]:
+  """(report_fault, new_count) for steerFaultTemporary.
 
-  Deliberately asymmetric: SLOW to assert (needs EAC_INHIBITED_MIN_FRAMES consecutive frames) and
-  INSTANT to clear (a single healthy frame resets). That is the safe direction for a fault flag --
-  a real fault is reported ~100 ms late, but recovery is never delayed, so openpilot resumes lateral
-  the moment the rack does. Note this is NOT the leaky up/down counter used by
-  update_steering_pressed: that has hysteresis on BOTH edges, which would also delay the clear.
+  `inhibited` = eacStatus is EAC_INHIBITED. `err_idle` = eacErrorCode is EAC_ERROR_IDLE (no reason
+  given). A coded inhibit reports immediately and does not touch the counter.
   """
-  count = count + 1 if inhibited else 0
-  return count >= EAC_INHIBITED_MIN_FRAMES, count
+  if inhibited and not err_idle:
+    return True, 0
+  count = min(count + EAC_IDLE_RISE, EAC_IDLE_CAP) if inhibited else max(count - EAC_IDLE_DECAY, 0)
+  return count >= EAC_IDLE_REPORT, count
 
 
 class CarState(CarStateBase):
@@ -66,7 +83,7 @@ class CarState(CarStateBase):
     self.suspected_fsd14 = False
 
     self.hands_on_level = 0
-    self.eac_inhibited_cnt = 0   # steerdebounce2pnw: consecutive EAC_INHIBITED frames
+    self.eac_idle_cnt = 0        # steerdebounce2pnw: leaky counter for UNCODED inhibits only
     self.das_control = None
 
   def update_autopark_state(self, autopark_state: str, cruise_enabled: bool):
@@ -109,14 +126,15 @@ class CarState(CarStateBase):
 
     eac_status = self.can_define.dv["EPAS3S_sysStatus"]["EPAS3S_eacStatus"].get(int(epas_status["EPAS3S_eacStatus"]), None)
     ret.steerFaultPermanent = eac_status == "EAC_FAULT"
-    # steerdebounce2pnw: debounce ONLY the temporary fault. steerFaultPermanent (EAC_FAULT) and
-    # steeringDisengage below are deliberately left instant -- the first is a real rack fault and the
-    # second is the panda-mirrored hard override, neither of which may be delayed.
-    ret.steerFaultTemporary, self.eac_inhibited_cnt = debounce_eac_inhibited(
-      self.eac_inhibited_cnt, eac_status == "EAC_INHIBITED")
+    eac_error_code = self.can_define.dv["EPAS3S_sysStatus"]["EPAS3S_eacErrorCode"].get(int(epas_status["EPAS3S_eacErrorCode"]), None)
+    # steerdebounce2pnw: a CODED inhibit is a real fault -> reported instantly, no added latency.
+    # Only the UNCODED (EAC_ERROR_IDLE) class -- the engage-handover artifact -- is filtered.
+    # steerFaultPermanent (EAC_FAULT) and steeringDisengage below stay instant: the first is a real
+    # rack fault, the second is the panda-mirrored hard override. Neither may be delayed.
+    ret.steerFaultTemporary, self.eac_idle_cnt = next_steer_fault_temporary(
+      self.eac_idle_cnt, eac_status == "EAC_INHIBITED", eac_error_code == "EAC_ERROR_IDLE")
 
     # FSD disengages using union of handsOnLevel (slow overrides) and high angle rate faults (fast overrides, high speed)
-    eac_error_code = self.can_define.dv["EPAS3S_sysStatus"]["EPAS3S_eacErrorCode"].get(int(epas_status["EPAS3S_eacErrorCode"]), None)
     ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
                                                          eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
 
@@ -225,14 +243,15 @@ class CarState(CarStateBase):
 
     eac_status = self.can_defines["EPAS_sysStatus"]["EPAS_eacStatus"].get(int(epas_status["EPAS_eacStatus"]), None)
     ret.steerFaultPermanent = eac_status == "EAC_FAULT"
-    # steerdebounce2pnw: debounce ONLY the temporary fault. steerFaultPermanent (EAC_FAULT) and
-    # steeringDisengage below are deliberately left instant -- the first is a real rack fault and the
-    # second is the panda-mirrored hard override, neither of which may be delayed.
-    ret.steerFaultTemporary, self.eac_inhibited_cnt = debounce_eac_inhibited(
-      self.eac_inhibited_cnt, eac_status == "EAC_INHIBITED")
+    eac_error_code = self.can_defines["EPAS_sysStatus"]["EPAS_eacErrorCode"].get(int(epas_status["EPAS_eacErrorCode"]), None)
+    # steerdebounce2pnw: a CODED inhibit is a real fault -> reported instantly, no added latency.
+    # Only the UNCODED (EAC_ERROR_IDLE) class -- the engage-handover artifact -- is filtered.
+    # steerFaultPermanent (EAC_FAULT) and steeringDisengage below stay instant: the first is a real
+    # rack fault, the second is the panda-mirrored hard override. Neither may be delayed.
+    ret.steerFaultTemporary, self.eac_idle_cnt = next_steer_fault_temporary(
+      self.eac_idle_cnt, eac_status == "EAC_INHIBITED", eac_error_code == "EAC_ERROR_IDLE")
 
     # FSD disengages using union of handsOnLevel (slow overrides) and high angle rate faults (fast overrides, high speed)
-    eac_error_code = self.can_defines["EPAS_sysStatus"]["EPAS_eacErrorCode"].get(int(epas_status["EPAS_eacErrorCode"]), None)
     ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
                                                          eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
 
