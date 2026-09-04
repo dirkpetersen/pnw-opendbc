@@ -10,6 +10,30 @@ from opendbc.car.tesla.values import DBC, CANBUS, GEAR_MAP, STEER_THRESHOLD, Tes
 ButtonType = structs.CarState.ButtonEvent.Type
 
 
+# steerdebounce2pnw: consecutive EAC_INHIBITED frames required before we report a temporary steering
+# fault. The Tesla EPS momentarily reports EAC_INHIBITED while it hands the rack over from
+# EAC_AVAILABLE to EAC_ACTIVE at engage. Measured on the car (I-5, 2026-09-03): exactly 4 frames out
+# of 6137 in a 61 s segment, all of them at the engage transition, ~40 ms total -- and openpilot
+# promoted that into a `steerTempUnavailable` SOFT_DISABLE and a driver-facing
+# "Steering Temporarily Unavailable" alert on EVERY engage.
+# 10 frames (~100 ms at the 100 Hz EPAS rate) is 2.5x the observed artifact while spending only ~3%
+# of the 3 s SOFT_DISABLE budget, so a genuinely sustained fault still disengages well within it.
+EAC_INHIBITED_MIN_FRAMES = 10
+
+
+def debounce_eac_inhibited(count: int, inhibited: bool) -> tuple[bool, int]:
+  """(report_fault, new_count) for the EAC_INHIBITED -> steerFaultTemporary debounce.
+
+  Deliberately asymmetric: SLOW to assert (needs EAC_INHIBITED_MIN_FRAMES consecutive frames) and
+  INSTANT to clear (a single healthy frame resets). That is the safe direction for a fault flag --
+  a real fault is reported ~100 ms late, but recovery is never delayed, so openpilot resumes lateral
+  the moment the rack does. Note this is NOT the leaky up/down counter used by
+  update_steering_pressed: that has hysteresis on BOTH edges, which would also delay the clear.
+  """
+  count = count + 1 if inhibited else 0
+  return count >= EAC_INHIBITED_MIN_FRAMES, count
+
+
 class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
@@ -42,6 +66,7 @@ class CarState(CarStateBase):
     self.suspected_fsd14 = False
 
     self.hands_on_level = 0
+    self.eac_inhibited_cnt = 0   # steerdebounce2pnw: consecutive EAC_INHIBITED frames
     self.das_control = None
 
   def update_autopark_state(self, autopark_state: str, cruise_enabled: bool):
@@ -84,7 +109,11 @@ class CarState(CarStateBase):
 
     eac_status = self.can_define.dv["EPAS3S_sysStatus"]["EPAS3S_eacStatus"].get(int(epas_status["EPAS3S_eacStatus"]), None)
     ret.steerFaultPermanent = eac_status == "EAC_FAULT"
-    ret.steerFaultTemporary = eac_status == "EAC_INHIBITED"
+    # steerdebounce2pnw: debounce ONLY the temporary fault. steerFaultPermanent (EAC_FAULT) and
+    # steeringDisengage below are deliberately left instant -- the first is a real rack fault and the
+    # second is the panda-mirrored hard override, neither of which may be delayed.
+    ret.steerFaultTemporary, self.eac_inhibited_cnt = debounce_eac_inhibited(
+      self.eac_inhibited_cnt, eac_status == "EAC_INHIBITED")
 
     # FSD disengages using union of handsOnLevel (slow overrides) and high angle rate faults (fast overrides, high speed)
     eac_error_code = self.can_define.dv["EPAS3S_sysStatus"]["EPAS3S_eacErrorCode"].get(int(epas_status["EPAS3S_eacErrorCode"]), None)
@@ -196,7 +225,11 @@ class CarState(CarStateBase):
 
     eac_status = self.can_defines["EPAS_sysStatus"]["EPAS_eacStatus"].get(int(epas_status["EPAS_eacStatus"]), None)
     ret.steerFaultPermanent = eac_status == "EAC_FAULT"
-    ret.steerFaultTemporary = eac_status == "EAC_INHIBITED"
+    # steerdebounce2pnw: debounce ONLY the temporary fault. steerFaultPermanent (EAC_FAULT) and
+    # steeringDisengage below are deliberately left instant -- the first is a real rack fault and the
+    # second is the panda-mirrored hard override, neither of which may be delayed.
+    ret.steerFaultTemporary, self.eac_inhibited_cnt = debounce_eac_inhibited(
+      self.eac_inhibited_cnt, eac_status == "EAC_INHIBITED")
 
     # FSD disengages using union of handsOnLevel (slow overrides) and high angle rate faults (fast overrides, high speed)
     eac_error_code = self.can_defines["EPAS_sysStatus"]["EPAS_eacErrorCode"].get(int(epas_status["EPAS_eacErrorCode"]), None)
