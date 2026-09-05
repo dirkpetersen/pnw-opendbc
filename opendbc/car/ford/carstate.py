@@ -1,3 +1,4 @@
+import time
 from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, create_button_events, structs
 from opendbc.car.common.conversions import Conversions as CV
@@ -19,6 +20,17 @@ class CarState(CarStateBase):
 
     self.distance_button = 0
     self.lc_button = 0
+
+    # cargps2pnw: /dev/shm handle for publishing the truck's own GPS fix, plus a decimator. Same
+    # pattern as fordlatui2pnw's FordLatStatus: an independent mem-param handle, fully guarded, so a
+    # params failure can never touch the car path. None => the feature is simply off.
+    self._cargps_params = None
+    try:
+      from openpilot.common.params import Params as _P
+      self._cargps_params = _P("/dev/shm/params")
+    except Exception:
+      self._cargps_params = None
+    self._cargps_decim = 0
 
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
@@ -113,11 +125,78 @@ class CarState(CarStateBase):
       *create_button_events(self.lc_button, prev_lc_button, {1: ButtonType.lkas}),
     ]
 
+    self._publish_car_gps(cp_cam)
     return ret
+
+  def _publish_car_gps(self, cp_cam) -> None:
+    """cargps2pnw: publish the truck's own GPS fix to /dev/shm CarGps for the ces_events log.
+
+    TELEMETRY ONLY -- nothing reads this for control, and every failure path is a silent no-op that
+    leaves the car untouched. Decimated to ~1 Hz because the source is 1 Hz; update() runs at 100 Hz.
+
+    DECODE GOTCHA, easy to get wrong: GPS_Longitude_Degrees is scaled (1,-179), so in the western
+    hemisphere it arrives ALREADY NEGATIVE (e.g. -122.0) while GPS_Longitude_Minutes/_Min_dec are
+    UNSIGNED magnitudes. Adding them naively yields -121.635 for a true -122.365 -- about 57 km east,
+    and plausible enough to believe. Combine sign-first (see _dm_to_deg).
+    """
+    if self._cargps_params is None:
+      return
+    self._cargps_decim += 1
+    if self._cargps_decim % 100:          # ~1 Hz against a 100 Hz update()
+      return
+    try:
+      nav1 = cp_cam.vl["APIMGPS_Data_Nav_1_FD1"]
+      nav3 = cp_cam.vl["APIMGPS_Data_Nav_3_FD1"]
+      lat_deg = float(nav1["GPS_Latitude_Degrees"])
+      lon_deg = float(nav1["GPS_Longitude_Degrees"])
+      if lat_deg == 0.0 and lon_deg == 0.0:
+        return                            # no fix yet -- publish nothing rather than 0,0
+      self._cargps_params.put_nonblocking("CarGps", {
+        "lat": round(_dm_to_deg(lat_deg, nav1["GPS_Latitude_Minutes"], nav1["GPS_Latitude_Min_dec"]), 6),
+        "lon": round(_dm_to_deg(lon_deg, nav1["GPS_Longitude_Minutes"], nav1["GPS_Longitude_Min_dec"]), 6),
+        "hdg": round(float(nav3["GPS_Heading"]), 1),
+        "spd": round(float(nav3["GPS_Speed"]), 1),          # MPH, as the DBC defines it
+        "sats": int(nav3["GPS_Sat_num_in_view"]),
+        "hdop": round(float(nav3["GPS_Hdop"]), 1),
+        "ts": round(time.time(), 2),
+      })
+    except Exception:
+      pass                                # missing message / malformed frame -> skip this tick
+
+  # cargps2pnw: the truck's OWN GPS fix, broadcast by the GWM on the camera bus at 1 Hz.
+  # Confirmed on-vehicle 2026-09-05 (F-150 Lightning, route 000000dc--c844257700 seg 8): decoded
+  # position agreed with the comma's own GPS to 5.4 m, with 31 satellites and HDOP 0.4 -- a better
+  # fix than the device gets behind a windshield. Telemetry only; nothing consumes it for control.
+  #
+  # REGISTERED WITH float("nan") FREQUENCY, WHICH IS LOAD-BEARING. CANParser sets
+  # ignore_alive = isnan(freq) (opendbc/can/parser.py), and MessageState.valid() returns True
+  # immediately when ignore_alive. Without that, a missing APIMGPS message would make this parser
+  # can_valid False, and interfaces.py does `ret.canValid = all(cp.can_valid ...)` -- i.e. a Ford
+  # with no SYNC nav, an asleep APIM, or a GPS fault would render the CAR UNUSABLE for a telemetry
+  # field. nan makes that impossible: the messages are decoded when present and simply absent
+  # otherwise.
+  GPS_MSGS = ("APIMGPS_Data_Nav_1_FD1", "APIMGPS_Data_Nav_3_FD1")
 
   @staticmethod
   def get_can_parsers(CP):
+    dbc_name = DBC[CP.carFingerprint][Bus.pt]
+    # Not every Ford DBC carries the APIMGPS messages, and CANParser RAISES on an unknown message
+    # name (parser.py: "could not find message ..."), which would be a hard failure at car start.
+    # Probe the DBC first and only register what it actually has.
+    cam_msgs = []
+    try:
+      from opendbc.can.parser import DBC as _DBC
+      known = _DBC(dbc_name).name_to_msg
+      cam_msgs = [(m, float("nan")) for m in CarState.GPS_MSGS if m in known]
+    except Exception:
+      cam_msgs = []
     return {
-      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus(CP).main),
-      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus(CP).camera),
+      Bus.pt: CANParser(dbc_name, [], CanBus(CP).main),
+      Bus.cam: CANParser(dbc_name, cam_msgs, CanBus(CP).camera),
     }
+
+
+def _dm_to_deg(deg: float, minutes: float, min_dec: float) -> float:
+  """Degrees + UNSIGNED minutes -> signed decimal degrees, SIGN FIRST (see _publish_car_gps)."""
+  sign = -1.0 if deg < 0 else 1.0
+  return sign * (abs(deg) + (float(minutes) + float(min_dec)) / 60.0)
