@@ -141,6 +141,29 @@ _STALL_MAX_BLIPS = 3         # give up on a stuck episode; devLim telemetry keep
 # the PSCM while the car is straight and the command is small -- a 300 ms lateral gap right at
 # hand-off, imperceptible, instead of a missed curve. The reactive detector above stays as backstop.
 _PRESS_BLIP_MIN_S = 0.5      # press must last this long before its release earns a pulse
+# Anti-stall guard (BluePilot bp-dev 9012f76666). BOTH blips above hold lateral inactive for
+# _STALL_BLIP_FRAMES (300 ms at 20 Hz) -- a deliberate steering release. That is imperceptible on a
+# straight, where the command is near zero and the car keeps its heading; mid-curve it is 300 ms of
+# no lateral command while the road is actively turning, i.e. the car drifts wide exactly when the
+# blip was meant to help. Gate both fire sites on path_angle (rad, the value actually put on the
+# wire) so a pulse can only ever fire while the command is essentially straight. 0.10 rad = 5.7 deg
+# of commanded path angle; with path_angle = kappa * v_ego * gain that is a very gentle bend at any
+# speed the blips can fire at (v_ego > 9 m/s for the reactive detector). Upstream value kept as-is:
+# path_angle is computed identically in this port, so the threshold carries over unchanged.
+#
+# KNOWN LIMITATION, inherited from upstream and deliberately NOT deviated from (fidelity — see the
+# module docstring on why this port keeps his mechanisms): the guard reads path_angle_last, which is
+# the RATE-LIMITED command, and every path that zeroes it (latActive going false, a human-turn
+# latch, a preceding blip) restarts it at zero. At >= ~24 m/s the soft ROC is 0.009 rad/frame, so
+# path_angle needs ~12 frames to climb back past 0.10 while _STALL_HOLD_S needs only 10 — leaving a
+# ~2-frame window right after any of those events in which a blip can still fire in a real curve.
+# This is not a regression (before this guard existed those cases fired unconditionally), and the
+# harm is bounded — inside that window the command on the wire is <= 0.099 rad anyway, so what is
+# actually lost is the ramp, not a large angle. The available fix is to gate on _path_angle_pre_roc
+# (the un-rate-limited command, computed below), which is already at full magnitude on frame 1; it
+# is a deviation from his design and would need its own on-road validation, so it is recorded here
+# as an open option rather than taken unilaterally.
+_BLIP_MAX_PATH_ANGLE = 0.10  # rad
 
 # angle2pnw-faithful2: how often (in units of this strategy's own 20Hz update() calls) to re-poll
 # the JSON tuning overlay, mirroring his own params-read cadence (he re-reads Params every
@@ -437,7 +460,8 @@ class LateralAngleExt:
       self.press_timer_s += _STEER_DT
     else:
       if (self.press_timer_s >= _PRESS_BLIP_MIN_S and self.stall_blip_cooldown_s <= 0.0
-          and self.stall_blip_frames_left <= 0):
+          and self.stall_blip_frames_left <= 0
+          and abs(self.path_angle_last) < _BLIP_MAX_PATH_ANGLE):
         self.stall_blip_frames_left = _STALL_BLIP_FRAMES
       self.press_timer_s = 0.0
 
@@ -671,7 +695,8 @@ class LateralAngleExt:
     if _stalled:
       if self.bp_curvature_deviation_limited and self.stall_blip_cooldown_s <= 0.0:
         self.stall_blip_hold_s += _STEER_DT
-      if self.stall_blip_hold_s >= _STALL_HOLD_S and self.stall_blip_count < _STALL_MAX_BLIPS:
+      if (self.stall_blip_hold_s >= _STALL_HOLD_S and self.stall_blip_count < _STALL_MAX_BLIPS
+          and abs(self.path_angle_last) < _BLIP_MAX_PATH_ANGLE):
         self.stall_blip_frames_left = _STALL_BLIP_FRAMES
         self.stall_blip_hold_s = 0.0
         self.stall_blip_count += 1
