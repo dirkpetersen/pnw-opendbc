@@ -144,6 +144,14 @@ class CarState(CarStateBase):
     self._cargps_decim += 1
     if self._cargps_decim % 100:          # ~1 Hz against a 100 Hz update()
       return
+    # Fable 2026-09-05: `cp_cam.vl` is a VLDict whose __getitem__ LAZILY registers an unknown
+    # message with freq=None -- i.e. ALIVE-CHECKED. If the DBC probe in get_can_parsers ever failed
+    # while the DBC did have the message, this indexing would register it checked, can_valid would
+    # go False, and interfaces.py would set ret.canValid=False -> THE CAR BECOMES UNDRIVEABLE. The
+    # defensive branch failed OPEN into exactly the outcome the nan-frequency registration exists to
+    # prevent. `in` uses dict.__contains__, which does NOT lazily add, so this fails closed.
+    if "APIMGPS_Data_Nav_1_FD1" not in cp_cam.vl or "APIMGPS_Data_Nav_3_FD1" not in cp_cam.vl:
+      return
     try:
       nav1 = cp_cam.vl["APIMGPS_Data_Nav_1_FD1"]
       nav3 = cp_cam.vl["APIMGPS_Data_Nav_3_FD1"]
