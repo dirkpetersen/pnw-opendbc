@@ -68,8 +68,13 @@ class PnwVehicle:
     # 4-signal curvature_rate panda safety); requires only the angle-mode value-range + ROC
     # additions carried into this port's opendbc/safety/modes/ford.h.
     #
-    # angle_lat is the master gate, driver-flippable via the FordAngleLateral settings toggle
-    # (default OFF — common/params_keys.h registers it PERSISTENT/BOOL/"0"). Gated directly on
+    # angle_lat is the master gate, driver-flippable from the settings UI. NOTE (2026-09-05): the
+    # driver-facing toggle is now NoFordAngleSteering (toggles-invert2pnw opt-out idiom); this key
+    # is only its LIVE MIRROR, which pnw-pilot's manager_init re-syncs every boot and seeds True on
+    # a fresh install. Angle steering therefore ships ON by DEFAULT on both 3devpnw and 3testpnw --
+    # the owner confirmed on-road (2026-09-05) that it steers better than the curvature path and is
+    # the safer default; a friend who dislikes it flips NoFordAngleSteering. The old "default OFF"
+    # comment here described the pre-invert state and was wrong for every build since. Gated on
     # carFingerprint here (not on four_signal_lat, a DIFFERENT and unrelated capability for the
     # old 4-signal curvature-rate path) because angle mode's panda safety is a self-contained
     # addition that does not depend on four_signal_lat's curvature_rate machinery being flashed.
