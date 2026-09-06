@@ -568,7 +568,27 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // if cancel button is pressed when cruise isn't engaged.
     bool violation = false;
     violation |= ((msg->data[1] >> 0) & 1U) && !cruise_engaged_prev;   // Signal: CcAslButtnCnclPress (cancel)
-    violation |= ((msg->data[3] >> 1) & 1U) && !controls_allowed;     // Signal: CcAsllButtnResPress (resume)
+    // madsresume2pnw: the resume gate now accepts EITHER authority.
+    //
+    // This DELIBERATELY REVERSES the pin that used to live at test_ford.py:301 ("the resume-button
+    // gate reads controls_allowed only -- it is a LONGITUDINAL authority, and MADS must not touch
+    // it"). That principle is real: keeping lateral and longitudinal authority separate is what
+    // makes the brake -> "Steering only" state safe, because the driver owns the speed there. Widen
+    // it and openpilot can hand itself the speed back, which is self-engagement.
+    //
+    // The owner made that call explicitly (2026-09-06), with the objection on the table, on this
+    // reasoning: openpilot only ever resumes to the speed THE DRIVER set, never higher, and the
+    // brake stays under the driver's foot at all times -- so the driver can always take it back.
+    // Production ACC auto-resumes after a brief brake for the same reason.
+    //
+    // What the panda permits is narrow: pressing resume is allowed only while openpilot ALREADY
+    // holds lateral authority the panda itself granted (controls_allowed_lateral, i.e. the
+    // brake-induced lateral-only state, which can only exist on the opted-in Lightning -- MADS is
+    // refused outside SAFETY_FORD by safety.h). WHEN to press is bounded entirely in openpilot
+    // (brake released, one press per brake event, time-limited, lead/TTC gated, never above the
+    // driver's own previous set). With MADS off, controls_allowed_lateral is permanently false and
+    // this reads exactly as it did before.
+    violation |= ((msg->data[3] >> 1) & 1U) && !controls_allowed && !controls_allowed_lateral;  // CcAsllButtnResPress (resume)
 
     if (violation) {
       tx = false;

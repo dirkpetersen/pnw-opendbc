@@ -298,14 +298,44 @@ class TestFordSafetyBase(common.CarSafetyTest, MadsLateralOnBrakeTestBase):
       self._mads_brake(True)
       self.assertFalse(self.safety.get_controls_allowed_lateral())
 
-  def test_mads_leaves_resume_button_gate_alone(self):
-    """The Steering_Data_FD1 resume-button gate reads controls_allowed only -- it is a
-    LONGITUDINAL authority, and MADS must not touch it."""
+  def test_mads_resume_button_gate_accepts_lateral_authority(self):
+    """madsresume2pnw: the resume gate accepts EITHER authority.
+
+    THIS REVERSES A DELIBERATE PIN. The test that stood here asserted the opposite -- "the
+    resume-button gate reads controls_allowed only; it is a LONGITUDINAL authority and MADS must not
+    touch it" -- and that reasoning is sound: separating lateral from longitudinal authority is what
+    makes the brake -> "Steering only" state safe, because the driver owns the speed there. Widening
+    it lets openpilot hand itself the speed back, i.e. self-engage.
+
+    The owner made that call explicitly on 2026-09-06 with the objection stated, on the grounds that
+    openpilot may only resume to the speed THE DRIVER already set, never higher, and the brake is
+    always under their foot. The panda only permits the press; WHEN to press is bounded in openpilot.
+    """
     self._mads_apply(True)
     self._mads_engage()
     self._mads_brake(True)
     self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self.safety.get_controls_allowed(), "brake must still clear longitudinal")
+    self.assertTrue(self._tx(self._acc_button_msg(Buttons.RESUME, 0)),
+                    "resume must be permitted while lateral authority is held")
+
+  def test_resume_button_still_blocked_with_no_authority_at_all(self):
+    """The gate must still REFUSE when openpilot holds neither authority -- that is the
+    self-engagement case the upstream check exists for, and it is untouched."""
+    self._mads_apply(False)
+    self.safety.set_controls_allowed(False)
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self._tx(self._acc_button_msg(Buttons.RESUME, 0)),
+                     "no authority -> resume must stay blocked")
+
+  def test_resume_gate_unchanged_with_mads_off(self):
+    """With MADS off, controls_allowed_lateral is permanently false, so this reads byte-for-byte as
+    it did before madsresume2pnw on every car including the Tesla."""
+    self._mads_apply(False)
+    self.safety.set_controls_allowed(False)
     self.assertFalse(self._tx(self._acc_button_msg(Buttons.RESUME, 0)))
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._acc_button_msg(Buttons.RESUME, 0)))
 
   # mads2pnw (Fable review 2026-09-05): ford.h's reset_bypass_latch_counter and
   # ford_bp_angle_mode_engaged are C statics that no init resets, and libsafety is a process-wide
