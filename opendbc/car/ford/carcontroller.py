@@ -269,6 +269,60 @@ class CarController(CarControllerBase):
       except Exception:
         self._icbm_enabled = False
 
+    # madsresume2pnw: the RESUME tap. Deliberately its OWN flag, its OWN mem-param, its OWN parser
+    # and its OWN one-shot press latch -- it shares nothing with the SET+/- path above except the
+    # 0x083 frame, because its cruise precondition is the exact OPPOSITE (cruise OFF, not ON).
+    # Also gated on the MADS capability: without the flashed MADS panda there is no brake-induced
+    # lateral-only state for it to complete, and the brain would never publish anyway.
+    self._resume_cmd = None
+    self._resume_press = None
+    self._resume_get_fail = 0
+    self._resume_enabled = veh.mads_resume and self._icbm_params is not None
+    if veh.mads_resume and self._icbm_params is None:
+      # Fable S1: this car HAS the capability but the mem-param store never came up, so the executor
+      # is dead while the brain keeps publishing offers. Silence here looks exactly like "the gates
+      # refused" in the drive log. Say it once, loudly.
+      carlog.error("madsresume2pnw: capability present but /dev/shm params unavailable -- auto-resume executor is INERT")
+    if self._resume_enabled:
+      try:
+        from opendbc.car.ford.icbm_pnw import ResumePress
+        self._resume_press = ResumePress()
+      except Exception:
+        carlog.exception("madsresume2pnw: ResumePress import/construction FAILED -- auto-resume executor is INERT")
+        self._resume_enabled = False
+
+  def _resume_button(self, CS) -> bool:
+    """madsresume2pnw: poll MadsResumeTarget at 4 Hz, gate it against the real car state at 100 Hz,
+    and assert RESUME for exactly one press per offer. Returns True on the frames the button should
+    be asserted. NEVER raises into the control path.
+
+    The gate list lives in icbm_pnw.decide_resume() (pure, unit-tested). The one that matters most
+    here: `cruise_enabled` must be FALSE -- RES while ACC is engaged is a SET+ on Ford, and raising
+    the driver's set speed is the single thing this feature must never do."""
+    import time
+    from opendbc.car.ford.icbm_pnw import decide_resume, parse_resume_cmd
+    # 4 Hz while idle (nothing to act on), but EVERY FRAME once a command is in hand.
+    # Gemini review 2026-09-06: at a flat 4 Hz this held a CACHED command for up to 250 ms after the
+    # brain cleared the mem-param, and since the cached `ts` was still inside RESUME_STALE_LIMIT_S
+    # it would have gone on pressing RESUME a quarter of a second after the brain aborted for a lead
+    # cutting in. The brain's fast-abort is only real if the withdrawal is read at the control rate.
+    if self._resume_cmd is not None or (self.frame % 25) == 0:
+      try:
+        self._resume_cmd = parse_resume_cmd(self._icbm_params.get("MadsResumeTarget"))
+        self._resume_get_fail = 0
+      except Exception:
+        # Fable S1: fail closed, but not silently. Throttled -- this can run at 100 Hz.
+        self._resume_cmd = None
+        self._resume_get_fail += 1
+        if self._resume_get_fail == 1 or self._resume_get_fail % 1000 == 0:
+          carlog.exception(f"madsresume2pnw: MadsResumeTarget read FAILING ({self._resume_get_fail} consecutive) -- auto-resume executor is blind")
+    # MONOTONIC, matching the clock the brain stamps `ts` with -- see RESUME_STALE_LIMIT_S.
+    ok = decide_resume(self._resume_cmd, time.monotonic(),
+                       bool(CS.out.cruiseState.enabled), bool(CS.out.cruiseState.available),
+                       bool(CS.out.gasPressed or CS.out.brakePressed),
+                       float(CS.out.cruiseState.speed))
+    return self._resume_press.update(self.frame, self._resume_cmd, ok)
+
   def _parse_button_cmd(self, raw):
     """speedadjust-exec2pnw: shared parser for both IcbmTarget and SpeedAdjustTarget — both mem-params
     use the identical {target, ceiling, ts, dir?} JSON shape. Returns an IcbmCommand or None; NEVER
@@ -354,10 +408,30 @@ class CarController(CarControllerBase):
     fcw_alert = hud_control.visualAlert == VisualAlert.fcw
 
     ### acc buttons ###
+    # madsresume2pnw: evaluated EVERY frame (not inside the elif chain below) so its one-shot press
+    # latch sees a continuous frame count and can abort mid-press the instant a gate stops holding.
+    # Mutually exclusive with the SET+/- taps by construction -- decide_press requires cruise ON,
+    # decide_resume requires cruise OFF -- but the branch below is ordered ahead of them anyway.
+    resume_btn = False
+    if self._resume_enabled:
+      try:
+        resume_btn = self._resume_button(CS)
+      except Exception:
+        carlog.exception("madsresume2pnw: _resume_button failed -- no auto-resume this frame")
+        resume_btn = False
+
     if CC.cruiseControl.cancel:
       can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.camera, CS.buttons_stock_values, cancel=True))
       can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.main, CS.buttons_stock_values, cancel=True))
     elif CC.cruiseControl.resume and (self.frame % CarControllerParams.BUTTONS_STEP) == 0:
+      can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.camera, CS.buttons_stock_values, resume=True))
+      can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.main, CS.buttons_stock_values, resume=True))
+    # madsresume2pnw: openpilot taps RESUME once, on the driver's behalf, to give back the speed
+    # THEY had already set -- only out of the brake-induced MADS lateral-only state, only inside the
+    # bounded window after the brake is fully released, only once per brake event, and never with a
+    # close lead. Same 0x083 frame + `resume=True` bit as the CC.cruiseControl.resume branch above
+    # (the panda's ford.h resume gate now accepts lateral authority for exactly this).
+    elif resume_btn and (self.frame % CarControllerParams.BUTTONS_STEP) == 0:
       can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.camera, CS.buttons_stock_values, resume=True))
       can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.main, CS.buttons_stock_values, resume=True))
     # if stock lane centering isn't off, send a button press to toggle it off

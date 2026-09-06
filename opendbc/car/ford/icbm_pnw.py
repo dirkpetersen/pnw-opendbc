@@ -76,7 +76,14 @@ def decide_press(stock_set_ms: float, cmd: IcbmCommand | None, now: float,
   target = min(cmd.target_ms, cmd.ceiling_ms)
   if target <= 0:
     return None
-  if getattr(cmd, "dir", "dec") == "inc":
+  direction = getattr(cmd, "dir", "dec")
+  if direction not in ("dec", "inc"):
+    # madsresume2pnw: this function handles the SET-/SET+ set-speed directions ONLY. Any other
+    # direction (today "res", the auto-resume tap) has its own path -- decide_resume() below -- and
+    # must NEVER be silently reinterpreted here. Without this the old code fell through to the DEC
+    # branch and would have pressed SET- for a resume command.
+    return None
+  if direction == "inc":
     # icbmrestore2pnw RESTORE path: press UP toward the (ceiling-clamped) restore target only.
     # NEVER a dec from an inc command — the two directions can't oscillate within one command, and
     # a cap (dec) command always replaces an inc one at the brain (dec wins).
@@ -282,3 +289,173 @@ class PressGovernor:
     self._active = intent
     self._press_until = frame + PRESS_FRAMES
     return intent
+
+
+# ------------------------------------------------------------------------------------------------
+# madsresume2pnw — the RESUME tap. A separate command, a separate parser, a separate decision, a
+# separate one-shot press latch. Deliberately shares NOTHING with the dec/inc set-speed path above
+# except the CAN frame (0x083) it ultimately rides on.
+#
+# Why it cannot go through decide_press(): a resume happens precisely when stock cruise is OFF, and
+# decide_press() returns None for `not cruise_enabled` (correctly -- a set-speed tap while cruise is
+# off is meaningless). The two have OPPOSITE cruise preconditions, so they are opposite functions.
+#
+# THE CRITICAL GATE: `cruise_enabled` must be FALSE. On Ford, RES while ACC is engaged is a
+# SET+ (+1 mph) -- pressing it there would raise the driver's set speed, which is the one thing
+# this whole feature is forbidden to do. The brain gates on this too; this is the independent
+# executor-side enforcement, read straight off the real CAN state.
+# ------------------------------------------------------------------------------------------------
+
+RESUME_DIR = "res"
+# A resume offer is only actionable for a moment. The brain re-publishes it (same `eid`, fresh
+# `ts`) every tick its gates still hold and withdraws it the instant one stops -- so a tight
+# freshness bound is what makes the press land within ~half a second of a tick where the lead/TTC/
+# set-speed gates were all verified, instead of up to STALE_LIMIT_S later against a stale world.
+#
+# The freshness bound is a BACKSTOP, not the withdrawal path: the caller re-reads the mem-param
+# every frame while it holds a command (carcontroller._resume_button), so a withdrawal lands within
+# one 10 ms frame. Gemini review 2026-09-06 caught the earlier version, which polled at a flat 4 Hz
+# and therefore kept pressing off a CACHED command for up to 250 ms after the brain had already
+# withdrawn the offer because a lead cut in -- defeating the brain's whole fast-abort design.
+RESUME_STALE_LIMIT_S = 0.5
+
+# `ts` on a resume offer is MONOTONIC (time.monotonic(), which is CLOCK_MONOTONIC and therefore
+# shared across processes on this host), NOT wall clock. The dec/inc set-speed path uses wall clock
+# for historical reasons and is left alone, but a resume must not: this device has a dead RTC and
+# takes a large clock STEP when it first syncs, and a backward step would make an offer published
+# minutes ago look fresh (or would instantly kill a live one). Gemini review 2026-09-06.
+# See also the negative-dt guard in decide_resume().
+RESUME_PRESS_FRAMES = PRESS_FRAMES        # one discrete tap, same shape as a SET tap
+# How far in the FUTURE a heartbeat may sit before it is judged a clock disagreement rather than
+# publish-time rounding. See the dt check in decide_resume().
+RESUME_FUTURE_TOL_S = 0.02
+
+
+@dataclass
+class ResumeCommand:
+  """madsresume2pnw brain -> executor. A DIFFERENT type from IcbmCommand on purpose: nothing that
+  handles set-speed targets can be handed one of these by accident, and vice versa."""
+  ts: float                       # MONOTONIC heartbeat, re-published while the offer stands
+  eid: float                      # episode id -- CONSTANT for one offer; the one-shot press key
+  # the driver's captured pre-brake set speed (m/s), for the executor's own independent
+  # "never above the driver's set" check
+  set_ms: float
+
+
+def parse_resume_cmd(raw) -> "ResumeCommand | None":
+  """Fail-closed parser for the MadsResumeTarget mem-param. NEVER raises. Anything malformed,
+  non-finite, wrongly-directed or missing a field yields None -> no press.
+
+  Shape: {"dir": "res", "ts": <float>, "eid": <float>, "set": <float m/s>}. The "dir" field is
+  REQUIRED to be exactly "res" -- an IcbmTarget/SpeedAdjustTarget payload accidentally routed here
+  is rejected, exactly as a "res" payload is rejected by _parse_button_cmd's dec/inc whitelist."""
+  import json
+  import math as _math
+  try:
+    if isinstance(raw, (bytes, str)) and raw:
+      raw = json.loads(raw)
+    if not isinstance(raw, dict):
+      return None
+    if str(raw.get("dir", "")) != RESUME_DIR:
+      return None
+    if not all(k in raw for k in ("ts", "eid", "set")):
+      return None
+    ts, eid, set_ms = float(raw["ts"]), float(raw["eid"]), float(raw["set"])
+    if not (_math.isfinite(ts) and _math.isfinite(eid) and _math.isfinite(set_ms)):
+      return None
+    if set_ms <= 0.0:
+      return None                 # no captured set speed -> the brain must not have offered at all
+    return ResumeCommand(ts=ts, eid=eid, set_ms=set_ms)
+  except Exception:
+    return None
+
+
+def decide_resume(cmd: "ResumeCommand | None", now: float, cruise_enabled: bool,
+                  cruise_available: bool, driver_override: bool, stock_set_ms: float) -> bool:
+  """PURE. May the RESUME button be asserted this instant? Every gate here is independent of the
+  brain and is read off the real car state at the carcontroller layer. `now` must be MONOTONIC,
+  matching the clock the brain stamped `cmd.ts` with.
+
+    cmd absent / wrong shape        -> no (fail-closed)
+    heartbeat older than 0.5 s      -> no (the brain has withdrawn the offer, or died)
+    heartbeat in the FUTURE         -> no (clocks disagree: unreadable input, not "extra fresh")
+    cruise_enabled                  -> NO. RES while engaged is a SET+ on Ford: it would RAISE the
+                                       driver's set speed. This is the hard one.
+    not cruise_available            -> no (ACC main off: nothing to resume; the press is meaningless)
+    driver_override (gas or brake)  -> no (the driver owns the pedals; they always win)
+    truck reports a set speed ABOVE
+      the driver's captured one     -> no (would resume above what the driver set)
+  """
+  if cmd is None or cruise_enabled or not cruise_available or driver_override:
+    return False
+  try:
+    dt = now - cmd.ts
+    if dt > RESUME_STALE_LIMIT_S:
+      return False
+    # A NEGATIVE age means the two clocks disagree (a step, a restart, a replayed payload). That is
+    # not "extra fresh" -- it is an unreadable input, and an unreadable input is a refusal.
+    #
+    # The tolerance is not zero (Fable C1): the brain publishes `round(now, 3)`, which can land up
+    # to 0.5 ms in the FUTURE, and a same-instant read would then see dt < 0 for one frame. That one
+    # frame is enough for ResumePress to treat it as a mid-press abort and BURN the eid -- the
+    # resume is lost for the whole brake event, logged only as `noCruise`. 20 ms is far below any
+    # real clock disagreement and far above publish rounding.
+    if dt < -RESUME_FUTURE_TOL_S:
+      return False
+  except TypeError:
+    return False
+  try:
+    live = float(stock_set_ms)
+  except (TypeError, ValueError):
+    return False
+  # A live reading ABOVE the brain's captured set speed means something moved the dial after the
+  # capture -- refuse. (A lower or absent/zero reading is fine: resume can only go to the PCM's own
+  # remembered set, which is at or below what the driver set.)
+  #
+  # A NON-FINITE reading is a REFUSAL, not a pass. It means gate 6's live half cannot be evaluated
+  # at all, and a gate whose input is missing must fail closed -- an earlier draft of this function
+  # short-circuited on `isfinite(live) and ...`, which quietly PERMITTED on a NaN/inf. Caught by
+  # test_nonfinite_live_set_speed_refuses.
+  import math as _math
+  if not _math.isfinite(live):
+    return False
+  if live > 0.0 and live > cmd.set_ms + DEADBAND_MS:
+    return False
+  return True
+
+
+class ResumePress:
+  """One press per unique `eid`, ever. The brain latches once-per-brake-event on its side; this is
+  the independent executor-side latch, so a repeated/duplicated/replayed offer cannot produce a
+  second tap even if the brain misbehaves.
+
+  Mid-press abort discipline matches PressGovernor: if `ok` stops holding (cruise came back, driver
+  touched a pedal, the offer went stale) the press is dropped IMMEDIATELY rather than completing."""
+
+  def __init__(self):
+    self._used_eid = None         # eid already consumed -- never pressed again
+    self._active_eid = None
+    self._press_until = -1
+
+  @property
+  def used_eid(self):
+    return self._used_eid
+
+  def update(self, frame: int, cmd: "ResumeCommand | None", ok: bool) -> bool:
+    """Returns True if the RESUME button should be asserted on this frame."""
+    if self._active_eid is not None:
+      if not ok or cmd is None or cmd.eid != self._active_eid or frame >= self._press_until:
+        self._active_eid = None
+        return False
+      return True
+    if not ok or cmd is None:
+      return False
+    # `<=`, not `==` (Fable C2): eid is a monotonic stamp, so an eid at or BEFORE the one already
+    # spent is either the same offer again or an older/replayed one. Both must be refused, and this
+    # is free.
+    if self._used_eid is not None and cmd.eid <= self._used_eid:
+      return False
+    self._used_eid = cmd.eid
+    self._active_eid = cmd.eid
+    self._press_until = frame + RESUME_PRESS_FRAMES
+    return True

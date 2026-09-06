@@ -38,6 +38,17 @@ class PnwVehicle:
     # wants to name the feature rather than the umbrella mechanism.
     self.speedadjust_buttons: bool = self.button_management
 
+    # madsresume2pnw: openpilot may tap the stock ACC's RESUME button once, on the driver's behalf,
+    # after a MADS brake press left it steering-only. Requires BOTH the stock-ACC button hardware
+    # path (button_management -- same 0x083 SCCM frame the SET+/- taps ride on, already
+    # TX-allowlisted) AND the MADS lateral authority itself, since the whole feature only exists in
+    # the brake-induced lateral-only state MADS creates. Mirrors the openpilot-side
+    # selfdrive/controls/lib/pnw_vehicle.py `mads_resume`; the fingerprint check lives HERE ONLY.
+    # The brain (selfdrive/controls/lib/madsresume_pnw.py) additionally refuses to publish at all
+    # unless madsState.available is true, i.e. unless the flashed panda actually carries MADS.
+    self.mads_lateral: bool = fp == "FORD_F_150_LIGHTNING_MK1"
+    self.mads_resume: bool = self.button_management and self.mads_lateral
+
     # predicted-curvature blend (fordlat2pnw): Ford curvature-only lateral cars where the
     # BluePilot-derived turn-exit blend is validated
     self.pc_blend: bool = fp == "FORD_F_150_LIGHTNING_MK1"
