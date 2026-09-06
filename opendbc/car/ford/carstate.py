@@ -125,10 +125,10 @@ class CarState(CarStateBase):
       *create_button_events(self.lc_button, prev_lc_button, {1: ButtonType.lkas}),
     ]
 
-    self._publish_car_gps(cp_cam)
+    self._publish_car_gps(cp)
     return ret
 
-  def _publish_car_gps(self, cp_cam) -> None:
+  def _publish_car_gps(self, cp) -> None:
     """cargps2pnw: publish the truck's own GPS fix to /dev/shm CarGps for the ces_events log.
 
     TELEMETRY ONLY -- nothing reads this for control, and every failure path is a silent no-op that
@@ -138,6 +138,13 @@ class CarState(CarStateBase):
     hemisphere it arrives ALREADY NEGATIVE (e.g. -122.0) while GPS_Longitude_Minutes/_Min_dec are
     UNSIGNED magnitudes. Adding them naively yields -121.635 for a true -122.365 -- about 57 km east,
     and plausible enough to believe. Combine sign-first (see _dm_to_deg).
+
+    BUS GOTCHA, cost a whole drive of frozen telemetry (2026-09-05): APIMGPS originates on the
+    POWERTRAIN bus (0), not the camera bus (2). The panda RELAYS it onto bus 2, but a relayed frame
+    is reported with the TX flag set (src = 2 + 128 = 130), and CANParser.update() skips anything
+    where `src != self.bus` -- so a bus-2 parser NEVER sees it. Registered on cp (Bus.pt) for that
+    reason. Symptom if this regresses: `age` climbs without bound while lat/lon hold their last
+    value. (ACCDATA_3 is the mirror image: it originates on bus 2 and is relayed to bus 0 as 128.)
     """
     if self._cargps_params is None:
       return
@@ -150,11 +157,12 @@ class CarState(CarStateBase):
     # go False, and interfaces.py would set ret.canValid=False -> THE CAR BECOMES UNDRIVEABLE. The
     # defensive branch failed OPEN into exactly the outcome the nan-frequency registration exists to
     # prevent. `in` uses dict.__contains__, which does NOT lazily add, so this fails closed.
-    if "APIMGPS_Data_Nav_1_FD1" not in cp_cam.vl or "APIMGPS_Data_Nav_3_FD1" not in cp_cam.vl:
+    if "APIMGPS_Data_Nav_1_FD1" not in cp.vl or "APIMGPS_Data_Nav_3_FD1" not in cp.vl:
       return
     try:
-      nav1 = cp_cam.vl["APIMGPS_Data_Nav_1_FD1"]
-      nav3 = cp_cam.vl["APIMGPS_Data_Nav_3_FD1"]
+      nav1 = cp.vl["APIMGPS_Data_Nav_1_FD1"]
+      nav3 = cp.vl["APIMGPS_Data_Nav_3_FD1"]
+      nav1_ns = int(cp.ts_nanos["APIMGPS_Data_Nav_1_FD1"]["GPS_Latitude_Degrees"])
       lat_deg = float(nav1["GPS_Latitude_Degrees"])
       lon_deg = float(nav1["GPS_Longitude_Degrees"])
       if lat_deg == 0.0 and lon_deg == 0.0:
@@ -167,11 +175,16 @@ class CarState(CarStateBase):
         "sats": int(nav3["GPS_Sat_num_in_view"]),
         "hdop": round(float(nav3["GPS_Hdop"]), 1),
         "ts": round(time.time(), 2),
+        # Rule 2: `ts` is when we PUBLISHED, which advances even when the decode is frozen -- that is
+        # exactly what hid the wrong-bus bug above for a whole drive. `age` is seconds since the CAN
+        # frame was actually received (ts_nanos is stamped from the frame's logMonoTime), so a stale
+        # fix is visible in the log instead of masquerading as live.
+        "age": round(max(0.0, (time.monotonic_ns() - nav1_ns) / 1e9), 2) if nav1_ns else None,
       })
     except Exception:
       pass                                # missing message / malformed frame -> skip this tick
 
-  # cargps2pnw: the truck's OWN GPS fix, broadcast by the GWM on the camera bus at 1 Hz.
+  # cargps2pnw: the truck's OWN GPS fix, broadcast by the GWM on the POWERTRAIN bus at 1 Hz.
   # Confirmed on-vehicle 2026-09-05 (F-150 Lightning, route 000000dc--c844257700 seg 8): decoded
   # position agreed with the comma's own GPS to 5.4 m, with 31 satellites and HDOP 0.4 -- a better
   # fix than the device gets behind a windshield. Telemetry only; nothing consumes it for control.
@@ -191,16 +204,16 @@ class CarState(CarStateBase):
     # Not every Ford DBC carries the APIMGPS messages, and CANParser RAISES on an unknown message
     # name (parser.py: "could not find message ..."), which would be a hard failure at car start.
     # Probe the DBC first and only register what it actually has.
-    cam_msgs = []
+    pt_msgs = []
     try:
       from opendbc.can.parser import DBC as _DBC
       known = _DBC(dbc_name).name_to_msg
-      cam_msgs = [(m, float("nan")) for m in CarState.GPS_MSGS if m in known]
+      pt_msgs = [(m, float("nan")) for m in CarState.GPS_MSGS if m in known]
     except Exception:
-      cam_msgs = []
+      pt_msgs = []
     return {
-      Bus.pt: CANParser(dbc_name, [], CanBus(CP).main),
-      Bus.cam: CANParser(dbc_name, cam_msgs, CanBus(CP).camera),
+      Bus.pt: CANParser(dbc_name, pt_msgs, CanBus(CP).main),
+      Bus.cam: CANParser(dbc_name, [], CanBus(CP).camera),
     }
 
 
