@@ -4,6 +4,7 @@ from opendbc.car import Bus, create_button_events, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.ford.fordcan import CanBus
 from opendbc.car.ford.values import DBC, CarControllerParams, FordFlags
+from opendbc.car.carlog import carlog
 from opendbc.car.interfaces import CarStateBase
 
 ButtonType = structs.CarState.ButtonEvent.Type
@@ -31,6 +32,7 @@ class CarState(CarStateBase):
     except Exception:
       self._cargps_params = None
     self._cargps_decim = 0
+    self._cargps_err = 0
 
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
@@ -162,7 +164,10 @@ class CarState(CarStateBase):
     try:
       nav1 = cp.vl["APIMGPS_Data_Nav_1_FD1"]
       nav3 = cp.vl["APIMGPS_Data_Nav_3_FD1"]
-      nav1_ns = int(cp.ts_nanos["APIMGPS_Data_Nav_1_FD1"]["GPS_Latitude_Degrees"])
+      # Oldest of the two messages: hdg/spd/sats/hdop come from Nav_3, so tracking only Nav_1 would
+      # let a frozen Nav_3 keep reading fresh (Fable + Gemini, 2026-09-05).
+      last_ns = min(int(cp.ts_nanos["APIMGPS_Data_Nav_1_FD1"]["GPS_Latitude_Degrees"]),
+                    int(cp.ts_nanos["APIMGPS_Data_Nav_3_FD1"]["GPS_Heading"]))
       lat_deg = float(nav1["GPS_Latitude_Degrees"])
       lon_deg = float(nav1["GPS_Longitude_Degrees"])
       if lat_deg == 0.0 and lon_deg == 0.0:
@@ -177,12 +182,23 @@ class CarState(CarStateBase):
         "ts": round(time.time(), 2),
         # Rule 2: `ts` is when we PUBLISHED, which advances even when the decode is frozen -- that is
         # exactly what hid the wrong-bus bug above for a whole drive. `age` is seconds since the CAN
-        # frame was actually received (ts_nanos is stamped from the frame's logMonoTime), so a stale
-        # fix is visible in the log instead of masquerading as live.
-        "age": round(max(0.0, (time.monotonic_ns() - nav1_ns) / 1e9), 2) if nav1_ns else None,
+        # frame was actually received, so a stale fix is visible in the log instead of masquerading
+        # as live. Differenced against the parser's OWN clock (_last_update_nanos, the logMonoTime of
+        # the batch we just consumed) rather than time.monotonic_ns(): ts_nanos is stamped from
+        # nanos_since_boot() (CLOCK_BOOTTIME) while monotonic_ns() is CLOCK_MONOTONIC, and it keeps
+        # the number meaningful under REPLAY. NOT clamped at zero -- a negative age means the clocks
+        # disagree, and clamping would turn that into a permanent "age 0.0", i.e. the exact
+        # reads-as-live failure this commit exists to fix (Fable, 2026-09-05).
+        "age": round((cp._last_update_nanos - last_ns) / 1e9, 2),
       })
     except Exception:
-      pass                                # missing message / malformed frame -> skip this tick
+      # Rule 2: silence here is what let the wrong-bus bug run a whole drive. The catch itself has to
+      # stay -- an exception escaping CarState.update() would take down `card` and the truck for a
+      # telemetry field -- but it must not be invisible. Rate-limited so a persistent failure costs
+      # one line a minute, not 100 a second.
+      self._cargps_err += 1
+      if self._cargps_err == 1 or self._cargps_err % 6000 == 0:
+        carlog.exception("cargps2pnw: publish failed (%d so far)", self._cargps_err)
 
   # cargps2pnw: the truck's OWN GPS fix, broadcast by the GWM on the POWERTRAIN bus at 1 Hz.
   # Confirmed on-vehicle 2026-09-05 (F-150 Lightning, route 000000dc--c844257700 seg 8): decoded

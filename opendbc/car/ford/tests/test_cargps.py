@@ -65,7 +65,6 @@ class TestGpsBusRegistration:
   def test_registered_with_nan_frequency_so_can_valid_cannot_fail(self):
     """On Bus.pt this is load-bearing: interfaces.py ANDs every parser's can_valid into
     ret.canValid, so an alive-checked GPS message would take the truck offroad outright."""
-    import math
     from opendbc.car.ford.carstate import CarState
     from opendbc.car import Bus
     pt = CarState.get_can_parsers(self._CP())[Bus.pt]
@@ -73,7 +72,6 @@ class TestGpsBusRegistration:
       st = pt.message_states[pt.dbc.name_to_msg[name].address]
       assert st.ignore_alive, f"{name} must be ignore_alive"
     assert pt.can_valid, "a parser that has received nothing at all must still be valid"
-    assert not math.isnan(0.0)  # guard: nan handling above is real, not a truthiness accident
 
   def test_relayed_frame_on_bus2_does_not_decode(self):
     """The actual bug, reproduced: same frame, src=0 decodes, src=130 (relay TX) does not."""
@@ -98,3 +96,31 @@ class TestGpsBusRegistration:
                       pt.vl["APIMGPS_Data_Nav_1_FD1"]["GPS_Latitude_Min_dec"]) == pytest.approx(47.672952, abs=1e-5)
     assert cam.vl["APIMGPS_Data_Nav_1_FD1"]["GPS_Latitude_Degrees"] == 0.0, \
       "a bus-2 parser must see nothing -- this is what froze the telemetry"
+
+  def test_gps_silence_cannot_take_the_truck_offroad(self):
+    """The failure that would matter: interfaces.py ANDs can_valid into ret.canValid, so if a silent
+    GPS message could invalidate the POWERTRAIN parser the truck would go undriveable for a
+    telemetry field. Drive a real 100 Hz message while APIMGPS never arrives, past the bus-timeout
+    horizon, and assert the parser stays valid -- with a control proving it can still go False."""
+    import time
+    from opendbc.can.parser import CANParser
+    from opendbc.can.packer import CANPacker
+    from opendbc.car.ford.carstate import CarState
+    from opendbc.car.ford.values import CAR, DBC
+    from opendbc.car import Bus
+    dbc = DBC[CAR.FORD_F_150_LIGHTNING_MK1][Bus.pt]
+    msgs = [("BrakeSnData_4", 50)] + [(m, float("nan")) for m in CarState.GPS_MSGS]
+    cp = CANParser(dbc, msgs, 0)
+    addr, real, _ = CANPacker(dbc).make_can_msg("BrakeSnData_4", 0, {})
+    t = time.monotonic_ns()
+    for i in range(600):                       # 6 s of real traffic, zero GPS frames
+      t += 10_000_000
+      cp.update([[t, [(addr, real, 0)]]])
+      assert cp.can_valid, f"GPS silence invalidated the powertrain parser at tick {i}"
+    # Control: the real message stops -> must go invalid. can_invalid_cnt only advances when the
+    # property is READ (parser.py:212), so it has to be evaluatedevery tick, exactly as card.py does.
+    for _i in range(600):
+      t += 10_000_000
+      cp.update([[t, []]])
+      last = cp.can_valid
+    assert not last, "control failed: parser must still enforce its REAL messages"
