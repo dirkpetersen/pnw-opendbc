@@ -98,6 +98,36 @@ class TeslaLegacyLateralBase(common.CarSafetyTest, common.AngleSteeringSafetyTes
     values = {"DI_cruiseState": 2 if enable else 0, "DI_speedUnits": 1}  # 1 = KPH
     return self.packer_chassis.make_can_msg_safety("DI_state", self.chassis_bus, values)
 
+  # mads2pnw: the Raven must be entirely unaffected. openpilot only ever sets the MADS
+  # alternative_experience bits for the F-150 Lightning (opendbc/car/pnw_vehicle.py ->
+  # selfdrive/car/card.py), so on this car the MADS state machine is never enabled and the
+  # lateral gates behave exactly as they did before mads2pnw. Also: on the Raven the EPS
+  # inhibits itself (EAC_INHIBITED) on a brake press, so MADS could not help here anyway.
+  def test_mads_never_enabled_on_tesla(self):
+    # Push the bits the way a buggy/compromised host would, then re-init: set_safety_hooks must
+    # REFUSE them outside SAFETY_FORD. This is the defense-in-depth check -- panda safety does not
+    # depend on openpilot's PnwVehicle gate being right.
+    self.safety.set_mads_params(True, False, False)
+    self.safety.set_safety_hooks(self.safety.get_current_safety_mode(), self.safety.get_current_safety_param())
+    self.assertFalse(self.safety.get_mads_system_enabled())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    for _ in range(5):
+      self._rx(self._pcm_status_msg(False))
+      self._rx(self._pcm_status_msg(True))
+      self._rx(self._user_brake_msg(True))
+      self._rx(self._user_brake_msg(False))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_mads_tesla_lateral_still_dies_on_brake(self):
+    self._rx(self._pcm_status_msg(False))
+    self._rx(self._pcm_status_msg(True))
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
+    self._rx(self._user_brake_msg(True))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
+
   def test_rx_hook(self):
     # Test angle command reception
     for i in range(5):

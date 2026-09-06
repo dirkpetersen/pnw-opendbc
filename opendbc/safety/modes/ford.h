@@ -33,9 +33,10 @@
 //     "pnw-hardening (2026-07-11)" comment below) in BOTH LMC and LMC2 — bp-7.0's own ford.h still
 //     carries the unconditional bypass our 19ad2728 fix closed; NOT reintroduced here.
 //   - bp-7.0's rx_hook MADS-only additions (mads_button_press, the Steering_Data_FD1 RxCheck, and
-//     the acc_main_on write that rode along with them in the same diff hunk) are NOT ported —
-//     mads_button_press doesn't exist in this tree, and acc_main_on is not read by any angle-mode
-//     check below (verified: no reference to it in this file), so it is out of scope for this port.
+//     the acc_main_on write that rode along with them in the same diff hunk) were NOT ported here —
+//     mads_button_press still isn't (no MADS button in this tree), but mads2pnw (2026-09-05) DID
+//     port the acc_main_on write: it is the one driver-reachable revoke for latched lateral
+//     authority. See the comment at that line in ford_rx_hook.
 
 // Safety-relevant CAN messages for Ford vehicles.
 #define FORD_EngBrakeData          0x165U   // RX from PCM, for driver brake pedal and cruise state
@@ -499,6 +500,15 @@ static void ford_rx_hook(const CANPacket_t *msg) {
       // Signal: CcStat_D_Actl
       unsigned int cruise_state = msg->data[1] & 0x07U;
       bool cruise_engaged = (cruise_state == 4U) || (cruise_state == 5U);
+      // mads2pnw (Fable review 2026-09-05): port bp-7.0's acc_main_on write, which the angle2pnw
+      // header comment above records as deliberately NOT ported. It is needed now: acc_main_on
+      // FALLING is the ONE driver-reachable way to revoke latched lateral authority mid-drive
+      // (turning ACC main off). State 3 is standby -- main on, not engaged -- so a brake press,
+      // which drops 4/5 -> 3, does NOT clear it, which is exactly the behaviour we want.
+      // acc_main_on is read by nothing else in this tree except the MADS state machine, so with
+      // MADS off this line is inert. Note the MADS ACC-main RISING edge is NOT an engage source
+      // here (see pnw/mads.h) -- this is revoke-only.
+      acc_main_on = (cruise_state == 3U) || cruise_engaged;
       pcm_cruise_check(cruise_engaged);
     }
   }
@@ -592,7 +602,12 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // Explicitly force false (not "leave stale") while disengaged so a flag left True from a prior
     // engaged session can never linger into a new disengage. See
     // test_angle_mode_wide_range_requires_controls_allowed.
-    if (controls_allowed) {
+    // mads2pnw: `controls_allowed || controls_allowed_lateral` -- lateral AUTHORITY, which is what
+    // this gate has always been about (the hardening's point is that a self-reported bit must not
+    // corroborate angle mode while openpilot has no authority to steer). Byte-identical whenever
+    // MADS is off: controls_allowed_lateral is then permanently false. See
+    // test_mads_angle_mode_corroboration_survives_brake / the MADS-off hardening tests below.
+    if (controls_allowed || controls_allowed_lateral) {
       ford_bp_angle_mode_engaged = (msg->data[4] & 0x1U) != 0U;
       ford_bp_shadow_curvature_raw = (int16_t)((msg->data[5] << 8) | msg->data[6]);
     } else {
@@ -627,7 +642,8 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // bit alone must never unlock the wide path_angle range or its looser ROC table (see the
     // ford_bp_angle_mode_engaged assignment above, which itself now only updates while
     // controls_allowed -- see test_angle_mode_wide_range_requires_controls_allowed).
-    bool angle_mode_active = ford_bp_angle_mode_engaged && controls_allowed;
+    // mads2pnw: lateral authority, not longitudinal engagement -- see the corroboration gate above.
+    bool angle_mode_active = ford_bp_angle_mode_engaged && (controls_allowed || controls_allowed_lateral);
 
     // Check curvature value limits (convert to signed values first)
     int desired_curvature = raw_curvature - FORD_INACTIVE_CURVATURE;
@@ -709,7 +725,9 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // steering guard, not a rate check -- it accumulates into `violation`, never latch-relaxable.
     bool curvature_violation = steer_angle_cmd_checks(desired_curvature, steer_control_enabled, FORD_STEERING_LIMITS);
     if (angle_mode_active && (desired_curvature == 0)) {
-      violation |= steer_control_enabled && !controls_allowed;
+      // mads2pnw: restores bp-7.0's `controls_allowed || controls_allowed_lateral` here (the
+      // substitution the angle2pnw header comment above records). Lateral gate only.
+      violation |= steer_control_enabled && !(controls_allowed || controls_allowed_lateral);
     } else {
       roc_violation |= curvature_violation;
     }
@@ -772,6 +790,13 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // deviation) is accumulated above and enforced unconditionally, in both modes, latch or no
     // latch. See test_angle_mode_value_range_survives_latch_amnesty and
     // test_reset_latch_roc_relaxation_still_works (the latch's intended relaxation, unchanged).
+    // mads2pnw: DELIBERATELY still plain `controls_allowed`, unlike the authority gates above.
+    // This latch grants AMNESTY FROM CHECKS (it zeroes roc_violation for 60 frames), it does not
+    // select which limits apply. Extending it to the MADS flag would re-open exactly the hole the
+    // pnw-hardening below closed -- openpilot streams neutral frames continuously while
+    // longitudinally disengaged, so with lateral latched they would keep the amnesty permanently
+    // armed. MADS therefore runs with the ROC checks fully enforced, every frame. Reviewed and
+    // chosen 2026-09-05 (Gemini finding 5 / Fable review).
     if (!controls_allowed) {
       reset_bypass_latch_counter = 0;                        // disengaged: latch inert, full checks
     } else if ((desired_curvature == 0) && (desired_path_angle == 0)) {
@@ -806,7 +831,8 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // `roc_violation` (rate-of-change checks) is the latch's only legitimate relaxation target.
     bool violation = false;
     bool roc_violation = false;
-    bool angle_mode_active = ford_bp_angle_mode_engaged && controls_allowed;
+    // mads2pnw: lateral authority, not longitudinal engagement -- see the corroboration gate above.
+    bool angle_mode_active = ford_bp_angle_mode_engaged && (controls_allowed || controls_allowed_lateral);
 
     // Check curvature value limits (convert to signed values first)
     int desired_curvature = raw_curvature - FORD_INACTIVE_CURVATURE;
@@ -868,7 +894,9 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // curvature_violation result accumulates into `roc_violation` (latch-relaxable, as always).
     bool curvature_violation = steer_angle_cmd_checks(desired_curvature, steer_control_enabled, FORD_CANFD_STEERING_LIMITS);
     if (angle_mode_active && (desired_curvature == 0)) {
-      violation |= steer_control_enabled && !controls_allowed;
+      // mads2pnw: restores bp-7.0's `controls_allowed || controls_allowed_lateral` here (the
+      // substitution the angle2pnw header comment above records). Lateral gate only.
+      violation |= steer_control_enabled && !(controls_allowed || controls_allowed_lateral);
     } else {
       roc_violation |= curvature_violation;
     }
@@ -910,6 +938,13 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // roc_violation (rate-of-change checks, its stated job); `violation` (value ranges +
     // shadow-curvature deviation) is enforced unconditionally regardless of latch state, in both
     // modes.
+    // mads2pnw: DELIBERATELY still plain `controls_allowed`, unlike the authority gates above.
+    // This latch grants AMNESTY FROM CHECKS (it zeroes roc_violation for 60 frames), it does not
+    // select which limits apply. Extending it to the MADS flag would re-open exactly the hole the
+    // pnw-hardening below closed -- openpilot streams neutral frames continuously while
+    // longitudinally disengaged, so with lateral latched they would keep the amnesty permanently
+    // armed. MADS therefore runs with the ROC checks fully enforced, every frame. Reviewed and
+    // chosen 2026-09-05 (Gemini finding 5 / Fable review).
     if (!controls_allowed) {
       reset_bypass_latch_counter = 0;                        // disengaged: latch inert, full checks
     } else if ((desired_curvature == 0) && (desired_path_angle == 0)) {

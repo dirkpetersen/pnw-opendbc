@@ -100,6 +100,10 @@ static bool is_msg_valid(RxCheck addr_list[], int index) {
     if (!addr_list[index].status.valid_checksum || !addr_list[index].status.valid_quality_flag || (addr_list[index].status.wrong_counters >= MAX_WRONG_COUNTERS)) {
       valid = false;
       controls_allowed = false;
+      // mads2pnw: a safety message failing its checksum/counter/quality checks drops LATERAL
+      // authority too. Upstream sunnypilot only clears controls_allowed here; clearing the
+      // parallel flag as well is strictly narrower. Test: test_mads_invalid_rx_msg_drops_lateral.
+      mads_exit_controls(MADS_DISENGAGE_REASON_LAG);
     }
   }
   return valid;
@@ -197,6 +201,13 @@ bool safety_rx_hook(const CANPacket_t *msg) {
 
   // Handles gas, brake, and regen paddle
   generic_rx_checks();
+
+  // mads2pnw: update the parallel lateral-authority state machine. Runs AFTER generic_rx_checks so
+  // it observes the post-brake value of controls_allowed. Once per received message -- deliberately
+  // NOT inside stock_ecu_check (which runs once per relay-checked tx_msg, i.e. a variable number of
+  // times per frame; that would make the edge detector below fire a variable number of times).
+  // No-op unless ALT_EXP_ENABLE_MADS was set: m_update_control_state gates on system_enabled.
+  mads_state_update(acc_main_on, controls_allowed, brake_pressed || regen_braking, steering_disengage);
 
   // the relay malfunction hook runs on all incoming rx messages.
   // check all applicable tx msgs for liveness on sending bus.
@@ -326,6 +337,7 @@ void safety_tick(const safety_config *cfg) {
       cfg->rx_checks[i].status.lagging = lagging;
       if (lagging) {
         controls_allowed = false;
+        mads_exit_controls(MADS_DISENGAGE_REASON_LAG);  // mads2pnw
       }
 
       if (lagging || !is_msg_valid(cfg->rx_checks, i)) {
@@ -450,6 +462,24 @@ int set_safety_hooks(uint16_t mode, uint16_t param) {
   reset_sample(&angle_meas);
 
   controls_allowed = false;
+  // mads2pnw: (re)apply the MADS policy bits from alternative_experience. mads_set_system_state
+  // calls m_mads_state_init(), so this ALWAYS clears controls_allowed_lateral on every
+  // safety-mode change -- including the drop to SAFETY_SILENT the panda performs when the
+  // heartbeat is lost. openpilot pushes alternative_experience (USB 0xdf) while still in a
+  // non-car mode and then sets the safety mode (0xdc), sequentially, so the value read here is
+  // the current one (selfdrive/pandad/panda_safety.cc). This call is MISSING in bluepilot, where
+  // MADS is consequently dead code in real firmware.
+  //
+  // DEFENSE IN DEPTH (Gemini + Fable review, 2026-09-05): the C state machine is generic, but the
+  // ONLY car this fork intends MADS for is the Ford. Refuse the bits outright in every other
+  // safety mode rather than trusting openpilot's Python capability gate as the sole guard --
+  // panda safety must not depend on the host being correct. In particular the Tesla Raven can
+  // then never latch lateral authority even if the bit reached the panda by mistake.
+  if (mode == SAFETY_FORD) {
+    mads_set_alternative_experience(&alternative_experience);
+  } else {
+    mads_set_system_state(false, false, false);
+  }
   relay_malfunction_reset();
   safety_rx_checks_invalid = false;
 

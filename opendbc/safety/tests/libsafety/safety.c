@@ -37,6 +37,38 @@ void set_controls_allowed(bool c){
   controls_allowed = c;
 }
 
+// mads2pnw test hooks
+bool get_controls_allowed_lateral(void){
+  return controls_allowed_lateral;
+}
+
+void set_controls_allowed_lateral(bool c){
+  controls_allowed_lateral = c;
+}
+
+int get_mads_disengage_reason(void){
+  return (int)m_mads_state.current_disengage.active_reason;
+}
+
+bool get_mads_system_enabled(void){
+  return m_mads_state.system_enabled;
+}
+
+// Mirrors exactly what openpilot pushes over USB 0xdf. The bits only take effect on the next
+// set_safety_hooks() call, same as in real firmware -- tests must call set_safety_hooks after this.
+void set_mads_params(bool enable_mads, bool disengage_lateral_on_brake, bool pause_lateral_on_brake){
+  alternative_experience = 0;
+  if (enable_mads) {
+    alternative_experience |= ALT_EXP_ENABLE_MADS;
+    if (disengage_lateral_on_brake) {
+      alternative_experience |= ALT_EXP_MADS_DISENGAGE_LATERAL_ON_BRAKE;
+    } else if (pause_lateral_on_brake) {
+      alternative_experience |= ALT_EXP_MADS_PAUSE_LATERAL_ON_BRAKE;
+    } else {
+    }
+  }
+}
+
 void set_alternative_experience(int mode){
   alternative_experience = mode;
 }
@@ -91,6 +123,19 @@ bool get_vehicle_moving(void){
 
 bool get_acc_main_on(void){
   return acc_main_on;
+}
+
+// mads2pnw TEST HARNESS ONLY (this file is not compiled into the panda firmware): force the MADS
+// state machine on regardless of safety mode, so lateral.h's TORQUE-steering gates can be covered.
+// Production can only reach this through set_safety_hooks, which refuses every mode but SAFETY_FORD.
+void mads_force_system_state(bool enabled){
+  mads_set_system_state(enabled, false, false);
+}
+
+// mads2pnw: drive the acc_main edge detector directly -- no car in this tree writes acc_main_on
+void set_acc_main_on(bool c){
+  acc_main_on = c;
+  mads_state_update(acc_main_on, controls_allowed, brake_pressed || regen_braking, steering_disengage);
 }
 
 float get_vehicle_speed_min(void){
@@ -194,6 +239,8 @@ bool get_honda_fwd_brake(void){
 void init_tests(void){
   safety_mode_cnt = 2U;  // avoid ignoring relay_malfunction logic
   alternative_experience = 0;
+  // mads2pnw: reset MADS state so it can't leak between tests
+  mads_set_system_state(false, false, false);
   set_timer(0);
   ts_steer_req_mismatch_last = 0;
   valid_steer_req_count = 0;

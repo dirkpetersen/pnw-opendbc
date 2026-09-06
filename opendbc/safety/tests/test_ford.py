@@ -4,6 +4,7 @@ import random
 import unittest
 
 import opendbc.safety.tests.common as common
+from opendbc.safety.tests.mads_common import MadsLateralOnBrakeTestBase, MadsSteeringModeOnBrake
 from opendbc.car.ford.carcontroller import MAX_LATERAL_ACCEL
 from opendbc.car.ford.values import FordSafetyFlags
 from opendbc.car.structs import CarParams
@@ -65,7 +66,7 @@ class Buttons:
 #  * CAN FD with stock longitudinal
 #  * CAN FD with openpilot longitudinal
 
-class TestFordSafetyBase(common.CarSafetyTest):
+class TestFordSafetyBase(common.CarSafetyTest, MadsLateralOnBrakeTestBase):
   STANDSTILL_THRESHOLD = 1
   RELAY_MALFUNCTION_ADDRS = {0: (MSG_ACCDATA_3, MSG_Lane_Assist_Data1, MSG_LateralMotionControl,
                                  MSG_LateralMotionControl2, MSG_IPMA_Data)}
@@ -170,6 +171,187 @@ class TestFordSafetyBase(common.CarSafetyTest):
     desired_angle_last / path_angle_last / path_offset_last / curvature_rate_last at 0."""
     for _ in range(self.RESET_BYPASS_LATCH_DURATION + 1):
       self._tx(self._lat_ctl_msg(False, 0, 0, 2e-5, 0))
+
+  # mads2pnw: Ford-specific MADS tests (the generic ones live in mads_common.py)
+  def test_mads_angle_mode_survives_brake(self):
+    """angle2pnw x mads2pnw: the WIDE angle-mode path_angle range is granted on lateral AUTHORITY,
+    not on longitudinal engagement. With MADS latched, a brake press must not silently demote the
+    truck back to the narrow curvature-mode range (which would reject openpilot's angle commands
+    and kill steering by a different route than the one MADS just fixed).
+
+    Structure mirrors test_angle_mode_wide_range_requires_controls_allowed: a blocked frame still
+    advances path_angle_last, so the first 0.35 send primes the ROC state and the SECOND is the
+    one under test."""
+    self._mads_apply(True)
+    self._drain_reset_latch()
+    self._reset_curvature_measurement(0, 5.)
+    self._mads_engage()
+    self._tx(self._lka_angle_msg(False))                        # ensure the static starts disarmed
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.35, 0, 0)))   # narrow range: blocked
+    self._tx(self._lka_angle_msg(True))                         # corroborate angle mode
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0.35, 0, 0)))    # wide range: allowed
+
+    self._mads_brake(True)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self._tx(self._lka_angle_msg(True))                         # corroborating on lateral authority alone
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0.35, 0, 0)),
+                    "angle-mode range must follow lateral authority, not controls_allowed")
+    self._tx(self._lka_angle_msg(False))                        # disarm the C static for the next test
+
+  def test_mads_angle_mode_still_needs_authority(self):
+    """The MADS-off half of the same gate: once the brake has taken lateral authority away, angle
+    mode cannot be corroborated and the wide range is refused -- today's behaviour, unchanged."""
+    self._mads_apply(False)
+    self._drain_reset_latch()
+    self._reset_curvature_measurement(0, 5.)
+    self._mads_engage()
+    self._tx(self._lka_angle_msg(False))
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.35, 0, 0)))
+    self._tx(self._lka_angle_msg(True))
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0.35, 0, 0)))
+
+    self._mads_brake(True)
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self._tx(self._lka_angle_msg(True))
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.35, 0, 0)))
+    self._tx(self._lka_angle_msg(False))
+
+  def test_mads_rate_limits_still_enforced_after_brake(self):
+    """MADS grants AUTHORITY, never amnesty. Every value-range and rate-of-change check is still
+    computed and enforced while lateral is running on the latched flag."""
+    self._mads_apply(True)
+    self._drain_reset_latch()
+    self._reset_curvature_measurement(0, 5.)
+    self._mads_engage()
+    self._mads_brake(True)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self._drain_reset_latch()   # no ROC amnesty -- every check below is enforced on its own merits
+    # POSITIVE control: a small in-budget curvature step IS allowed on the latched lateral
+    # authority. Without the shared-gate change in lateral.h this frame would be rejected as
+    # "steering while disengaged", which is the failure mode mads2pnw exists to remove.
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0, 2e-5, 0)))
+    # way outside the path_angle value range in either mode
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.49, 0, 0)))
+    # a large rate-of-change step from the neutral state
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.2, 0.01, 0)))
+    # a pure CURVATURE rate-of-change step (lateral.h steer_angle_cmd_checks' own ROC budget,
+    # which only runs when the gate above says there is lateral authority)
+    self._drain_reset_latch()
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0, 0.01, 0)))
+
+  def test_mads_reset_latch_inert_without_lateral_authority(self):
+    """The pnw reset-latch hardening is unchanged when MADS is off: neutral frames sent while
+    disengaged still cannot arm the ROC amnesty."""
+    self._mads_apply(True)
+    self._drain_reset_latch()
+    self._reset_curvature_measurement(0, 5.)
+    self._mads_engage()
+    self._mads_brake(True)
+    # DISENGAGE mode drops lateral entirely -> latch must go inert like any disengaged frame
+    self._mads_apply(True, MadsSteeringModeOnBrake.DISENGAGE)
+    self._mads_engage()
+    self._mads_brake(True)
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    for _ in range(5):
+      self._tx(self._lat_ctl_msg(True, 0, 0, 0, 0))
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0.2, 0.01, 0)))
+
+  def test_mads_acc_main_off_revokes_lateral(self):
+    """The one driver-reachable revoke: turning ACC MAIN off drops latched lateral authority.
+    A brake press drops CcStat_D_Actl 4/5 -> 3 (standby, main still on) and must NOT revoke."""
+    self._mads_apply(True)
+    self._mads_engage()
+    self.assertTrue(self.safety.get_acc_main_on())
+    self._mads_brake(True)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())   # standby: still on
+    self._rx(self._acc_main_off_msg())
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self._mads_lateral_tx())
+
+  def test_mads_invalid_rx_msg_drops_lateral(self):
+    """A safety RX message failing its quality/checksum/counter checks drops LATERAL authority
+    too, not just controls_allowed. This is a hardening beyond upstream sunnypilot -- if it is
+    reverted, this test fails."""
+    self._mads_apply(True)
+    self._mads_engage()
+    # brake FIRST: this is the state where the explicit clear is load-bearing rather than
+    # redundant -- controls_allowed is already false, so is_msg_valid's own
+    # `controls_allowed = false` produces no falling edge for the non-brake-disengage exit to see.
+    self._mads_brake(True)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self._rx(self._speed_msg(0, quality_flag=False))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self._mads_lateral_tx())
+
+  def test_mads_does_not_reengage_lateral_while_braked(self):
+    """The latch is set on the openpilot-engaged RISING edge. Once the brake has cleared
+    controls_allowed, a stream of further brake-held frames must not produce a new rising edge
+    (i.e. nothing re-arms lateral behind the driver's back in DISENGAGE mode)."""
+    self._mads_apply(True, MadsSteeringModeOnBrake.DISENGAGE)
+    self._mads_engage()
+    self._mads_brake(True)
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    for _ in range(20):
+      self._mads_brake(True)
+      self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_mads_leaves_resume_button_gate_alone(self):
+    """The Steering_Data_FD1 resume-button gate reads controls_allowed only -- it is a
+    LONGITUDINAL authority, and MADS must not touch it."""
+    self._mads_apply(True)
+    self._mads_engage()
+    self._mads_brake(True)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self._tx(self._acc_button_msg(Buttons.RESUME, 0)))
+
+  # mads2pnw (Fable review 2026-09-05): ford.h's reset_bypass_latch_counter and
+  # ford_bp_angle_mode_engaged are C statics that no init resets, and libsafety is a process-wide
+  # singleton -- an armed latch or a corroborated angle-mode flag leaks into whatever test the
+  # xdist worker runs next. That already made this file order-flaky before mads2pnw; the MADS
+  # tests engage/corroborate more than most, so clean up explicitly.
+  def tearDown(self):
+    self.safety.set_mads_params(False, False, False)
+    self.safety.set_safety_hooks(self.safety.get_current_safety_mode(), self.safety.get_current_safety_param())
+    self.safety.set_controls_allowed(False)
+    self._tx(self._lka_angle_msg(False))
+    self._drain_reset_latch()
+
+  # mads2pnw: hooks for MadsLateralOnBrakeTestBase
+  def _mads_lateral_tx(self) -> bool:
+    # a fully neutral lateral command: inside every value range and every rate-of-change budget,
+    # so the ONLY thing that can block it is the lateral authority gate under test
+    return self._tx(self._lat_ctl_msg(True, 0, 0, 0, 0))
+
+  def _mads_engage(self) -> None:
+    self._rx(self._pcm_status_msg(False))
+    self._rx(self._pcm_status_msg(True))
+
+  def _mads_brake(self, pressed: bool) -> None:
+    # NOT _user_brake_msg: that helper sends CcStat_D_Actl == 0 (ACC main OFF) whenever
+    # controls_allowed is False, which is not what a real Lightning does. On the truck a brake
+    # press drops CcStat_D_Actl 4/5 (engaged) -> 3 (standby, main still ON). Using the stock
+    # helper here would turn ACC main off as a side effect and revoke lateral for the wrong
+    # reason, hiding the behaviour under test. (Gemini review finding, 2026-09-05.)
+    values = {
+      "BpedDrvAppl_D_Actl": 2 if pressed else 1,
+      "CcStat_D_Actl": 5 if self.safety.get_controls_allowed() else 3,
+    }
+    self._rx(self.packer.make_can_msg_safety("EngBrakeData", 0, values))
+
+  def _mads_disengage_no_brake(self) -> None:
+    # CcStat_D_Actl 5 -> 3: cruise CANCELLED but ACC MAIN still on, brake released. Deliberately
+    # not _pcm_status_msg(False), which sends 0 (main OFF) and would drop lateral via the
+    # acc_main revoke instead -- masking the path under test.
+    values = {"BpedDrvAppl_D_Actl": 1, "CcStat_D_Actl": 3}
+    self._rx(self.packer.make_can_msg_safety("EngBrakeData", 0, values))
+
+  def _acc_main_off_msg(self):
+    # CcStat_D_Actl == 0 -> ACC main OFF (not standby); brake released
+    values = {"BpedDrvAppl_D_Actl": 1, "CcStat_D_Actl": 0}
+    return self.packer.make_can_msg_safety("EngBrakeData", 0, values)
 
   # Driver brake pedal
   def _user_brake_msg(self, brake: bool):
@@ -846,6 +1028,16 @@ class TestFordCANFDStockSafety(TestFordSafetyBase):
 
 
 class TestFordLongitudinalSafetyBase(TestFordSafetyBase):
+  # mads2pnw
+  def test_mads_longitudinal_still_dies_on_brake(self):
+    """MADS grants LATERAL authority only. Longitudinal gates keep reading controls_allowed
+    alone, so an ACC command is still blocked after a brake press."""
+    self._mads_apply(True)
+    self._mads_engage()
+    self._mads_brake(True)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self._tx(self._acc_command_msg(self.INACTIVE_GAS, self.MAX_ACCEL, True)))
+
   MAX_ACCEL = 2.0  # accel is used for brakes, but openpilot can set positive values
   MIN_ACCEL = -3.5
   INACTIVE_ACCEL = 0.0

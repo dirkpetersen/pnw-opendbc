@@ -617,10 +617,12 @@ def main():
     # TODO: fix these surviving mutants and delete this block
     known_survivors = {
       ("opendbc/safety/helpers.h", 40, "arithmetic"),
-      ("opendbc/safety/lateral.h", 105, "boundary"),
-      ("opendbc/safety/lateral.h", 195, "boundary"),
-      ("opendbc/safety/lateral.h", 239, "boundary"),
-      ("opendbc/safety/lateral.h", 337, "arithmetic"),
+      # mads2pnw: +3 lines inserted at the top of lateral.h (the mads.h include + its comment);
+      # these are the SAME four pre-existing survivors, re-pinned. Contents verified unchanged.
+      ("opendbc/safety/lateral.h", 108, "boundary"),
+      ("opendbc/safety/lateral.h", 198, "boundary"),
+      ("opendbc/safety/lateral.h", 242, "boundary"),
+      ("opendbc/safety/lateral.h", 340, "arithmetic"),
     }
     survivors = [r for r in survivors if (str(r.site.origin_file.relative_to(ROOT)), r.site.origin_line, r.site.mutator) not in known_survivors]
 

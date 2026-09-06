@@ -142,6 +142,49 @@ class TestToyotaSafetyTorque(TestToyotaSafetyBase, common.MotorTorqueSteeringSaf
     self.safety.set_safety_hooks(CarParams.SafetyModel.toyota, self.EPS_SCALE)
     self.safety.init_tests()
 
+  # mads2pnw: set_safety_hooks refuses the MADS alternative_experience bits in every safety mode
+  # except SAFETY_FORD (defense in depth -- panda safety must not depend on the openpilot host's
+  # capability gate being correct). Toyota is the torque-steering witness for that refusal.
+  def test_mads_refused_outside_ford_safety_mode(self):
+    self.safety.set_mads_params(True, False, False)
+    self.safety.set_safety_hooks(self.safety.get_current_safety_mode(), self.safety.get_current_safety_param())
+    self.assertFalse(self.safety.get_mads_system_enabled())
+    for _ in range(5):
+      self._rx(self._pcm_status_msg(False))
+      self._rx(self._pcm_status_msg(True))
+      self._rx(self._user_brake_msg(True))
+      self._rx(self._user_brake_msg(False))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_mads_torque_gates_follow_lateral_authority(self):
+    """Coverage for the TORQUE half of lateral.h's shared gates. No production car can reach it
+    (set_safety_hooks refuses MADS outside SAFETY_FORD, and the Lightning is curvature/angle), so
+    the state machine is forced on through a test-harness-only hook. Without this the
+    steer_torque_cmd_checks gates would be shipped untested."""
+    self.safety.mads_force_system_state(True)
+    self._rx(self._pcm_status_msg(False))
+    self._rx(self._pcm_status_msg(True))
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self._rx(self._user_brake_msg(True))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    # lateral survives on the latched flag ...
+    self.assertTrue(self._tx(self._torque_cmd_msg(self.MAX_RATE_UP)))
+    # ... but the torque and rate budgets are still computed and enforced (authority, not amnesty)
+    self.assertFalse(self._tx(self._torque_cmd_msg(self.MAX_TORQUE_LOOKUP[1][0] + 1)))
+    self.assertFalse(self._tx(self._torque_cmd_msg(3 * self.MAX_RATE_UP)))
+    self.safety.mads_force_system_state(False)
+
+  def test_mads_torque_steer_still_dies_on_brake(self):
+    self.safety.set_mads_params(True, False, False)
+    self.safety.set_safety_hooks(self.safety.get_current_safety_mode(), self.safety.get_current_safety_param())
+    self._rx(self._pcm_status_msg(False))
+    self._rx(self._pcm_status_msg(True))
+    self._rx(self._user_brake_msg(True))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self._tx(self._torque_cmd_msg(self.MAX_RATE_UP)))
+
 
 class TestToyotaSafetyAngle(TestToyotaSafetyBase, common.AngleSteeringSafetyTest):
 
