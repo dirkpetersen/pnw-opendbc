@@ -18,6 +18,13 @@ MADSState m_mads_state;
 
 bool controls_allowed_lateral = false;
 
+// madsheartbeat2pnw -- the LATERAL heartbeat watchdog, the exact mirror of safety.h's
+// heartbeat_engaged / heartbeat_engaged_mismatches pair. Written ONLY by the panda board code
+// (board/main_comms.h, USB 0xf3 param2) and by the test harness. Defaults FALSE so a panda that
+// never hears "openpilot still wants lateral" revokes rather than grants.
+bool heartbeat_engaged_mads = false;
+uint32_t heartbeat_engaged_mads_mismatches = 0U;
+
 // ===============================
 // State Update Helpers
 // ===============================
@@ -62,6 +69,11 @@ inline void m_mads_state_init(void) {
 
   m_mads_state.controls_requested_lateral = false;
   controls_allowed_lateral = false;
+  // madsheartbeat2pnw: the watchdog counter is state, not a host input, so it re-inits with the
+  // rest. heartbeat_engaged_mads is deliberately NOT touched here -- it is the host's live signal,
+  // owned by board/main_comms.h, and clearing it here would be a no-op at best (the latch is
+  // already down, so the check takes its else branch) and a lie about what openpilot last said.
+  heartbeat_engaged_mads_mismatches = 0U;
 }
 
 inline void m_update_binary_state(BinaryStateTracking *state) {
@@ -135,6 +147,36 @@ inline void m_update_control_state(void) {
     controls_allowed_lateral = true;
     m_mads_state.current_disengage.active_reason = MADS_DISENGAGE_REASON_NONE;
     m_mads_state.current_disengage.pending_reasons = MADS_DISENGAGE_REASON_NONE;
+    // madsheartbeat2pnw: clear the watchdog counter on the LATCH RISING EDGE, exactly as safety.h
+    // clears heartbeat_engaged_mismatches when controls_allowed rises. Without it, ticks counted
+    // against a previous latch can carry over: revoke on tick 3, re-latch inside the same 1 s
+    // window, and the next tick would revoke the fresh latch even though openpilot has since
+    // started asking again. Fail-safe direction either way (it degrades to stock), but this makes
+    // the mirror of the longitudinal watchdog exact. (Fable review 2026-09-05.)
+    heartbeat_engaged_mads_mismatches = 0U;
+  }
+}
+
+/**
+ * @brief 1 Hz watchdog: revoke lateral authority if openpilot stops asking for it.
+ *
+ * Mirrors main.c's `controls_allowed && !heartbeat_engaged` check exactly, including the
+ * 3-tick threshold. Called once per second from panda's board/main.c.
+ *
+ * REVOKE-ONLY BY CONSTRUCTION: the only write to authority here is via mads_exit_controls(),
+ * which can only clear. Nothing in this function can set controls_allowed_lateral, and the
+ * counter only advances while the latch is ALREADY up -- so with MADS off (the latch can never
+ * be set: m_update_control_state gates on system_enabled, and set_safety_hooks refuses the MADS
+ * bits outside SAFETY_FORD) this function is a no-op that just holds the counter at zero.
+ */
+inline void mads_heartbeat_engaged_check(void) {
+  if (controls_allowed_lateral && !heartbeat_engaged_mads) {
+    heartbeat_engaged_mads_mismatches += 1U;
+    if (heartbeat_engaged_mads_mismatches >= 3U) {
+      mads_exit_controls(MADS_DISENGAGE_REASON_HEARTBEAT_ENGAGED_MISMATCH);
+    }
+  } else {
+    heartbeat_engaged_mads_mismatches = 0U;
   }
 }
 

@@ -64,19 +64,28 @@
  *     fails its checksum/counter/quality checks (`is_msg_valid`). Upstream
  *     clears only `controls_allowed` there. Clearing lateral too is a
  *     hardening in the safe direction; it is tested.
- *   - `mads_heartbeat_engaged_check()` / `heartbeat_engaged_mads` are NOT
- *     ported at all -- not even as dead code. Upstream's watchdog needs the
- *     panda to receive a second "openpilot still wants lateral" flag over USB
- *     (heartbeat cmd 0xf3 param2) and this tree's panda does not send one, so
- *     the function would only ever have been unused (and it tripped MISRA
- *     8.7). CONSEQUENCE, stated plainly: while MADS is enabled there is NO
- *     equivalent of `main.c`'s `controls_allowed && !heartbeat_engaged` 3-second
- *     watchdog for the LATERAL flag. Once latched, `controls_allowed_lateral`
- *     is only cleared by ACC-main-off, a steering override, a lagging/invalid
- *     safety message, or a safety-mode change (which includes the drop to
- *     SILENT when the heartbeat is lost entirely). Wiring the watchdog is a
- *     REQUIRED prerequisite before this code is ever flashed to a panda --
- *     see docs/pnw/MADS2PNW.md, which carries the exact upstream snippet.
+ *   - `mads_heartbeat_engaged_check()` / `heartbeat_engaged_mads` ARE now
+ *     ported (madsheartbeat2pnw), matching upstream byte for byte. They were
+ *     deliberately left out of the first mads2pnw commit because the panda had
+ *     no way to receive the flag; `pnw-panda madsheartbeat2pnw` adds it
+ *     (`board/main_comms.h` case 0xf3 -> `req->param2`, and the 1 Hz call in
+ *     `board/main.c`), and `pandad` sends `madsState.enabled` in param2.
+ *
+ *     WHAT THE WATCHDOG IS FOR, precisely. It is NOT the "openpilot died"
+ *     case -- that one is already covered: no 0xf3 at all -> heartbeat_counter
+ *     climbs -> panda drops to SAFETY_SILENT -> set_safety_hooks ->
+ *     mads_set_system_state(false,..) -> m_mads_state_init() ->
+ *     controls_allowed_lateral = false. The watchdog covers the case where
+ *     openpilot is STILL TALKING but has stopped intending lateral (selfdrived
+ *     restarted, madsState went stale/invalid, MADS turned itself off): within
+ *     3 s of param2 reading 0 while the latch is up, the panda revokes it.
+ *
+ *     DIRECTION. The check can only ever REVOKE. It contains no path that sets
+ *     `controls_allowed_lateral` true, and `heartbeat_engaged_mads` defaults to
+ *     false, so a panda that never hears from a MADS-aware openpilot -- an old
+ *     device, a crashed pandad, param2 always 0 -- revokes after 3 ticks and
+ *     stays revoked. Missing == revoke. There is no "grant" edge anywhere in
+ *     this function.
  */
 
 #pragma once
@@ -97,6 +106,7 @@ typedef enum __attribute__((packed)) {
   MADS_DISENGAGE_REASON_LAG = 2,                          ///< Lagging or invalid safety message
   MADS_DISENGAGE_REASON_ACC_MAIN_OFF = 8,                 ///< ACC system turned off
   MADS_DISENGAGE_REASON_OP_DISENGAGE = 16,                ///< openpilot lost controls for a non-brake reason
+  MADS_DISENGAGE_REASON_HEARTBEAT_ENGAGED_MISMATCH = 32,  ///< openpilot stopped asking for lateral (0xf3 param2)
   MADS_DISENGAGE_REASON_STEERING_DISENGAGE = 64,          ///< Steering override/disengage
 } DisengageReason;
 
@@ -145,6 +155,12 @@ extern MADSState m_mads_state;
 
 extern bool controls_allowed_lateral;
 
+// State for the LATERAL heartbeat watchdog (madsheartbeat2pnw). heartbeat_engaged_mads is written
+// ONLY by the panda board code from heartbeat USB command 0xf3 param2 -- "openpilot still intends
+// lateral authority". It is the exact mirror of `heartbeat_engaged` (0xf3 param1) in safety.h.
+extern bool heartbeat_engaged_mads;
+extern uint32_t heartbeat_engaged_mads_mismatches;
+
 // ===============================
 // External Function Declarations
 // ===============================
@@ -153,6 +169,7 @@ extern void mads_set_system_state(bool enabled, bool disengage_lateral_on_brake,
 extern void mads_set_alternative_experience(const int *mode);
 extern void mads_state_update(bool op_acc_main, bool op_allowed, bool is_braking, bool steering_disengage);
 extern void mads_exit_controls(DisengageReason reason);
+extern void mads_heartbeat_engaged_check(void);
 
 // ===============================
 // Inline Function Implementations, must be included in the header file to comply with MISRA-C:2012 Rule 8.10

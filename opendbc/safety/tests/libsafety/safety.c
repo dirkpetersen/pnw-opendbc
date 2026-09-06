@@ -46,6 +46,16 @@ void set_controls_allowed_lateral(bool c){
   controls_allowed_lateral = c;
 }
 
+// madsheartbeat2pnw test hooks -- in real firmware heartbeat_engaged_mads is written only by
+// panda's board/main_comms.h from USB 0xf3 param2.
+void set_heartbeat_engaged_mads(bool c){
+  heartbeat_engaged_mads = c;
+}
+
+uint32_t get_heartbeat_engaged_mads_mismatches(void){
+  return heartbeat_engaged_mads_mismatches;
+}
+
 int get_mads_disengage_reason(void){
   return (int)m_mads_state.current_disengage.active_reason;
 }
@@ -241,6 +251,11 @@ void init_tests(void){
   alternative_experience = 0;
   // mads2pnw: reset MADS state so it can't leak between tests
   mads_set_system_state(false, false, false);
+  // madsheartbeat2pnw: heartbeat_engaged_mads is DELIBERATELY not reset here. It is the panda's
+  // live host signal (USB 0xf3 param2) and its C initializer -- false, i.e. "missing means revoke"
+  // -- is load-bearing safety behaviour; a harness that forced it true would hide a mutation of
+  // that default. Every watchdog test sets it explicitly before use.
+  // (mads_set_system_state above already zeroed heartbeat_engaged_mads_mismatches.)
   set_timer(0);
   ts_steer_req_mismatch_last = 0;
   valid_steer_req_count = 0;

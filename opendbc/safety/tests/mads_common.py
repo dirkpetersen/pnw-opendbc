@@ -15,8 +15,12 @@ Mix into a car's safety test. The car test must provide:
 """
 
 import abc
+import pathlib
 
 from opendbc.safety import ALTERNATIVE_EXPERIENCE
+
+# opendbc/safety/pnw/mads_declarations.h: MADS_DISENGAGE_REASON_HEARTBEAT_ENGAGED_MISMATCH
+MADS_DISENGAGE_REASON_HEARTBEAT_ENGAGED_MISMATCH = 32
 
 
 class MadsSteeringModeOnBrake:
@@ -181,3 +185,140 @@ class MadsLateralOnBrakeTestBase(abc.ABC):
     self.safety.safety_tick_current_safety_config()
     self.assertFalse(self.safety.get_controls_allowed())
     self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  # --- the lateral heartbeat watchdog (madsheartbeat2pnw) -------------------
+  #
+  # main.c calls mads_heartbeat_engaged_check() once a second. It is the exact mirror of the
+  # existing `controls_allowed && !heartbeat_engaged` watchdog: if openpilot stops saying "I still
+  # want lateral" (USB 0xf3 param2) while the latch is up, the panda revokes it after 3 ticks.
+  #
+  # THE CLAIM THESE TESTS HOLD DOWN: the watchdog can only ever REVOKE lateral, never grant it.
+
+  def test_mads_heartbeat_watchdog_revokes_after_three_ticks(self):
+    """THE scenario the watchdog exists for: the driver braked, openpilot disengaged, MADS is
+    holding lateral ALONE -- and then openpilot stops asking for it (selfdrived restarted,
+    madsState went stale, MADS turned itself off) while pandad keeps the heartbeat alive. Three
+    ticks later the panda takes the steering back. Note the brake press first: only in the
+    lateral-only state is controls_allowed already down, so the tx gate
+    (controls_allowed || controls_allowed_lateral) actually turns on this flag."""
+    self._mads_apply(True)
+    self._mads_engage()
+    self._mads_brake(True)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.assertTrue(self._mads_lateral_tx())
+
+    self.safety.set_heartbeat_engaged_mads(False)
+    for tick in range(1, 3):
+      self.safety.mads_heartbeat_engaged_check()
+      self.assertTrue(self.safety.get_controls_allowed_lateral(), f"revoked too early at tick {tick}")
+      self.assertEqual(tick, self.safety.get_heartbeat_engaged_mads_mismatches())
+      self.assertTrue(self._mads_lateral_tx())
+
+    self.safety.mads_heartbeat_engaged_check()
+    self.assertFalse(self.safety.get_controls_allowed_lateral(), "3rd tick must revoke")
+    self.assertFalse(self._mads_lateral_tx(), "lateral tx must be blocked once the watchdog fires")
+    self.assertEqual(MADS_DISENGAGE_REASON_HEARTBEAT_ENGAGED_MISMATCH, self.safety.get_mads_disengage_reason())
+
+  def test_mads_heartbeat_watchdog_resets_on_match(self):
+    """Two bad ticks then a good one must clear the counter -- no accumulation across gaps."""
+    self._mads_apply(True)
+    self._mads_engage()
+    self.safety.set_heartbeat_engaged_mads(False)
+    for _ in range(2):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertEqual(2, self.safety.get_heartbeat_engaged_mads_mismatches())
+
+    self.safety.set_heartbeat_engaged_mads(True)
+    self.safety.mads_heartbeat_engaged_check()
+    self.assertEqual(0, self.safety.get_heartbeat_engaged_mads_mismatches())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+    # ... and it takes a full three again
+    self.safety.set_heartbeat_engaged_mads(False)
+    for _ in range(2):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_mads_heartbeat_watchdog_stays_engaged_while_openpilot_asks(self):
+    """The watchdog must not be able to end a healthy lateral-only session. 100 s of openpilot
+    saying "still steering" changes nothing."""
+    self._mads_apply(True)
+    self._mads_engage()
+    self._mads_brake(True)
+    self.safety.set_heartbeat_engaged_mads(True)
+    for _ in range(100):
+      self.safety.mads_heartbeat_engaged_check()
+      self.assertTrue(self.safety.get_controls_allowed_lateral())
+      self.assertEqual(0, self.safety.get_heartbeat_engaged_mads_mismatches())
+    self.assertTrue(self._mads_lateral_tx())
+
+  def test_mads_heartbeat_watchdog_can_never_grant_lateral(self):
+    """THE fail-safe direction. With the latch DOWN, no combination of heartbeat value and tick
+    count may ever raise controls_allowed_lateral -- MADS enabled or not."""
+    for enabled in (False, True):
+      for heartbeat in (False, True):
+        with self.subTest(mads_enabled=enabled, heartbeat_engaged_mads=heartbeat):
+          self._mads_apply(enabled)
+          self.safety.set_controls_allowed_lateral(False)
+          self.safety.set_heartbeat_engaged_mads(heartbeat)
+          for _ in range(20):
+            self.safety.mads_heartbeat_engaged_check()
+            self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_mads_heartbeat_watchdog_never_touches_longitudinal_authority(self):
+    """The watchdog is lateral-only: it must not clear (or set) controls_allowed."""
+    self._mads_apply(True)
+    self._mads_engage()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.safety.set_heartbeat_engaged_mads(False)
+    for _ in range(20):
+      self.safety.mads_heartbeat_engaged_check()
+      self.assertTrue(self.safety.get_controls_allowed(),
+                      "the LATERAL watchdog must never touch controls_allowed")
+
+  def test_mads_heartbeat_watchdog_inert_with_mads_off(self):
+    """With MADS off -- the shipping default, and every car but the opted-in Lightning -- the
+    watchdog is a no-op: the latch can never be up, so nothing is ever revoked and behaviour is
+    byte-for-byte what it was before madsheartbeat2pnw."""
+    self._mads_apply(False)
+    self._mads_engage()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.safety.set_heartbeat_engaged_mads(False)
+    for _ in range(200):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.assertEqual(0, self.safety.get_heartbeat_engaged_mads_mismatches())
+    # and the pre-MADS lateral behaviour is untouched
+    self.assertTrue(self._mads_lateral_tx())
+    self._mads_brake(True)
+    self.assertFalse(self._mads_lateral_tx())
+
+  def test_mads_heartbeat_default_is_revoke(self):
+    """The C initializer is load-bearing and cannot be observed through the harness (the flag is a
+    process-wide static that other tests write), so pin it directly: a panda that has never been
+    told "openpilot wants lateral" must start out revoking, never granting. If this line is ever
+    changed to `true`, an openpilot that does not send 0xf3 param2 -- an old build, a dead
+    pandad -- would silently satisfy the watchdog forever."""
+    mads_h = pathlib.Path(__file__).parents[1] / "pnw" / "mads.h"
+    assert "bool heartbeat_engaged_mads = false;" in mads_h.read_text()
+
+  def test_mads_heartbeat_watchdog_counter_clears_on_the_latch_rising_edge(self):
+    """Ticks counted against a previous latch must not carry over to a fresh one -- the exact
+    mirror of safety.h clearing heartbeat_engaged_mismatches when controls_allowed rises."""
+    self._mads_apply(True)
+    self._mads_engage()
+    self._mads_brake(True)
+    self.safety.set_heartbeat_engaged_mads(False)
+    for _ in range(2):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertEqual(2, self.safety.get_heartbeat_engaged_mads_mismatches())
+
+    # openpilot is asking again and re-engages -> fresh latch, fresh counter
+    self.safety.set_heartbeat_engaged_mads(True)
+    self._mads_brake(False)
+    self._mads_engage()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.assertEqual(0, self.safety.get_heartbeat_engaged_mads_mismatches())

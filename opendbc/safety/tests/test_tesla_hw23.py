@@ -128,6 +128,30 @@ class TeslaLegacyLateralBase(common.CarSafetyTest, common.AngleSteeringSafetyTes
     self.assertFalse(self.safety.get_controls_allowed_lateral())
     self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
 
+  def test_mads_heartbeat_watchdog_cannot_affect_tesla(self):
+    """madsheartbeat2pnw: the new 1 Hz lateral watchdog runs on EVERY car (panda's main.c calls it
+    unconditionally). On the Raven the MADS state machine is never enabled, so the latch is always
+    down and the watchdog takes its else branch forever -- it must never revoke, grant, or touch
+    controls_allowed. Run it with the heartbeat flag in both states, engaged and disengaged."""
+    self.safety.set_mads_params(True, False, False)  # a buggy host pushing the bits anyway
+    self.safety.set_safety_hooks(self.safety.get_current_safety_mode(), self.safety.get_current_safety_param())
+    for heartbeat in (False, True):
+      with self.subTest(heartbeat_engaged_mads=heartbeat):
+        self._rx(self._pcm_status_msg(False))
+        self._rx(self._pcm_status_msg(True))
+        self.assertTrue(self.safety.get_controls_allowed())
+        self.safety.set_heartbeat_engaged_mads(heartbeat)
+        for _ in range(50):
+          self.safety.mads_heartbeat_engaged_check()
+        self.assertTrue(self.safety.get_controls_allowed(), "Tesla longitudinal authority untouched")
+        self.assertFalse(self.safety.get_controls_allowed_lateral())
+        self.assertTrue(self._tx(self._angle_cmd_msg(0, True)), "Tesla steering untouched")
+        # ... and the brake still takes everything, exactly as before
+        self._rx(self._user_brake_msg(True))
+        self.assertFalse(self.safety.get_controls_allowed())
+        self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
+        self._rx(self._user_brake_msg(False))
+
   def test_rx_hook(self):
     # Test angle command reception
     for i in range(5):
