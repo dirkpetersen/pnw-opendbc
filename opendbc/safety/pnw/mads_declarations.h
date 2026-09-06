@@ -141,10 +141,24 @@ typedef struct {
 // so `op_controls_allowed` falls with `braking.current` still false and the revoke below fires
 // before the brake exists. The brake then lands on the NEXT 0x165 frame, up to ~100 ms later.
 //
-// 300 ms = three 10 Hz frames of margin. Deliberately a TIME bound, not a tick count:
-// mads_state_update() runs from safety_rx_hook() once per RECEIVED CAN MESSAGE, so a tick counter
-// would expire in a few milliseconds of ordinary bus traffic.
-#define MADS_BRAKE_RELATCH_US 300000U
+// 600 ms, and the earlier reasoning behind this number was WRONG TWICE. It was first derived from
+// "0x165 is 10 Hz so the brake lands ~100 ms late" (ford.h:982 declares 10U), then re-derived as
+// ~40 ms after measuring the wire at 20.0 ms median (50 Hz). Both measured the BUS, which is not
+// what the window is racing.
+//
+// MEASURED FROM THE DRIVER'S OWN LOGS 2026-09-06 (rlog scan, cruiseState.enabled falling edge ->
+// carState.brakePressed): the real lead is 321 ms and 361 ms. A 300 ms window covered 0 of 2; the
+// delay is PEDAL TRAVEL, not CAN transport -- the PCM drops cruise on light pedal application while
+// BpedDrvAppl_D_Actl == 2 needs the pedal properly applied. 600 ms is ~1.7x the observed worst case.
+//
+// THE COST OF THIS BOUND IS THE CANCEL BRIDGE: within it, a CANCEL press followed by a brake
+// re-latches lateral, because at the panda the two are the same event (op_controls_allowed FALLING);
+// only the brake edge distinguishes them, and here it arrives. At 600 ms that is a plausible human
+// sequence, so it is a real behavioural trade-off, not a free constant -- see MADS2PNW.md.
+//
+// Deliberately a TIME bound, not a tick count: mads_state_update() runs from safety_rx_hook() once
+// per RECEIVED CAN MESSAGE, so a tick counter would expire in a few ms of ordinary bus traffic.
+#define MADS_BRAKE_RELATCH_US 600000U
 
 typedef struct {
   BinaryStateTracking acc_main;
