@@ -133,6 +133,19 @@ typedef struct {
   bool previous : 1;
 } BinaryStateTracking;
 
+// madsbrakerace2pnw: how long after an OP_DISENGAGE revoke a brake may still RE-LATCH lateral.
+//
+// MEASURED ON THE TRUCK 2026-09-06. The driver braked with "Disengage on brake" OFF and everything
+// disengaged. On the Ford BOTH authorities read brake and cruise from the SAME 10 Hz message
+// (EngBrakeData 0x165), and the PCM drops cruise on the pedal FASTER than BpedDrvAppl reports it --
+// so `op_controls_allowed` falls with `braking.current` still false and the revoke below fires
+// before the brake exists. The brake then lands on the NEXT 0x165 frame, up to ~100 ms later.
+//
+// 300 ms = three 10 Hz frames of margin. Deliberately a TIME bound, not a tick count:
+// mads_state_update() runs from safety_rx_hook() once per RECEIVED CAN MESSAGE, so a tick counter
+// would expire in a few milliseconds of ordinary bus traffic.
+#define MADS_BRAKE_RELATCH_US 300000U
+
 typedef struct {
   BinaryStateTracking acc_main;
   BinaryStateTracking op_controls_allowed;
@@ -140,6 +153,15 @@ typedef struct {
   BinaryStateTracking mads_steering_disengage;
 
   DisengageState current_disengage;
+
+  // madsbrakerace2pnw: microsecond timestamp of the last OP_DISENGAGE revoke, plus an EXPLICIT
+  // pending flag. The flag is not optional: microsecond_timer_get() legitimately returns 0 (the
+  // libsafety harness starts there, and the hardware timer wraps through it), so overloading 0 as
+  // "nothing pending" would silently disarm the window exactly at t=0 and on every wrap.
+  // Authority is ALWAYS revoked immediately (never held longer than before this change); this only
+  // bounds how long a late brake may restore it.
+  uint32_t op_disengage_ts;
+  bool op_disengage_pending;
 
   bool system_enabled : 1;
   bool disengage_lateral_on_brake : 1;

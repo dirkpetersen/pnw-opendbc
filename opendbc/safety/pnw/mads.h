@@ -68,6 +68,8 @@ inline void m_mads_state_init(void) {
   m_mads_state.current_disengage.pending_reasons = MADS_DISENGAGE_REASON_NONE;
 
   m_mads_state.controls_requested_lateral = false;
+  m_mads_state.op_disengage_ts = 0U;          // madsbrakerace2pnw: no pending re-latch
+  m_mads_state.op_disengage_pending = false;  // across a re-init
   controls_allowed_lateral = false;
   // madsheartbeat2pnw: heartbeat_engaged_mads_mismatches is deliberately NOT reset here, and
   // neither is heartbeat_engaged_mads.
@@ -125,7 +127,42 @@ inline void m_update_control_state(void) {
   // only it) is excluded. See test_mads_cancel_drops_lateral / the brake tests either side of it.
   if ((m_mads_state.op_controls_allowed.transition == MADS_EDGE_FALLING) && !m_mads_state.braking.current) {
     mads_exit_controls(MADS_DISENGAGE_REASON_OP_DISENGAGE);
+    // madsbrakerace2pnw: arm the bounded re-latch. Authority is revoked RIGHT NOW, exactly as
+    // before -- this only records WHEN, so a brake arriving on the next 0x165 frame can restore it.
+    m_mads_state.op_disengage_ts = microsecond_timer_get();
+    m_mads_state.op_disengage_pending = true;
     allowed = false;
+  }
+
+  // madsbrakerace2pnw: THE LATE BRAKE. On the Ford, brake and cruise share one 10 Hz message and the
+  // PCM drops cruise first, so the revoke above fires with braking still false and the brake lands a
+  // frame later. Without this, a brake press could never keep lateral on this car -- measured, the
+  // feature simply did not work.
+  //
+  // Why this is a NEW engage source when mads.h deliberately had only one: that comment predates the
+  // openpilot-side MADS state machine (madsop2pnw) and the heartbeat_engaged_mads watchdog
+  // (madsheartbeat2pnw). Both now exist, which is exactly the arbitration the comment said was
+  // missing. This source is narrower than the original concern in every direction:
+  //   * it can only fire within MADS_BRAKE_RELATCH_US of an OP_DISENGAGE revoke;
+  //   * it requires a real BRAKE RISING EDGE off the CAN signal -- a CANCEL press with no brake can
+  //     never trigger it (openpilot cannot tell those apart on this car, but the panda can);
+  //   * it refuses if any OTHER disengage reason is active, or if the driver asked for
+  //     disengage_lateral_on_brake, or if MADS is not enabled;
+  //   * it never extends authority -- the latch was already down when this window opened.
+  // openpilot's own window MUST stay strictly shorter than this (mads_pnw.MADS_BRAKE_GRACE_FRAMES),
+  // so openpilot can never arm lateral after the panda has stopped accepting it.
+  if (m_mads_state.op_disengage_pending) {
+    if (safety_get_ts_elapsed(microsecond_timer_get(), m_mads_state.op_disengage_ts) > MADS_BRAKE_RELATCH_US) {
+      m_mads_state.op_disengage_pending = false;
+    } else if (allowed && m_mads_state.system_enabled && !m_mads_state.disengage_lateral_on_brake &&
+               (m_mads_state.braking.transition == MADS_EDGE_RISING) &&
+               (m_mads_state.current_disengage.active_reason == MADS_DISENGAGE_REASON_OP_DISENGAGE)) {
+      m_mads_state.controls_requested_lateral = true;
+      m_mads_state.current_disengage.active_reason = MADS_DISENGAGE_REASON_NONE;
+      m_mads_state.current_disengage.pending_reasons = MADS_DISENGAGE_REASON_NONE;
+      m_mads_state.op_disengage_pending = false;
+    } else {
+    }
   }
 
   // Secondary control conditions - only checked if primary conditions don't block further control processing

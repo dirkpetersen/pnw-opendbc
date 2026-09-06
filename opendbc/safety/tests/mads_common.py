@@ -19,6 +19,21 @@ import pathlib
 
 from opendbc.safety import ALTERNATIVE_EXPERIENCE
 
+
+def _relatch_us_from_header() -> int:
+  """Read MADS_BRAKE_RELATCH_US straight out of the C header.
+
+  Hardcoding it here would let C and Python drift silently -- the window would still be tested,
+  just not the one the panda actually runs."""
+  hdr = pathlib.Path(__file__).resolve().parents[1] / "pnw" / "mads_declarations.h"
+  for line in hdr.read_text().splitlines():
+    if line.startswith("#define MADS_BRAKE_RELATCH_US"):
+      return int(line.split()[2].rstrip("Uu"))
+  raise AssertionError("MADS_BRAKE_RELATCH_US not found in mads_declarations.h")
+
+
+MADS_BRAKE_RELATCH_US = _relatch_us_from_header()
+
 # opendbc/safety/pnw/mads_declarations.h: MADS_DISENGAGE_REASON_HEARTBEAT_ENGAGED_MISMATCH
 MADS_DISENGAGE_REASON_HEARTBEAT_ENGAGED_MISMATCH = 32
 
@@ -322,3 +337,76 @@ class MadsLateralOnBrakeTestBase(abc.ABC):
     self._mads_engage()
     self.assertTrue(self.safety.get_controls_allowed_lateral())
     self.assertEqual(0, self.safety.get_heartbeat_engaged_mads_mismatches())
+
+  # --- madsbrakerace2pnw: the late brake -----------------------------------
+
+  def test_mads_late_brake_relatches_lateral(self):
+    """THE REGRESSION, replayed at the safety layer.
+
+    MEASURED ON THE TRUCK 2026-09-06: the driver braked with REMAIN_ACTIVE and everything
+    disengaged. On the Ford both authorities read brake and cruise from the SAME 10 Hz message
+    (EngBrakeData 0x165) and the PCM drops cruise on the pedal FASTER than BpedDrvAppl reports it,
+    so `op_controls_allowed` falls while `braking` is still false -- the OP_DISENGAGE revoke fires
+    before the brake exists, and the brake lands on the NEXT frame.
+
+    A pure-Python mads_pnw test CANNOT see this: openpilot arming lateral while the panda has
+    already revoked it is exactly the state that produces 2 s of blocked steering and then
+    madsControlsMismatchLateral. Only a safety replay proves the two agree.
+    """
+    self._mads_apply(True, MadsSteeringModeOnBrake.REMAIN_ACTIVE)
+    self._mads_engage()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+    self._mads_disengage_no_brake()          # frame A: cruise drops, brake NOT yet reported
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_controls_allowed_lateral(),
+                     "authority must still be revoked IMMEDIATELY -- the window only restores it")
+
+    self._mads_brake(True)                   # frame B: the brake finally arrives
+    self.assertTrue(self.safety.get_controls_allowed_lateral(),
+                    "a brake inside MADS_BRAKE_RELATCH_US must restore lateral")
+    self.assertTrue(self._mads_lateral_tx())
+
+  def test_mads_cancel_without_brake_stays_off(self):
+    """A CANCEL press with NO brake must never re-latch, however long we wait.
+
+    This is the property openpilot CANNOT enforce on this car: carstate emits no ButtonType.cancel,
+    so a cancel is indistinguishable from a brake-driven pcmDisable in Python. The panda can tell
+    them apart because it reads the brake signal itself -- which is why the window lives here.
+    """
+    self._mads_apply(True, MadsSteeringModeOnBrake.REMAIN_ACTIVE)
+    self._mads_engage()
+    self._mads_disengage_no_brake()
+    for _ in range(20):
+      self._mads_brake(False)
+      self.assertFalse(self.safety.get_controls_allowed_lateral(),
+                       "no brake edge -> nothing may re-latch")
+      self.assertFalse(self._mads_lateral_tx())
+
+  def test_mads_late_brake_window_expires(self):
+    """The window is BOUNDED. A brake long after the disengage is a NEW driver action and must not
+    resurrect authority."""
+    self._mads_apply(True, MadsSteeringModeOnBrake.REMAIN_ACTIVE)
+    self._mads_engage()
+    self._mads_disengage_no_brake()
+    self.safety.set_timer(MADS_BRAKE_RELATCH_US + 1000)   # past the bound
+    self._mads_brake(True)
+    self.assertFalse(self.safety.get_controls_allowed_lateral(),
+                     "a brake after the window must not re-latch")
+    self.assertFalse(self._mads_lateral_tx())
+
+  def test_mads_late_brake_never_relatches_in_disengage_mode(self):
+    """With DISENGAGE selected (stock behaviour) the window must not exist at all."""
+    self._mads_apply(True, MadsSteeringModeOnBrake.DISENGAGE)
+    self._mads_engage()
+    self._mads_disengage_no_brake()
+    self._mads_brake(True)
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_mads_late_brake_needs_mads_enabled(self):
+    """MADS off -> no window, no re-latch, on any car."""
+    self._mads_apply(False)
+    self._mads_engage()
+    self._mads_disengage_no_brake()
+    self._mads_brake(True)
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
