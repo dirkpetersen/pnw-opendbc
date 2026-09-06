@@ -410,3 +410,24 @@ class MadsLateralOnBrakeTestBase(abc.ABC):
     self._mads_disengage_no_brake()
     self._mads_brake(True)
     self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_mads_late_brake_refused_after_a_second_disengage(self):
+    """A fault arriving INSIDE the window must kill the re-latch.
+
+    mads_exit_controls() only updates `active_reason` `if (controls_allowed_lateral)`, and by the
+    time this window is open the latch is already down -- so a second reason ORs into
+    pending_reasons while active_reason still reads OP_DISENGAGE. Guarding on active_reason alone
+    would re-latch lateral UNDER A LIVE FAULT and then erase the record of it.
+    (Gemini review 2026-09-06.)
+    """
+    self._mads_apply(True, MadsSteeringModeOnBrake.REMAIN_ACTIVE)
+    self._mads_engage()
+    self._mads_disengage_no_brake()          # window opens, pending = OP_DISENGAGE
+    # a SECOND reason lands inside the window: ACC main goes off. The state machine runs on rx,
+    # so drive it with a no-brake frame (which alone must never re-latch anything).
+    self.safety.set_acc_main_on(False)
+    self._mads_brake(False)
+    self._mads_brake(True)                   # brake arrives while that fault stands
+    self.assertFalse(self.safety.get_controls_allowed_lateral(),
+                     "a fault inside the window must veto the late-brake re-latch")
+    self.assertFalse(self._mads_lateral_tx())

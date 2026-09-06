@@ -156,7 +156,16 @@ inline void m_update_control_state(void) {
       m_mads_state.op_disengage_pending = false;
     } else if (allowed && m_mads_state.system_enabled && !m_mads_state.disengage_lateral_on_brake &&
                (m_mads_state.braking.transition == MADS_EDGE_RISING) &&
-               (m_mads_state.current_disengage.active_reason == MADS_DISENGAGE_REASON_OP_DISENGAGE)) {
+               (m_mads_state.current_disengage.active_reason == MADS_DISENGAGE_REASON_OP_DISENGAGE) &&
+               // pending_reasons, not just active_reason. mads_exit_controls() only updates
+               // active_reason `if (controls_allowed_lateral)` -- and by the time this window is
+               // open the latch is ALREADY DOWN, so a SECOND disengage arriving inside the window
+               // (ACC main off, steering disengage, LAG, heartbeat mismatch) ORs itself into
+               // pending_reasons and leaves active_reason reading OP_DISENGAGE. Checking only
+               // active_reason would therefore re-latch lateral under a live fault and then erase
+               // the record of it. Requiring pending_reasons to be EXACTLY OP_DISENGAGE means any
+               // other reason, past or concurrent, blocks the re-latch. (Gemini review 2026-09-06.)
+               (m_mads_state.current_disengage.pending_reasons == MADS_DISENGAGE_REASON_OP_DISENGAGE)) {
       m_mads_state.controls_requested_lateral = true;
       m_mads_state.current_disengage.active_reason = MADS_DISENGAGE_REASON_NONE;
       m_mads_state.current_disengage.pending_reasons = MADS_DISENGAGE_REASON_NONE;
@@ -244,6 +253,14 @@ extern inline void mads_set_system_state(const bool enabled, const bool disengag
 inline void mads_exit_controls(const DisengageReason reason) {
   // Always track this as a pending reason
   m_mads_state.current_disengage.pending_reasons |= reason;
+
+  // madsbrakerace2pnw: ANY reason other than the openpilot disengage itself cancels a pending
+  // late-brake re-latch outright. Defence in depth -- the pending_reasons equality check in
+  // m_update_control_state() already refuses in this case; this makes the window stop existing
+  // rather than merely stop passing, so no later change can reopen it by loosening that test.
+  if (reason != MADS_DISENGAGE_REASON_OP_DISENGAGE) {
+    m_mads_state.op_disengage_pending = false;
+  }
 
   if (controls_allowed_lateral) {
     m_mads_state.current_disengage.active_reason = reason;
