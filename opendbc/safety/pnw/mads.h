@@ -69,11 +69,16 @@ inline void m_mads_state_init(void) {
 
   m_mads_state.controls_requested_lateral = false;
   controls_allowed_lateral = false;
-  // madsheartbeat2pnw: the watchdog counter is state, not a host input, so it re-inits with the
-  // rest. heartbeat_engaged_mads is deliberately NOT touched here -- it is the host's live signal,
-  // owned by board/main_comms.h, and clearing it here would be a no-op at best (the latch is
-  // already down, so the check takes its else branch) and a lie about what openpilot last said.
-  heartbeat_engaged_mads_mismatches = 0U;
+  // madsheartbeat2pnw: heartbeat_engaged_mads_mismatches is deliberately NOT reset here, and
+  // neither is heartbeat_engaged_mads.
+  //   - The COUNTER needs no reset: this function always leaves controls_allowed_lateral false, so
+  //     the very next mads_heartbeat_engaged_check() takes its else branch and zeroes it; and if a
+  //     fresh latch beats that tick, m_update_control_state() zeroes it on the rising edge. Adding
+  //     a third reset here would be code no test can distinguish from its absence (it was there
+  //     and a mutation run proved it dead).
+  //   - The FLAG is the host's live signal, owned by board/main_comms.h (USB 0xf3 param2).
+  //     Clearing it here would be a lie about what openpilot last said, and it cannot grant
+  //     anything: a stale `true` can only delay a revoke by up to one 1 Hz tick.
 }
 
 inline void m_update_binary_state(BinaryStateTracking *state) {
