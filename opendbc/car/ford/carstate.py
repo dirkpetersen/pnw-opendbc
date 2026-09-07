@@ -21,6 +21,10 @@ class CarState(CarStateBase):
 
     self.distance_button = 0
     self.lc_button = 0
+    # onebutton2pnw: the ACC master ON/OFF button on the wheel. Surfaced as a mainCruise button
+    # event because openpilot cannot infer the press from CcStat_D_Actl alone -- see the rising-edge
+    # comment at its use site below.
+    self.main_button = 0
 
     # cargps2pnw: /dev/shm handle for publishing the truck's own GPS fix, plus a decimator. Same
     # pattern as fordlatui2pnw's FordLatStatus: an independent mem-param handle, fully guarded, so a
@@ -102,8 +106,10 @@ class CarState(CarStateBase):
     ret.genericToggle = bool(cp.vl["Steering_Data_FD1"]["TjaButtnOnOffPress"])
     prev_distance_button = self.distance_button
     prev_lc_button = self.lc_button
+    prev_main_button = self.main_button
     self.distance_button = cp.vl["Steering_Data_FD1"]["AccButtnGapTogglePress"]
     self.lc_button = bool(cp.vl["Steering_Data_FD1"]["TjaButtnOnOffPress"])
+    self.main_button = int(cp.vl["Steering_Data_FD1"]["CcButtnOnOffPress"])
 
     # lock info
     ret.doorOpen = any([cp.vl["BodyInfo_3_FD1"]["DrStatDrv_B_Actl"], cp.vl["BodyInfo_3_FD1"]["DrStatPsngr_B_Actl"],
@@ -125,6 +131,15 @@ class CarState(CarStateBase):
     ret.buttonEvents = [
       *create_button_events(self.distance_button, prev_distance_button, {1: ButtonType.gapAdjustCruise}),
       *create_button_events(self.lc_button, prev_lc_button, {1: ButtonType.lkas}),
+      # onebutton2pnw. MEASURED 2026-09-07 (drives/2026-09-07/lightning-onoff-button/): the ACC
+      # state alone CANNOT tell you the driver asked for off. From Standby (CcStat 3) -- which is
+      # exactly where the truck sits after a brake drops cruise while MADS keeps steering -- this
+      # button NEVER reaches Off. Four presses observed from Standby: two did nothing at all, two
+      # turned the system ON, zero produced Off. From Off and from Active it is a clean toggle.
+      # So `cruiseState.available` going false is not a usable signal in the state that matters,
+      # and the PRESS itself has to be surfaced. Nothing else in openpilot acts on mainCruise
+      # (only Hyundai's own interface lists it), so this is inert for every other consumer.
+      *create_button_events(self.main_button, prev_main_button, {1: ButtonType.mainCruise}),
     ]
 
     self._publish_car_gps(cp)
