@@ -8,6 +8,10 @@ from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
 from opendbc.car.ford import fordcan_pnw  # fordsafety2pnw: BluePilot 4-signal lateral builders
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
+# lightning-extra2pnw. Aliased with a leading underscore so the 100 Hz control loop does no import
+# work per frame, and so these names cannot be confused with the cruise-button constants.
+from opendbc.car.ford.lightning_extra_pnw import (PPO_ADDR as _PPO_ADDR, PPO_RATE_HZ as _PPO_RATE_HZ,
+                                                  PpoInputs as _PpoInputs)
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 from opendbc.car.pnw_vehicle import PnwVehicle
 
@@ -278,6 +282,20 @@ class CarController(CarControllerBase):
     self._resume_press = None
     self._resume_get_fail = 0
     self._resume_lat_block = 0     # consecutive frames a SET offer was held back by latActive
+    # lightning-extra2pnw: re-arm Pro Power Onboard once per ignition. Constructed unconditionally
+    # (it is inert on any truck that never reports the state) and never allowed to raise into the
+    # control path -- see the call site.
+    self._ppo_armer = None
+    self._ppo_fail = 0
+    # CAPABILITY, never a fingerprint test in feature code (pnw/CLAUDE.md). The gate is load-bearing:
+    # 0x455 is `eCall_Info` in ford_cgea1_2_ptcan_2011.dbc, so on some other Ford this ID is an
+    # EMERGENCY-CALL frame, and every Ford shares ford_lincoln_base_pt (Fable review 2026-09-07).
+    if veh.pro_power_onboard:
+      try:
+        from opendbc.car.ford.lightning_extra_pnw import ProPowerArmer
+        self._ppo_armer = ProPowerArmer()
+      except Exception:
+        carlog.exception("lightning-extra2pnw: ProPowerArmer construction FAILED -- feature INERT")
     self._resume_enabled = veh.mads_resume and self._icbm_params is not None
     if veh.mads_resume and self._icbm_params is None:
       # Fable S1: this car HAS the capability but the mem-param store never came up, so the executor
@@ -428,6 +446,41 @@ class CarController(CarControllerBase):
     main_on = CS.out.cruiseState.available
     steer_alert = hud_control.visualAlert in (VisualAlert.steerRequired, VisualAlert.ldw)
     fcw_alert = hud_control.visualAlert == VisualAlert.fcw
+
+    ### lightning-extra2pnw: Pro Power Onboard re-arm ###
+    # Wholly separate from everything below: its own frame (0x455), its own bounded state machine,
+    # and no interaction with cruise. Runs before the acc-button chain purely so a failure here
+    # cannot skip it. Every bound lives in ProPowerArmer; this only transmits what it returns.
+    #
+    # NOT A CONTROL PATH. The worst case is a body-comfort setting not being re-armed.
+    if self._ppo_armer is not None:
+      try:
+        # Match the frame's own 10 Hz cadence rather than spraying at the 100 Hz control rate --
+        # measured on the truck, the real sender transmits 0x455 at exactly 10.0 Hz.
+        if (self.frame % int(100 / _PPO_RATE_HZ)) == 0:
+          was = self._ppo_armer.phase
+          import time as _time
+          payload = self._ppo_armer.update(_PpoInputs(
+            now=_time.monotonic(),
+            standstill=bool(CS.out.standstill),
+            # CLAUDE.md rule 3: the GEAR is the truth source for "parked", not IsOnroad and not
+            # standstill alone -- a red light is a standstill too.
+            parked=str(CS.out.gearShifter) == "GearShifter.park",
+            state_valid=bool(getattr(CS, "ppo_valid", False)),
+            ppo_on=bool(getattr(CS, "ppo_on", False)),
+            enabled=True,
+          ))
+          if payload is not None:
+            can_sends.append((_PPO_ADDR, payload, self.CAN.main))
+          # Rule 2: every phase change says so once. A feature that quietly does nothing is the
+          # thing this whole effort keeps tripping over.
+          if self._ppo_armer.phase != was and self._ppo_armer.note:
+            log = carlog.error if self._ppo_armer.phase == "failed" else carlog.warning
+            log("lightning-extra2pnw: %s -> %s: %s", was, self._ppo_armer.phase, self._ppo_armer.note)
+      except Exception:
+        self._ppo_fail += 1
+        if self._ppo_fail == 1 or self._ppo_fail % 1000 == 0:
+          carlog.exception("lightning-extra2pnw: armer step FAILED (%d) -- feature inert this frame", self._ppo_fail)
 
     ### acc buttons ###
     # madsresume2pnw: evaluated EVERY frame (not inside the elif chain below) so its one-shot press

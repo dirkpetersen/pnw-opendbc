@@ -53,6 +53,14 @@ class PnwVehicle:
     # BluePilot-derived turn-exit blend is validated
     self.pc_blend: bool = fp == "FORD_F_150_LIGHTNING_MK1"
 
+    # lightning-extra2pnw: re-arm Pro Power Onboard at ignition. LIGHTNING ONLY, and the gate is
+    # load-bearing rather than tidiness: 0x455 is undocumented on this platform but is `eCall_Info`
+    # in ford_cgea1_2_ptcan_2011.dbc, i.e. Ford reuses the ID and on at least one platform it is an
+    # EMERGENCY-CALL frame. Every Ford shares ford_lincoln_base_pt, so without this gate any other
+    # Ford whose 0x44A/0x480 bits happen to read 0 would have had openpilot spoof that ID three
+    # times at standstill. (Fable review 2026-09-07, must-fix 1.)
+    self.pro_power_onboard: bool = fp == "FORD_F_150_LIGHTNING_MK1"
+
     # human-turn reset (fordlat_pnw.HumanTurnHold): flush commanded curvature during a sustained
     # manual turn so release ramps from ~0 (kills the post-override other-lane lurch)
     self.ht_reset: bool = fp == "FORD_F_150_LIGHTNING_MK1"

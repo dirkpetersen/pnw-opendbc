@@ -2044,6 +2044,7 @@ BO_ 602 HEV_Powertrain_Data: 8 PCM_HEV
  SG_ PwPckTqRdy_B_Dsply : 31|1@0+ (1,0) [0|1] "SED"  GWM
 
 BO_ 1152 HEV_Powertrain_Data6: 8 PCM_HEV
+ SG_ PnwProPwrOnbd_B_Stat2 : 24|1@0+ (1,0) [0|1] "SED"  GWM
  SG_ BattTracDiagClr_B_Stat : 2|1@0+ (1,0) [0|1] "SED"  GWM
  SG_ EngTeHi_B_Actl : 5|1@0+ (1,0) [0|1] "SED"  SOBDMC_HPCM_FD1,GWM
  SG_ DcdcOn_B_Rq : 6|1@0+ (1,0) [0|1] "SED"  GWM
@@ -2191,6 +2192,7 @@ BO_ 1100 PowertrainData_9: 8 PCM_HEV
  SG_ GrossTrainWeight_M_Est : 7|8@0+ (100,0) [0|25300] "kilogram"  VDM,ABS_ESC,PSCM,IPMA_ADAS,TCCM,TCM_DSL,GWM
 
 BO_ 1098 EffDrvModeData: 8 ECM_Diesel
+ SG_ PnwProPwrOnbd_B_Stat : 52|1@0+ (1,0) [0|1] "SED"  GWM
  SG_ EdmVeh_V_Dsply : 31|5@0+ (5,0) [0|155] "km/h"  GWM
  SG_ EdmSailMdeOn_B_Stat : 25|1@0+ (1,0) [0|1] "SED"  GWM
  SG_ EdmPrev_Fe_Dsply : 23|8@0+ (0.1,0) [0|25.5] "litre/100km"  GWM

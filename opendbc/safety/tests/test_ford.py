@@ -23,6 +23,12 @@ MSG_Lane_Assist_Data1 = 0x3CA      # TX by OP, Lane Keep Assist
 MSG_LateralMotionControl = 0x3D3   # TX by OP, Lateral Control message
 MSG_LateralMotionControl2 = 0x3D6  # TX by OP, alternate Lateral Control message
 MSG_IPMA_Data = 0x3D8              # TX by OP, IPMA and LKAS user interface
+# lightning-extra2pnw: the Pro Power Onboard HMI frame. THIS ADDRESS WIDENS THE FORD TX ALLOWLIST --
+# it is a body-comfort message, not a control one, added so openpilot can re-arm a setting the truck
+# forgets on every ignition cycle. Listing it here is the deliberate record of that decision: before
+# this, test_spam_can_buses correctly FAILED with "allowed TX addr=1109", which is the safety model
+# doing its job. Nothing about lateral or longitudinal authority changes.
+MSG_PnwProPowerOnboard = 0x455
 
 
 def checksum(msg):
@@ -408,6 +414,37 @@ class TestFordSafetyBase(common.CarSafetyTest, MadsLateralOnBrakeTestBase):
     return self.packer.make_can_msg_safety("EngVehicleSpThrottle2", 0, values, fix_checksum=checksum)
 
   # Standstill state
+  # --- lightning-extra2pnw: the Pro Power frame is pinned in C, not merely allowlisted ----------
+
+  def _ppo_msg(self, b1: int, rest: int = 0):
+    """0x455 with an explicit payload. Not in any DBC, so it is built by hand -- which is the point:
+    the panda must judge the BYTES, not trust that the host built them correctly."""
+    dat = bytes([0, b1] + [rest] * 6)
+    return libsafety_py.make_CANPacket(MSG_PnwProPowerOnboard, 0, dat)
+
+  def test_pro_power_only_the_ON_press_at_standstill_is_allowed(self):
+    """Fable review 2026-09-07, must-fix 2. Allowlisting 0x455 bounds NOTHING on its own: before
+    this pin, the OFF-request pulse, an all-0xff payload, and a press WHILE MOVING were all accepted
+    by the panda. Every 'never turns it off / never while moving' guarantee lived in Python, which
+    is the arrangement safety.h explicitly warns against."""
+    self.safety.set_controls_allowed(False)          # deliberately: this frame needs no authority
+
+    # standstill -- the only state in which any Pro Power press may go out
+    self._rx(self._vehicle_moving_msg(0))
+    self.assertTrue(self._tx(self._ppo_msg(0x40)), "the ON press at standstill must be allowed")
+    self.assertFalse(self._tx(self._ppo_msg(0x00)), "the OFF request must NEVER be transmittable")
+    self.assertFalse(self._tx(self._ppo_msg(0x80)), "the idle/resting payload must not be sent")
+    self.assertFalse(self._tx(self._ppo_msg(0xFF, 0xFF)), "junk must be refused")
+    self.assertFalse(self._tx(self._ppo_msg(0x40, 0x01)), "trailing bytes must be zero")
+
+    # moving -- nothing at all, including the otherwise-valid press
+    self._rx(self._vehicle_moving_msg(10))
+    self.assertFalse(self._tx(self._ppo_msg(0x40)), "no Pro Power press may go out while moving")
+
+    # and back at a standstill it is permitted again
+    self._rx(self._vehicle_moving_msg(0))
+    self.assertTrue(self._tx(self._ppo_msg(0x40)))
+
   def _vehicle_moving_msg(self, speed: float):
     values = {"VehStop_D_Stat": 1 if speed <= self.STANDSTILL_THRESHOLD else random.choice((0, 2, 3))}
     return self.packer.make_can_msg_safety("DesiredTorqBrk", 0, values)
@@ -1042,7 +1079,7 @@ class TestFordCANFDStockSafety(TestFordSafetyBase):
 
   TX_MSGS = [
     [MSG_Steering_Data_FD1, 0], [MSG_Steering_Data_FD1, 2], [MSG_ACCDATA_3, 0], [MSG_Lane_Assist_Data1, 0],
-    [MSG_LateralMotionControl2, 0], [MSG_IPMA_Data, 0],
+    [MSG_LateralMotionControl2, 0], [MSG_IPMA_Data, 0], [MSG_PnwProPowerOnboard, 0],
   ]
   RELAY_MALFUNCTION_ADDRS = {0: (MSG_ACCDATA_3, MSG_Lane_Assist_Data1, MSG_LateralMotionControl2,
                                  MSG_IPMA_Data)}
@@ -1123,7 +1160,7 @@ class TestFordLongitudinalSafety(TestFordLongitudinalSafetyBase):
 
   TX_MSGS = [
     [MSG_Steering_Data_FD1, 0], [MSG_Steering_Data_FD1, 2], [MSG_ACCDATA, 0], [MSG_ACCDATA_3, 0], [MSG_Lane_Assist_Data1, 0],
-    [MSG_LateralMotionControl, 0], [MSG_IPMA_Data, 0],
+    [MSG_LateralMotionControl, 0], [MSG_IPMA_Data, 0], [MSG_PnwProPowerOnboard, 0],
   ]
   RELAY_MALFUNCTION_ADDRS = {0: (MSG_ACCDATA, MSG_ACCDATA_3, MSG_Lane_Assist_Data1, MSG_LateralMotionControl,
                                  MSG_IPMA_Data)}
@@ -1149,7 +1186,7 @@ class TestFordCANFDLongitudinalSafety(TestFordLongitudinalSafetyBase):
 
   TX_MSGS = [
     [MSG_Steering_Data_FD1, 0], [MSG_Steering_Data_FD1, 2], [MSG_ACCDATA, 0], [MSG_ACCDATA_3, 0], [MSG_Lane_Assist_Data1, 0],
-    [MSG_LateralMotionControl2, 0], [MSG_IPMA_Data, 0],
+    [MSG_LateralMotionControl2, 0], [MSG_IPMA_Data, 0], [MSG_PnwProPowerOnboard, 0],
   ]
   RELAY_MALFUNCTION_ADDRS = {0: (MSG_ACCDATA, MSG_ACCDATA_3, MSG_Lane_Assist_Data1, MSG_LateralMotionControl2,
                                  MSG_IPMA_Data)}

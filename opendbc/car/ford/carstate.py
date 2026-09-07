@@ -25,6 +25,13 @@ class CarState(CarStateBase):
     # event because openpilot cannot infer the press from CcStat_D_Actl alone -- see the rising-edge
     # comment at its use site below.
     self.main_button = 0
+    # lightning-extra2pnw: latched Pro Power Onboard state. `ppo_valid` stays False until at least
+    # ONE of the two signals has actually been received (they are ORed, not ANDed), so "not yet
+    # read" can never be mistaken for "off" -- the armer refuses to act on an unread state rather
+    # than guessing.
+    self.ppo_on = False
+    self.ppo_valid = False
+    self._ppo_err = 0
     # onebutton2pnw: RES / SET+ / SET- presses. Ford emitted NO cruise ButtonTypes at all before
     # this (only gapAdjustCruise and lkas), so anything upstream or downstream that keys on
     # accelCruise/decelCruise/resumeCruise silently never fired on this brand -- including the
@@ -162,8 +169,49 @@ class CarState(CarStateBase):
       *create_button_events(self.set_dec_button, prev_set_dec_button, {1: ButtonType.decelCruise}),
     ]
 
+    self._read_pro_power(cp)
     self._publish_car_gps(cp)
     return ret
+
+  def _read_pro_power(self, cp) -> None:
+    """lightning-extra2pnw: latch the Pro Power Onboard state from the two messages that carry it.
+
+    Both were verified to decode correctly against the REAL captured payloads (0x44A
+    `0000000000bf0000` / `...bf1000`, 0x480 `4800808200000000` / `...8300000000`), not just derived
+    from bit arithmetic. They are ORed rather than ANDed: either module reporting armed is enough,
+    and the only consequence of a disagreement is that the armer does nothing, which is the
+    fail-safe direction for a feature that can only ever turn the setting ON.
+
+    Telemetry/convenience only -- nothing here reaches a control path. Never raises: a Ford whose
+    DBC lacks these messages simply leaves `ppo_valid` False forever and the feature stays inert.
+    """
+    try:
+      # PRESENCE IS TESTED WITH ts_nanos, NOT WITH THE VALUE. Verified empirically 2026-09-07:
+      # `cp.vl["X"].get("sig")` returns **0.0**, not None, for a message that has NEVER been
+      # received -- the registered message is lazily populated with defaults. An `is None` test
+      # therefore never fires, and `"X" not in cp.vl` is False too (the message IS registered), so
+      # neither of the obvious guards works.
+      #
+      # Left unguarded this was a real hazard on OTHER Fords, not a cosmetic bug: any Ford on this
+      # DBC that never transmits these messages would have read `ppo_valid=True, ppo_on=False`, and
+      # the armer would then have spoofed 0x455 on a truck where that address may mean something
+      # else entirely. (Gemini review 2026-09-07 found this; its proposed `not in cp.vl` fix does
+      # not fire, so this uses ts_nanos, which is 0 until a frame actually arrives.)
+      seen_a = cp.ts_nanos["EffDrvModeData"]["PnwProPwrOnbd_B_Stat"] != 0
+      seen_b = cp.ts_nanos["HEV_Powertrain_Data6"]["PnwProPwrOnbd_B_Stat2"] != 0
+      if not (seen_a or seen_b):
+        return                                   # never received -> stays invalid, feature inert
+      a = cp.vl["EffDrvModeData"]["PnwProPwrOnbd_B_Stat"] if seen_a else 0
+      b = cp.vl["HEV_Powertrain_Data6"]["PnwProPwrOnbd_B_Stat2"] if seen_b else 0
+      self.ppo_on = bool(a) or bool(b)
+      self.ppo_valid = True
+    except Exception:
+      # Rule 2: NOT `pass`. An absent message is expected and handled by the ts_nanos test above, so
+      # reaching here means something else went wrong -- and a silently-inert feature is exactly
+      # what this project keeps getting bitten by. Rate-limited, mirroring the _cargps_err pattern.
+      self._ppo_err += 1
+      if self._ppo_err == 1 or self._ppo_err % 6000 == 0:
+        carlog.exception("lightning-extra2pnw: Pro Power state read failed (%d so far)", self._ppo_err)
 
   def _publish_car_gps(self, cp) -> None:
     """cargps2pnw: publish the truck's own GPS fix to /dev/shm CarGps for the ces_events log.
@@ -249,6 +297,12 @@ class CarState(CarStateBase):
   # otherwise.
   GPS_MSGS = ("APIMGPS_Data_Nav_1_FD1", "APIMGPS_Data_Nav_3_FD1")
 
+  # lightning-extra2pnw: the two messages that carry the Pro Power Onboard state, found by CAN diff
+  # while the driver toggled the setting ten times (drives/2026-09-07/propower-toggle-scan/). Both
+  # agree, and both are registered with nan frequency for the SAME reason as GPS_MSGS above: a Ford
+  # without them must not be rendered unusable over a body-comfort feature.
+  PPO_MSGS = ("EffDrvModeData", "HEV_Powertrain_Data6")
+
   @staticmethod
   def get_can_parsers(CP):
     dbc_name = DBC[CP.carFingerprint][Bus.pt]
@@ -259,7 +313,7 @@ class CarState(CarStateBase):
     try:
       from opendbc.can.parser import DBC as _DBC
       known = _DBC(dbc_name).name_to_msg
-      pt_msgs = [(m, float("nan")) for m in CarState.GPS_MSGS if m in known]
+      pt_msgs = [(m, float("nan")) for m in CarState.GPS_MSGS + CarState.PPO_MSGS if m in known]
     except Exception:
       pt_msgs = []
     return {

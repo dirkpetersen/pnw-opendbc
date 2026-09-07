@@ -51,6 +51,12 @@
 #define FORD_Lane_Assist_Data1     0x3CAU   // TX by OP, Lane Keep Assist
 #define FORD_LateralMotionControl  0x3D3U   // TX by OP, Lateral Control message
 #define FORD_LateralMotionControl2 0x3D6U   // TX by OP, alternate Lateral Control message
+// lightning-extra2pnw: the Pro Power Onboard HMI/button frame. TX by OP to re-arm a BODY-COMFORT
+// setting the truck forgets on every ignition cycle. Undocumented (not in any Ford DBC); found by
+// diffing the bus while the driver toggled the setting ten times, see
+// drives/2026-09-07/propower-toggle-scan/. 10 Hz, constant 0080000000000000 payload, no counter and
+// no checksum.
+#define FORD_PnwProPowerOnboard    0x455U   // TX by OP, Pro Power Onboard toggle (body, non-control)
 #define FORD_IPMA_Data             0x3D8U   // TX by OP, IPMA and LKAS user interface
 
 // CAN bus numbers.
@@ -514,6 +520,29 @@ static void ford_rx_hook(const CANPacket_t *msg) {
   }
 }
 
+// lightning-extra2pnw: the ONLY Pro Power payload openpilot may transmit, pinned in C.
+//
+// This exists because the allowlist alone bounds nothing (Fable review 2026-09-07, must-fix 2):
+// with 0x455 merely permitted, the OFF-request pulse, an all-0xff payload, and a press WHILE MOVING
+// were all accepted by the panda. Every "never turns it off / never while moving" guarantee lived
+// in Python, which is exactly the arrangement safety.h warns against -- panda safety must not
+// depend on the host being correct.
+//
+// Byte 1 == 0x40 is "pressing, requesting ON" (bit7 clear = pressing, bit6 set = ON). 0x00 would be
+// "requesting OFF" and is refused here, so no host bug can turn the driver's setting off. All other
+// bytes must be zero, matching every frame observed on the bus.
+#define FORD_PPO_PRESS_ON 0x40U
+
+static bool ford_ppo_tx_valid(const CANPacket_t *msg) {
+  bool valid = (msg->data[0] == 0U) && (msg->data[1] == FORD_PPO_PRESS_ON);
+  for (int i = 2; i < 8; i++) {
+    valid = valid && (msg->data[i] == 0U);
+  }
+  // Pro Power is a parked-truck function. The panda holds this bound itself, from the same ABS
+  // signal the host derives standstill from, so a host that gets it wrong cannot press while moving.
+  return valid && !vehicle_moving;
+}
+
 static bool ford_tx_hook(const CANPacket_t *msg) {
   const LongitudinalLimits FORD_LONG_LIMITS = {
     // acceleration cmd limits (used for brakes)
@@ -530,6 +559,13 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
   };
 
   bool tx = true;
+
+  // lightning-extra2pnw: the Pro Power frame carries exactly one permitted payload, and only at a
+  // standstill. See ford_ppo_tx_valid -- this is what makes the allowlist entry a bound rather
+  // than a blank cheque.
+  if (msg->addr == FORD_PnwProPowerOnboard) {
+    tx = ford_ppo_tx_valid(msg);
+  }
 
   // Safety check for ACCDATA accel and brake requests
   if (msg->addr == FORD_ACCDATA) {
@@ -1010,6 +1046,7 @@ static safety_config ford_init(uint16_t param) {
     {FORD_ACCDATA_3, 0, 8, .check_relay = true},          \
     {FORD_Lane_Assist_Data1, 0, 8, .check_relay = true},  \
     {FORD_IPMA_Data, 0, 8, .check_relay = true},          \
+    {FORD_PnwProPowerOnboard, 0, 8, .check_relay = false}, \
 
   static const CanMsg FORD_CANFD_LONG_TX_MSGS[] = {
     FORD_COMMON_TX_MSGS
