@@ -287,6 +287,9 @@ class CarController(CarControllerBase):
     # control path -- see the call site.
     self._ppo_armer = None
     self._ppo_fail = 0
+    # 0x455 frames handed to pandad this ignition. NOT proof the panda accepted them -- see the
+    # log wording at the call site.
+    self._ppo_tx = 0
     # CAPABILITY, never a fingerprint test in feature code (pnw/CLAUDE.md). The gate is load-bearing:
     # 0x455 is `eCall_Info` in ford_cgea1_2_ptcan_2011.dbc, so on some other Ford this ID is an
     # EMERGENCY-CALL frame, and every Ford shares ford_lincoln_base_pt (Fable review 2026-09-07).
@@ -459,24 +462,46 @@ class CarController(CarControllerBase):
         # measured on the truck, the real sender transmits 0x455 at exactly 10.0 Hz.
         if (self.frame % int(100 / _PPO_RATE_HZ)) == 0:
           was = self._ppo_armer.phase
+          # DELIBERATELY a local alias, not the module `time`. update() already does a bare
+          # `import time` further down (the FordLatStatus block), which makes `time` a LOCAL name
+          # for this entire function -- so a module-level import would leave this line raising
+          # UnboundLocalError and crash card on the first tick the armer runs. Caught by ruff F823
+          # when this was "helpfully" hoisted; declining Fable's N2 for that reason.
           import time as _time
           payload = self._ppo_armer.update(_PpoInputs(
             now=_time.monotonic(),
             standstill=bool(CS.out.standstill),
             # CLAUDE.md rule 3: the GEAR is the truth source for "parked", not IsOnroad and not
             # standstill alone -- a red light is a standstill too.
-            parked=str(CS.out.gearShifter) == "GearShifter.park",
+            #
+            # COMPARE THE ENUM, NEVER str(). `CS.out` is a **capnp** struct here, and capnp renders
+            # an enum as the bare member name: str(gearShifter) is 'park', NOT 'GearShifter.park'.
+            # The original `str(...) == "GearShifter.park"` was therefore ALWAYS False, `parked`
+            # never went true, the armer never left IDLE, and -- because the only log line fired on
+            # a phase change -- the whole feature was silently inert for its entire first outing
+            # (2026-09-07; found by Fable review, not by the tests, which feed `parked` directly to
+            # the pure module). `card.py:488` already does this correctly; match it.
+            parked=CS.out.gearShifter == structs.CarState.GearShifter.park,
             state_valid=bool(getattr(CS, "ppo_valid", False)),
             ppo_on=bool(getattr(CS, "ppo_on", False)),
             enabled=True,
+            # Stale CAN keeps its last decoded values and `ppo_valid` is a forever-latch, so without
+            # this the armer can burn all three presses into a silent bus and then report a
+            # confident failure (Fable review 2026-09-07).
+            can_valid=bool(CS.out.canValid),
           ))
           if payload is not None:
             can_sends.append((_PPO_ADDR, payload, self.CAN.main))
-          # Rule 2: every phase change says so once. A feature that quietly does nothing is the
-          # thing this whole effort keeps tripping over.
-          if self._ppo_armer.phase != was and self._ppo_armer.note:
+            self._ppo_tx += 1
+          # Rule 2: log whatever the armer has to say, phase change or NOT. Logging only on a phase
+          # change is what made the dead `parked` test above look exactly like a healthy feature
+          # with nothing to do. "handed to pandad" is deliberate -- the panda may still refuse the
+          # frame, so this count is an upper bound, not a delivery receipt.
+          note = self._ppo_armer.take_note()
+          if note:
             log = carlog.error if self._ppo_armer.phase == "failed" else carlog.warning
-            log("lightning-extra2pnw: %s -> %s: %s", was, self._ppo_armer.phase, self._ppo_armer.note)
+            log("lightning-extra2pnw: %s -> %s: %s (%d frames handed to pandad)",
+                was, self._ppo_armer.phase, note, self._ppo_tx)
       except Exception:
         self._ppo_fail += 1
         if self._ppo_fail == 1 or self._ppo_fail % 1000 == 0:

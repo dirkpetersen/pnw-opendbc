@@ -12,7 +12,8 @@ DT = 0.01
 
 def run(armer, secs, **kw):
   """Tick the armer for `secs`, returning every payload it asked to transmit."""
-  base = dict(standstill=True, parked=True, state_valid=True, ppo_on=False, enabled=True)
+  base = dict(standstill=True, parked=True, state_valid=True, ppo_on=False, enabled=True,
+              can_valid=True)
   base.update(kw)
   out = []
   t = getattr(run, "_t", 0.0)
@@ -157,3 +158,111 @@ def test_a_ford_that_never_sends_these_messages_stays_inert():
   cp.update([(2_000_000, [CanData(0x44A, bytes.fromhex("0000000000bf0000"), 0)])])
   CarState._read_pro_power(cs, cp)
   assert cs.ppo_valid and not cs.ppo_on, "a real OFF frame must read disarmed"
+
+
+# ---------------------------------------------------------------------------------------------
+# Regression guards for the 2026-09-07 silent-inertness bug. These are deliberately NOT tests of
+# the pure module -- the module was always correct. The bug lived in how ford/carcontroller.py
+# BUILT its PpoInputs, which is exactly the seam the pure-module tests cannot see, because they
+# hand `parked` in ready-made.
+# ---------------------------------------------------------------------------------------------
+
+def test_park_must_be_compared_as_an_enum_not_stringified():
+  """`CS.out` is a capnp struct and capnp renders an enum as the BARE member name.
+
+  The shipped carcontroller compared `str(CS.out.gearShifter) == "GearShifter.park"`, which is
+  always False, so `parked` never went true and the armer never transmitted anything at all. This
+  fails if anyone reintroduces a str() comparison, and it fails on the real struct type rather
+  than a stand-in.
+  """
+  from opendbc.car import structs
+  cs = structs.CarState.new_message()
+  cs.gearShifter = structs.CarState.GearShifter.park
+
+  # what carcontroller.py must do
+  assert (cs.gearShifter == structs.CarState.GearShifter.park) is True
+  assert (cs.as_reader().gearShifter == structs.CarState.GearShifter.park) is True
+  # what it must never go back to -- capnp gives 'park', not 'GearShifter.park'
+  assert str(cs.gearShifter) == "park"
+  assert (str(cs.gearShifter) == "GearShifter.park") is False
+
+  # and the value that must NOT read as parked
+  cs.gearShifter = structs.CarState.GearShifter.drive
+  assert (cs.gearShifter == structs.CarState.GearShifter.park) is False
+
+
+def test_carcontroller_does_not_stringify_the_gear():
+  """Guard the CALL SITE, not just the semantics.
+
+  The assertions above are about capnp and would still pass with the bug fully reintroduced -- they
+  document why it is a bug, they do not prevent it. This one reads the source that actually builds
+  PpoInputs and fails if the str() form comes back. Crude, and deliberately so: the seam between
+  the carcontroller and the pure module is the one place a unit test of the module cannot reach,
+  and it is where the bug lived.
+  """
+  import ast
+  import inspect
+  from opendbc.car.ford import carcontroller
+
+  # Parse, don't grep. A substring test over the source would pass on a mention inside a comment
+  # (this very file's fix carries a comment ABOUT the str() form) and would break on reformatting.
+  tree = ast.parse(inspect.getsource(carcontroller))
+  parked = [kw.value for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_PpoInputs"
+            for kw in node.keywords if kw.arg == "parked"]
+  assert len(parked) == 1, f"expected exactly one _PpoInputs(parked=...) call site, found {len(parked)}"
+  expr = parked[0]
+
+  # It must be a comparison, and nothing in it may be a str() call.
+  assert isinstance(expr, ast.Compare), ast.dump(expr)
+  assert not [n for n in ast.walk(expr)
+              if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "str"], \
+      "capnp renders the enum as 'park', so str(gearShifter) never equals 'GearShifter.park'"
+  # ...and it must compare against the GearShifter.park enum member, not a string literal.
+  assert not [n for n in ast.walk(expr) if isinstance(n, ast.Constant) and isinstance(n.value, str)], \
+      "compare the enum member, not a string literal"
+  assert ast.unparse(expr.comparators[0]).endswith("GearShifter.park"), ast.unparse(expr)
+
+
+def test_being_held_at_the_gate_eventually_says_so():
+  """Rule 2: "held at the gate" must not be indistinguishable from "nothing to do".
+
+  Logging only on a PHASE change is what let the dead Park test look like a healthy feature for a
+  whole ignition cycle. A note must surface even though the phase never leaves IDLE.
+  """
+  armer = ProPowerArmer()
+  run._t = 0.0
+  assert armer.take_note() == ""
+
+  # never in Park -> the armer can never act, and must say which gate is holding it
+  run(armer, PPO_SETTLE_S * 2 + 1.0, parked=False)
+  assert armer.phase == ProPowerArmer.IDLE
+  note = armer.take_note()
+  assert "not in Park" in note, note
+  assert armer.take_note() == "", "a note must be drained exactly once, not repeated every tick"
+
+  # and it says it ONCE, not on every subsequent tick
+  run(armer, 30.0, parked=False)
+  assert armer.take_note() == ""
+
+
+def test_gate_note_names_standstill_when_that_is_what_is_holding():
+  armer = ProPowerArmer()
+  run._t = 0.0
+  run(armer, PPO_SETTLE_S * 2 + 1.0, standstill=False)
+  assert "not at a standstill" in armer.take_note()
+
+
+def test_a_dead_can_bus_never_produces_a_press():
+  """Stale CAN keeps its last decoded values, and `ppo_valid` is a forever-latch.
+
+  Without the can_valid bound, an armer running on a quiet bus reads stale standstill/parked/
+  state_valid, spends all three presses into silence, and then reports a confident failure.
+  """
+  armer = ProPowerArmer()
+  run._t = 0.0
+  assert run(armer, PPO_SETTLE_S * 3, can_valid=False) == []
+  assert armer.phase == ProPowerArmer.IDLE
+  assert armer.attempts == 0
+  # ...and it starts working the moment the bus comes back
+  assert run(armer, PPO_SETTLE_S + PPO_PRESS_S, can_valid=True) != []

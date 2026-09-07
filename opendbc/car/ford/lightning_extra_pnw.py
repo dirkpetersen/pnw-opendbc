@@ -44,9 +44,16 @@ THE ENVELOPE, and why each bound exists
     and would otherwise press at the next red light, in Drive. Park is the honest expression of
     "parked" (CLAUDE.md rule 3: IsOnroad is not "being driven", the gear is). The panda enforces the
     standstill half independently, in C, from the same ABS signal.
-  * ONCE PER IGNITION, and at most MAX_ATTEMPTS presses. The truck forgets the setting once per
+  * AT MOST MAX_ATTEMPTS PRESSES PER `card` PROCESS, and only while the state reads OFF. The truck forgets the setting once per
     cycle, so re-arming it is a once-per-cycle job. An unbounded retry loop mashing a body button is
     exactly the failure this bound exists to make impossible.
+    Known and accepted limit (Gemini review 2026-09-07): the bound is per ARMER INSTANCE, and `card`
+    constructs a fresh one when it restarts, so a `card` crash inside one ignition cycle does allow a
+    second round of attempts. Deliberately not defended against with a param or a file: the first
+    thing a fresh armer checks is `ppo_on`, so a successful earlier press means the new instance does
+    nothing at all; a `card` crash-loop is a far larger problem than a repeated body-button press;
+    and persisting state across restarts to protect a comfort feature is more machinery than the risk
+    justifies.
   * VERIFIED, NOT ASSUMED. After each press we watch the STATE bits. If they do not flip, we say so
     loudly and stop. We are spoofing an undocumented frame whose real sender keeps transmitting at
     10 Hz alongside us; whether the receiving module honours our copy is a question about the truck
@@ -87,6 +94,9 @@ class PpoInputs:
   state_valid: bool    # both state signals have been seen this drive
   ppo_on: bool         # the latched state: True = Pro Power is armed for engine-off
   enabled: bool        # feature master (currently always True; a place for a future opt-out)
+  # CS.out.canValid -- see the outer gate. Deliberately has NO default: a caller that has not
+  # thought about bus liveness should not compile.
+  can_valid: bool
 
 
 class ProPowerArmer:
@@ -101,8 +111,26 @@ class ProPowerArmer:
     self._t0 = None          # first tick we saw, for the settle window
     self._press_until = 0.0
     self._verify_until = 0.0
-    self.note = ""           # one-line reason, for the caller to log
+    self.note = ""           # last line said, for tests and introspection
+    self._pending_note = ""  # drained by the caller via take_note(); see WHY below
     self._said_unread = False
+    self._said_blocked = False
+
+  def _say(self, note: str) -> None:
+    """Queue a line for the caller to log.
+
+    WHY THIS EXISTS RATHER THAN JUST SETTING self.note: the caller used to log only when the PHASE
+    changed, so any condition that keeps the armer parked in IDLE was, by construction, silent --
+    and that is exactly the failure that hid the dead Park gate for a whole day (Fable review
+    2026-09-07). A note now reaches the log whether or not the phase moved.
+    """
+    self.note = note
+    self._pending_note = note
+
+  def take_note(self) -> str:
+    """Pop the queued line, or "" if there is nothing to say."""
+    note, self._pending_note = self._pending_note, ""
+    return note
 
   def update(self, i: PpoInputs) -> bytes | None:
     """Returns the payload to transmit on PPO_ADDR this tick, or None. NEVER raises."""
@@ -114,10 +142,26 @@ class ProPowerArmer:
 
     # Outer bound. A moving truck never sees a frame from this module, in any phase -- including
     # mid-press: if the driver pulls away while we are pressing, we stop transmitting immediately.
+    # Fable review 2026-09-07 (L2): `card` calls apply() whenever carControl is alive, regardless of
+    # bus health, and `cp.vl` KEEPS ITS LAST VALUES when messages go stale -- while `ppo_valid` is a
+    # forever-latch. So on a quiet powertrain bus (modules asleep mid-charge, say) a fresh armer
+    # would read stale standstill/parked/state_valid, spend all three presses into silence, and then
+    # report a confident failure. Require a live bus before believing any of it.
+    if not i.can_valid:
+      return None
+
     if not (i.standstill and i.parked):
       if self.phase == self.PRESSING:
         self.phase = self.IDLE
-        self.note = "aborted: truck moved or left Park mid-press"
+        self._say("aborted: truck moved or left Park mid-press")
+      elif not self._said_blocked and (i.now - self._t0) > PPO_SETTLE_S * 2:
+        # Rule 2. "Held at the gate" and "nothing to do" used to look identical from the log, and a
+        # dead `parked` test therefore read as a working feature for a whole ignition cycle. Name
+        # the gate that is holding, once.
+        self._said_blocked = True
+        held = " and ".join([n for n, ok in (("not at a standstill", i.standstill),
+                                             ("not in Park", i.parked)) if not ok])
+        self._say(f"idle after {PPO_SETTLE_S * 2:.0f}s -- held because the truck is {held}")
       return None
 
     if self.phase == self.PRESSING:
@@ -130,17 +174,18 @@ class ProPowerArmer:
     if self.phase == self.VERIFYING:
       if i.ppo_on:
         self.phase = self.DONE
-        self.note = f"Pro Power armed after {self.attempts} press(es)"
+        self._say(f"Pro Power armed after {self.attempts} press(es)")
       elif i.now >= self._verify_until:
         if self.attempts >= PPO_MAX_ATTEMPTS:
           self.phase = self.FAILED
-          self.note = " ".join([
+          self._say(" ".join([
             f"gave up after {self.attempts} presses -- the state bit never flipped.",
             "Either the panda is dropping the TX (0x455 must be in the Ford allowlist and the",
             "panda flashed) or the module ignores a spoofed press.",
-          ])
+          ]))
         else:
           self.phase = self.IDLE
+          self._say(f"press {self.attempts} not confirmed in {PPO_VERIFY_S:.0f}s -- retrying")
       return None
 
     # IDLE: decide whether there is anything to do at all.
@@ -150,18 +195,18 @@ class ProPowerArmer:
       # from "the feature is working and had nothing to do".
       if not self._said_unread and (i.now - self._t0) > PPO_SETTLE_S * 2:
         self._said_unread = True
-        self.note = "Pro Power state never reported on the bus -- feature inert this drive"
+        self._say("Pro Power state never reported on the bus -- feature inert this drive")
         self.phase = self.FAILED
       return None
     if i.now - self._t0 < PPO_SETTLE_S:
       return None                                  # too early to trust the read
     if i.ppo_on:
       self.phase = self.DONE
-      self.note = "already armed; nothing to do"
+      self._say("already armed; nothing to do")
       return None
 
     self.attempts += 1
     self.phase = self.PRESSING
     self._press_until = i.now + PPO_PRESS_S
-    self.note = f"pressing to arm Pro Power (attempt {self.attempts})"
+    self._say(f"pressing to arm Pro Power (attempt {self.attempts})")
     return PPO_PRESS_ON
