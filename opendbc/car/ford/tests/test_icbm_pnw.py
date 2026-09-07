@@ -423,3 +423,44 @@ def test_non_finite_via_json_string_rejected():
   assert parse(None, raw) is None
   raw2 = f'{{"target": Infinity, "ceiling": 60.0, "ts": {NOW}}}'
   assert parse(None, raw2) is None
+
+
+# --- gasset2pnw: the SET mode --------------------------------------------------------------------
+
+def test_parses_a_set_mode_offer():
+  """The brain may now ask for SET (establish the driver's gas-chosen speed) as well as RESUME.
+  Both literals must parse; anything else must still be rejected."""
+  from opendbc.car.ford.icbm_pnw import parse_resume_cmd, RESUME_DIR, SET_DIR
+  import json
+  for d in (RESUME_DIR, SET_DIR):
+    cmd = parse_resume_cmd(json.dumps({"dir": d, "ts": 1.0, "eid": 2.0, "set": 18.0}))
+    assert cmd is not None and cmd.mode == d, d
+    assert cmd.set_ms == 18.0
+  assert parse_resume_cmd(json.dumps({"dir": "dec", "ts": 1.0, "eid": 2.0, "set": 18.0})) is None
+  assert parse_resume_cmd(json.dumps({"dir": "", "ts": 1.0, "eid": 2.0, "set": 18.0})) is None
+
+
+def test_set_mode_is_not_refused_by_the_resume_ceiling():
+  """The stock-set ceiling exists so a RESUME can never target above what the driver set. A SET
+  establishes the current speed outright and has no remembered value to exceed -- and the truck
+  reports roughly the CURRENT speed while in standby, so applying that ceiling to a SET would
+  refuse it for a condition that does not exist."""
+  from opendbc.car.ford.icbm_pnw import parse_resume_cmd, decide_resume, RESUME_DIR, SET_DIR
+  import json
+  # live standby reading sits ABOVE the target, which is normal for a set-to-current
+  live = 20.0
+
+  def mk(d):
+    return parse_resume_cmd(json.dumps({"dir": d, "ts": 100.0, "eid": 1.0, "set": 18.0}))
+  assert decide_resume(mk(SET_DIR), 100.0, False, True, False, live) is True
+  assert decide_resume(mk(RESUME_DIR), 100.0, False, True, False, live) is False
+
+
+def test_set_mode_still_refuses_while_cruise_is_engaged():
+  """A SET tap while ACC is engaged would MOVE the driver's set speed rather than establish it."""
+  from opendbc.car.ford.icbm_pnw import parse_resume_cmd, decide_resume, SET_DIR
+  import json
+  cmd = parse_resume_cmd(json.dumps({"dir": SET_DIR, "ts": 100.0, "eid": 1.0, "set": 18.0}))
+  assert decide_resume(cmd, 100.0, True, True, False, 0.0) is False       # cruise_enabled
+  assert decide_resume(cmd, 100.0, False, False, False, 0.0) is False     # master off
+  assert decide_resume(cmd, 100.0, False, True, True, 0.0) is False       # driver on a pedal

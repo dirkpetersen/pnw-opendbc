@@ -307,6 +307,10 @@ class PressGovernor:
 # ------------------------------------------------------------------------------------------------
 
 RESUME_DIR = "res"
+# gasset2pnw: the SECOND thing this executor may tap. "res" restores the PCM's own remembered set
+# speed and therefore ACCELERATES; "set" establishes the speed the driver has just chosen with the
+# accelerator and commands no speed change at all. Same frame, same one-shot latch, different bit.
+SET_DIR = "set"
 # A resume offer is only actionable for a moment. The brain re-publishes it (same `eid`, fresh
 # `ts`) every tick its gates still hold and withdraws it the instant one stops -- so a tight
 # freshness bound is what makes the press land within ~half a second of a tick where the lead/TTC/
@@ -337,9 +341,11 @@ class ResumeCommand:
   handles set-speed targets can be handed one of these by accident, and vice versa."""
   ts: float                       # MONOTONIC heartbeat, re-published while the offer stands
   eid: float                      # episode id -- CONSTANT for one offer; the one-shot press key
-  # the driver's captured pre-brake set speed (m/s), for the executor's own independent
-  # "never above the driver's set" check
+  # the target speed (m/s): the driver's captured pre-brake set speed for "res", or the speed they
+  # reached on the accelerator for "set". Used for the executor's own independent ceiling check.
   set_ms: float
+  # which button. "res" (RESUME) or "set" (SET at current speed).
+  mode: str = RESUME_DIR
 
 
 def parse_resume_cmd(raw) -> "ResumeCommand | None":
@@ -356,7 +362,8 @@ def parse_resume_cmd(raw) -> "ResumeCommand | None":
       raw = json.loads(raw)
     if not isinstance(raw, dict):
       return None
-    if str(raw.get("dir", "")) != RESUME_DIR:
+    mode = str(raw.get("dir", ""))
+    if mode not in (RESUME_DIR, SET_DIR):
       return None
     if not all(k in raw for k in ("ts", "eid", "set")):
       return None
@@ -365,7 +372,7 @@ def parse_resume_cmd(raw) -> "ResumeCommand | None":
       return None
     if set_ms <= 0.0:
       return None                 # no captured set speed -> the brain must not have offered at all
-    return ResumeCommand(ts=ts, eid=eid, set_ms=set_ms)
+    return ResumeCommand(ts=ts, eid=eid, set_ms=set_ms, mode=mode)
   except Exception:
     return None
 
@@ -419,7 +426,11 @@ def decide_resume(cmd: "ResumeCommand | None", now: float, cruise_enabled: bool,
   import math as _math
   if not _math.isfinite(live):
     return False
-  if live > 0.0 and live > cmd.set_ms + DEADBAND_MS:
+  # The ceiling check is RESUME-specific: it exists so a resume can never target above what the
+  # driver set. A SET establishes the current speed outright -- there is no remembered value for it
+  # to exceed, and the truck's standby reading tracks current speed rather than a set point, so
+  # applying this check to a SET would refuse it for a reason that does not exist.
+  if cmd.mode == RESUME_DIR and live > 0.0 and live > cmd.set_ms + DEADBAND_MS:
     return False
   return True
 

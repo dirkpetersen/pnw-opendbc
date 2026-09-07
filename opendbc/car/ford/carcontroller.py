@@ -413,12 +413,24 @@ class CarController(CarControllerBase):
     # Mutually exclusive with the SET+/- taps by construction -- decide_press requires cruise ON,
     # decide_resume requires cruise OFF -- but the branch below is ordered ahead of them anyway.
     resume_btn = False
+    set_btn = False
     if self._resume_enabled:
       try:
-        resume_btn = self._resume_button(CS)
+        if self._resume_button(CS):
+          # gasset2pnw: same one-shot latch, two different buttons. "res" hands back the driver's
+          # remembered set speed (RESUME); "set" establishes the speed they just chose with the
+          # accelerator. SET- is used for the latter because it is the tap ICBM already proves on
+          # this truck, and because in the impossible case that ACC were somehow engaged it moves
+          # the set speed DOWN, never up.
+          from opendbc.car.ford.icbm_pnw import SET_DIR
+          if self._resume_cmd is not None and self._resume_cmd.mode == SET_DIR:
+            set_btn = True
+          else:
+            resume_btn = True
       except Exception:
         carlog.exception("madsresume2pnw: _resume_button failed -- no auto-resume this frame")
         resume_btn = False
+        set_btn = False
 
     if CC.cruiseControl.cancel:
       can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.camera, CS.buttons_stock_values, cancel=True))
@@ -434,6 +446,12 @@ class CarController(CarControllerBase):
     elif resume_btn and (self.frame % CarControllerParams.BUTTONS_STEP) == 0:
       can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.camera, CS.buttons_stock_values, resume=True))
       can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.main, CS.buttons_stock_values, resume=True))
+    # gasset2pnw: SET at the speed the driver just chose with the accelerator. Same 0x083 frame; the
+    # SET- bit is NOT panda-gated (ford.h only validates the cancel and resume bits), so this needs
+    # no panda change -- exactly as ICBM's SET+/- taps do not.
+    elif set_btn and (self.frame % CarControllerParams.BUTTONS_STEP) == 0:
+      can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.camera, CS.buttons_stock_values, set_dec=True))
+      can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.main, CS.buttons_stock_values, set_dec=True))
     # if stock lane centering isn't off, send a button press to toggle it off
     # the stock system checks for steering pressed, and eventually disengages cruise control
     elif CS.acc_tja_status_stock_values["Tja_D_Stat"] != 0 and (self.frame % CarControllerParams.ACC_UI_STEP) == 0:
