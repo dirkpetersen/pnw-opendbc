@@ -275,3 +275,43 @@ def test_nothing_is_pressed_without_an_offer():
   assert not any(p.update(f, None, True) for f in range(100))
   assert not any(p.update(f, cmd(), False) for f in range(100, 200))
   assert p.used_eid is None
+
+
+# --- gasset2pnw: the latActive fold-in must not burn the eid ------------------------------------
+
+def test_a_blocked_SET_does_not_burn_the_eid():
+  """Fable review 2026-09-07 -- reproduced, and the reason the check is folded into `ok` inside
+  _resume_button rather than applied to its RESULT.
+
+  ResumePress latches `_used_eid` on the first frame it returns True, and refuses that eid forever
+  after. So checking CC.latActive AFTERWARDS consumed the episode while sending ZERO taps: no press,
+  no record, the offer unusable for good, and the brain reporting `fire` and then `verify: noCruise`
+  ten seconds later -- pointing the reader at the panda for what was an executor refusal.
+
+  Folded in, a blocked frame simply does not press, and the offer survives to be pressed the moment
+  latActive returns inside its window."""
+  from opendbc.car.ford.icbm_pnw import ResumePress, ResumeCommand, SET_DIR
+  cmd = ResumeCommand(ts=100.0, eid=123.456, set_ms=18.0, mode=SET_DIR)
+  rp = ResumePress()
+
+  # 20 frames with the SET blocked by latActive -- this is what `ok=False` encodes
+  taps = [rp.update(f, cmd, False) for f in range(20)]
+  assert not any(taps), "a blocked SET must send no taps"
+  assert rp.used_eid is None, \
+    f"a blocked SET must NOT consume the eid (got {rp.used_eid}) -- burning it kills the offer"
+
+  # latActive returns, still inside the offer window -> the press lands
+  assert rp.update(20, cmd, True), "the offer must still be pressable once latActive returns"
+  assert rp.used_eid == 123.456, "and only then is the eid consumed"
+
+
+def test_a_burned_eid_is_never_pressed_again():
+  """The other half of the same latch: once an eid HAS been spent, no later frame may press it."""
+  from opendbc.car.ford.icbm_pnw import ResumePress, ResumeCommand, SET_DIR
+  cmd = ResumeCommand(ts=100.0, eid=200.0, set_ms=18.0, mode=SET_DIR)
+  rp = ResumePress()
+  assert rp.update(0, cmd, True), "first frame presses"
+  for f in range(1, 60):
+    rp.update(f, cmd, True)
+  assert rp.used_eid == 200.0
+  assert not rp.update(200, cmd, True), "a spent eid must never press again"

@@ -25,6 +25,13 @@ class CarState(CarStateBase):
     # event because openpilot cannot infer the press from CcStat_D_Actl alone -- see the rising-edge
     # comment at its use site below.
     self.main_button = 0
+    # onebutton2pnw: RES / SET+ / SET- presses. Ford emitted NO cruise ButtonTypes at all before
+    # this (only gapAdjustCruise and lkas), so anything upstream or downstream that keys on
+    # accelCruise/decelCruise/resumeCruise silently never fired on this brand -- including the
+    # off-request latch's "the driver changed their mind" clear, which was dead code until now.
+    self.res_button = 0
+    self.set_inc_button = 0
+    self.set_dec_button = 0
 
     # cargps2pnw: /dev/shm handle for publishing the truck's own GPS fix, plus a decimator. Same
     # pattern as fordlatui2pnw's FordLatStatus: an independent mem-param handle, fully guarded, so a
@@ -107,9 +114,15 @@ class CarState(CarStateBase):
     prev_distance_button = self.distance_button
     prev_lc_button = self.lc_button
     prev_main_button = self.main_button
+    prev_res_button = self.res_button
+    prev_set_inc_button = self.set_inc_button
+    prev_set_dec_button = self.set_dec_button
     self.distance_button = cp.vl["Steering_Data_FD1"]["AccButtnGapTogglePress"]
     self.lc_button = bool(cp.vl["Steering_Data_FD1"]["TjaButtnOnOffPress"])
     self.main_button = int(cp.vl["Steering_Data_FD1"]["CcButtnOnOffPress"])
+    self.res_button = int(cp.vl["Steering_Data_FD1"]["CcAsllButtnResPress"])
+    self.set_inc_button = int(cp.vl["Steering_Data_FD1"]["CcAslButtnSetIncPress"])
+    self.set_dec_button = int(cp.vl["Steering_Data_FD1"]["CcAslButtnSetDecPress"])
 
     # lock info
     ret.doorOpen = any([cp.vl["BodyInfo_3_FD1"]["DrStatDrv_B_Actl"], cp.vl["BodyInfo_3_FD1"]["DrStatPsngr_B_Actl"],
@@ -140,6 +153,13 @@ class CarState(CarStateBase):
       # and the PRESS itself has to be surfaced. Nothing else in openpilot acts on mainCruise
       # (only Hyundai's own interface lists it), so this is inert for every other consumer.
       *create_button_events(self.main_button, prev_main_button, {1: ButtonType.mainCruise}),
+      # The driver's own ENGAGE presses. Read from bus 0, which carries the SCCM's frames only --
+      # openpilot's own RES/SET taps go out on sendcan and do NOT come back as RX here (verified
+      # 2026-09-07: a RESUME tapped at t=80.2 appears in sendcan and in NO bus-0 button event), so
+      # these cannot be self-triggered by our own presses.
+      *create_button_events(self.res_button, prev_res_button, {1: ButtonType.resumeCruise}),
+      *create_button_events(self.set_inc_button, prev_set_inc_button, {1: ButtonType.accelCruise}),
+      *create_button_events(self.set_dec_button, prev_set_dec_button, {1: ButtonType.decelCruise}),
     ]
 
     self._publish_car_gps(cp)

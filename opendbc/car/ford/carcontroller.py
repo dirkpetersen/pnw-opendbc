@@ -277,6 +277,7 @@ class CarController(CarControllerBase):
     self._resume_cmd = None
     self._resume_press = None
     self._resume_get_fail = 0
+    self._resume_lat_block = 0     # consecutive frames a SET offer was held back by latActive
     self._resume_enabled = veh.mads_resume and self._icbm_params is not None
     if veh.mads_resume and self._icbm_params is None:
       # Fable S1: this car HAS the capability but the mem-param store never came up, so the executor
@@ -291,7 +292,7 @@ class CarController(CarControllerBase):
         carlog.exception("madsresume2pnw: ResumePress import/construction FAILED -- auto-resume executor is INERT")
         self._resume_enabled = False
 
-  def _resume_button(self, CS) -> bool:
+  def _resume_button(self, CS, lat_active: bool) -> bool:
     """madsresume2pnw: poll MadsResumeTarget at 4 Hz, gate it against the real car state at 100 Hz,
     and assert RESUME for exactly one press per offer. Returns True on the frames the button should
     be asserted. NEVER raises into the control path.
@@ -300,7 +301,7 @@ class CarController(CarControllerBase):
     here: `cruise_enabled` must be FALSE -- RES while ACC is engaged is a SET+ on Ford, and raising
     the driver's set speed is the single thing this feature must never do."""
     import time
-    from opendbc.car.ford.icbm_pnw import decide_resume, parse_resume_cmd
+    from opendbc.car.ford.icbm_pnw import SET_DIR, decide_resume, parse_resume_cmd
     # 4 Hz while idle (nothing to act on), but EVERY FRAME once a command is in hand.
     # Gemini review 2026-09-06: at a flat 4 Hz this held a CACHED command for up to 250 ms after the
     # brain cleared the mem-param, and since the cached `ts` was still inside RESUME_STALE_LIMIT_S
@@ -321,6 +322,27 @@ class CarController(CarControllerBase):
                        bool(CS.out.cruiseState.enabled), bool(CS.out.cruiseState.available),
                        bool(CS.out.gasPressed or CS.out.brakePressed),
                        float(CS.out.cruiseState.speed))
+    # The SET path's latActive check is folded in HERE, ahead of the eid latch, never applied to its
+    # result (Fable review 2026-09-07 round 3, finding D -- reproduced). ResumePress latches
+    # `_used_eid` on the first frame it returns True, one press per eid ever. Checking latActive
+    # AFTERWARDS therefore BURNED the eid while sending zero taps: no press, no record, the offer
+    # unusable forever, and the brain reporting `fire` and then `verify: noCruise` 10 s later.
+    # Folded in, a False simply means no frame goes out and the offer survives until latActive
+    # returns inside the offer window.
+    if self._resume_cmd is None:
+      # No offer standing: clear the blocked-frame counter. Without this it is left orphaned above
+      # zero when a blocked SET offer simply expires, and the NEXT blocked episode never hits the
+      # `== 1` branch -- so its first warning is swallowed and the throttle reports nothing until
+      # frame 500 (Gemini verification pass 2026-09-07, finding A).
+      self._resume_lat_block = 0
+    elif self._resume_cmd.mode == SET_DIR and not lat_active:
+      ok = False
+      # Rule 2: an executor-side refusal the brain cannot see must not be silent.
+      self._resume_lat_block += 1
+      if self._resume_lat_block == 1 or self._resume_lat_block % 500 == 0:
+        carlog.warning(f"madsresume2pnw: SET offer standing but CC.latActive is False -- not pressing (frames: {self._resume_lat_block})")
+    elif ok:
+      self._resume_lat_block = 0
     return self._resume_press.update(self.frame, self._resume_cmd, ok)
 
   def _parse_button_cmd(self, raw):
@@ -416,13 +438,14 @@ class CarController(CarControllerBase):
     set_btn = False
     if self._resume_enabled:
       try:
-        if self._resume_button(CS):
-          # gasset2pnw: same one-shot latch, two different buttons. "res" hands back the driver's
-          # remembered set speed (RESUME); "set" establishes the speed they just chose with the
-          # accelerator. SET- is used for the latter because it is the tap ICBM already proves on
-          # this truck, and because in the impossible case that ACC were somehow engaged it moves
-          # the set speed DOWN, never up.
-          from opendbc.car.ford.icbm_pnw import SET_DIR
+        # gasset2pnw: same one-shot latch, two different buttons. "res" hands back the driver's
+        # remembered set speed (RESUME); "set" establishes the speed they just chose with the
+        # accelerator. SET- is used for the latter because it is the tap ICBM already proves on this
+        # truck, and because in the impossible case that ACC were somehow engaged it moves the set
+        # speed DOWN, never up. The SET latActive gate lives inside _resume_button, ahead of the eid
+        # latch -- see there for what that check is and is not worth.
+        from opendbc.car.ford.icbm_pnw import SET_DIR
+        if self._resume_button(CS, bool(CC.latActive)):
           if self._resume_cmd is not None and self._resume_cmd.mode == SET_DIR:
             set_btn = True
           else:
