@@ -126,7 +126,9 @@ def test_a_press_in_Drive_says_so_in_the_log():
 
   b = fresh()
   run(b, PPO_SETTLE_S + 1.0, parked=True)
-  assert "in Park" in b.take_note()
+  note_b = b.take_note()
+  # "in Park" alone is satisfied by "NOT in Park" -- the assertion has to exclude it (Fable review)
+  assert "in Park" in note_b and "NOT" not in note_b, note_b
 
 
 def test_moving_is_still_refused_regardless_of_gear():
@@ -299,3 +301,34 @@ def test_a_dead_can_bus_never_produces_a_press():
   assert armer.attempts == 0
   # ...and it starts working the moment the bus comes back
   assert run(armer, PPO_SETTLE_S + PPO_PRESS_S, can_valid=True) != []
+
+
+def test_stop_and_go_creep_cannot_machine_gun_the_body_button():
+  """ppostandstill2pnw (Fable review 2026-09-09). THE regression this change could have introduced.
+
+  The attempt cap used to be enforced only in the VERIFYING branch, so a press ABORTED by movement
+  never counted. With the old Park gate that was self-limiting. With standstill-only, every brief
+  stop in stop-and-go traffic starts a fresh press: simulated at 60 presses / 180 frames in 60 s of
+  creep before the fix, phase never reaching FAILED.
+
+  Creep pattern: 0.3 s stopped (shorter than PPO_PRESS_S, so every press aborts), 0.7 s rolling."""
+  a = fresh()
+  frames = []
+  t = 0.0
+  # get past the settle window first, stopped
+  for _ in range(int(PPO_SETTLE_S / DT) + 10):
+    a.update(PpoInputs(now=t, standstill=False, parked=False, state_valid=True,
+                       ppo_on=False, enabled=True, can_valid=True))
+    t += DT
+  for _cycle in range(60):                       # 60 s of creep
+    for stopped, secs in ((True, 0.3), (False, 0.7)):
+      for _ in range(int(secs / DT)):
+        p = a.update(PpoInputs(now=t, standstill=stopped, parked=False, state_valid=True,
+                               ppo_on=False, enabled=True, can_valid=True))
+        if p is not None:
+          frames.append(p)
+        t += DT
+  assert a.attempts <= PPO_MAX_ATTEMPTS, f"pressed {a.attempts} times in creep -- the cap must count aborts"
+  assert a.phase == ProPowerArmer.FAILED, "and it must STOP, not sit in IDLE re-pressing forever"
+  assert len(frames) <= PPO_MAX_ATTEMPTS * int(PPO_PRESS_S / DT) + 5, \
+    f"{len(frames)} frames handed to pandad in 60 s of creep"

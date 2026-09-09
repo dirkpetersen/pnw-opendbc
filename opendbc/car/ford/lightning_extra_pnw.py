@@ -233,6 +233,22 @@ class ProPowerArmer:
       self._say("already armed; nothing to do")
       return None
 
+    # ppostandstill2pnw (Fable review 2026-09-09): the attempt cap MUST be enforced here, not only in
+    # VERIFYING. A press aborted by movement never reaches VERIFYING, so before this the counter
+    # climbed and the cap never fired. Under the old Park gate that was rare and self-limiting -- you
+    # had to leave Park mid-press, and could not press again without returning to Park. Under the
+    # standstill-only gate every sub-0.5 s stop in stop-and-go traffic is a fresh press: simulated,
+    # 60 presses / 180 frames in 60 s of creep, phase never reaching FAILED. That is exactly the
+    # "body-button machine gun" the bound below exists to make impossible, and the envelope note
+    # claiming the cap "matters MORE, not less" was not true until this existed.
+    # Accepted trade-off: three creep-aborts before a real stop now burn the cycle. Correct priority
+    # for a comfort feature -- a spent budget is a missed convenience, an unbounded one is a body
+    # module being hammered.
+    if self.attempts >= PPO_MAX_ATTEMPTS:
+      self.phase = self.FAILED
+      self._say(f"gave up: {self.attempts} presses started, none confirmed -- not pressing again this ignition")
+      return None
+
     self.attempts += 1
     self.phase = self.PRESSING
     self._press_until = i.now + PPO_PRESS_S
