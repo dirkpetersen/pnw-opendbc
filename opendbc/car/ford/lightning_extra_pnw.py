@@ -39,11 +39,35 @@ Pure decision logic — no CAN, no params, no I/O — so the whole envelope is u
 (ford/carcontroller.py) supplies car state and sends the frame this returns.
 
 THE ENVELOPE, and why each bound exists
-  * STANDSTILL **AND IN PARK**. Pro Power is a parked-truck function (tools, a fridge, a campsite).
-    Standstill alone is not enough: `card` restarts on crash, so a fresh armer can appear mid-drive
-    and would otherwise press at the next red light, in Drive. Park is the honest expression of
-    "parked" (CLAUDE.md rule 3: IsOnroad is not "being driven", the gear is). The panda enforces the
-    standstill half independently, in C, from the same ABS signal.
+  * STANDSTILL. Any standstill -- the gear is NOT required to be Park.
+
+    ppostandstill2pnw (2026-09-09), an EXPLICIT DRIVER DECISION that relaxes a bound this file used
+    to hold. It previously also required Park, reasoning: "`card` restarts on crash, so a fresh armer
+    can appear mid-drive and would otherwise press at the next red light, in Drive." That reasoning
+    was sound and the driver has now overruled its conclusion, in these words: "why does it have to
+    be in park ... this is not a driving critical function I just wanted it to be on."
+
+    What forced the question: on 2026-09-09 the truck was started and driven away within 16 s, so the
+    armer never saw Park-at-standstill and Pro Power stayed OFF for the whole drive -- with a cooler
+    of food in the back. Park-only means the ONLY chance to arm is the driver happening to sit still
+    in Park with the ignition on. Any standstill turns that into "the first red light".
+
+    So a press can now occur at a stop light, in Drive, possibly with openpilot ENGAGED. Weighed:
+      - the panda still refuses the frame while the truck is moving (ford.h `!vehicle_moving`, from
+        the ABS signal, independent of anything here) -- that half is NOT relaxed and is not ours to
+        relax without a reflash;
+      - the payload is still pinned in C to the single "press, request ON" byte, so no state here can
+        turn the driver's setting OFF or emit anything else;
+      - it is a BODY module button, not a control message. Nothing about propulsion, steering or
+        braking is addressed by 0x455;
+      - the attempt cap below is unchanged and now matters MORE, not less.
+    Accepted cost, stated plainly: the duplicate-ID exposure documented in PRO-POWER-CAN-CONTROL.md
+    (we transmit 0x455 while its real sender also transmits it) no longer happens only in Park with
+    openpilot idle. Measured on the truck 2026-09-08 it produced ZERO new CAN errors across a 6-frame
+    press -- bus-0 totalErrorCnt stayed at 1 over 2,412 pandaStates samples -- but that was one
+    observation of a rare event, in Park. It is now also possible while stopped and engaged.
+  * ABORT THE MOMENT THE TRUCK MOVES. Unchanged, and it is what makes the above bounded: a press in
+    progress stops transmitting immediately if standstill drops.
   * AT MOST MAX_ATTEMPTS PRESSES PER `card` PROCESS, and only while the state reads OFF. The truck forgets the setting once per
     cycle, so re-arming it is a once-per-cycle job. An unbounded retry loop mashing a body button is
     exactly the failure this bound exists to make impossible.
@@ -90,7 +114,10 @@ class PpoInputs:
   """One tick of everything the decision is allowed to see. Plain python only."""
   now: float           # monotonic seconds
   standstill: bool     # the outer bound: nothing happens unless the truck is stopped
-  parked: bool         # gearShifter == park; see the envelope note about card restarts mid-drive
+  # ppostandstill2pnw: DIAGNOSTIC ONLY since 2026-09-09 -- `parked` is reported in the log line but
+  # no longer gates the press (see THE ENVELOPE). Kept on the input so a drive log can tell a Park
+  # arm from a red-light arm.
+  parked: bool         # gearShifter == park
   state_valid: bool    # both state signals have been seen this drive
   ppo_on: bool         # the latched state: True = Pro Power is armed for engine-off
   enabled: bool        # feature master (currently always True; a place for a future opt-out)
@@ -150,18 +177,19 @@ class ProPowerArmer:
     if not i.can_valid:
       return None
 
-    if not (i.standstill and i.parked):
+    # ppostandstill2pnw: STANDSTILL ONLY. `parked` is still carried on PpoInputs and still reported
+    # in the log line below, because "where was it standing when it pressed" is exactly what a drive
+    # log needs to answer -- but it no longer gates.
+    if not i.standstill:
       if self.phase == self.PRESSING:
         self.phase = self.IDLE
-        self._say("aborted: truck moved or left Park mid-press")
+        self._say("aborted: truck moved mid-press")
       elif not self._said_blocked and (i.now - self._t0) > PPO_SETTLE_S * 2:
         # Rule 2. "Held at the gate" and "nothing to do" used to look identical from the log, and a
         # dead `parked` test therefore read as a working feature for a whole ignition cycle. Name
         # the gate that is holding, once.
         self._said_blocked = True
-        held = " and ".join([n for n, ok in (("not at a standstill", i.standstill),
-                                             ("not in Park", i.parked)) if not ok])
-        self._say(f"idle after {PPO_SETTLE_S * 2:.0f}s -- held because the truck is {held}")
+        self._say(f"idle after {PPO_SETTLE_S * 2:.0f}s -- held because the truck is not at a standstill")
       return None
 
     if self.phase == self.PRESSING:
@@ -208,5 +236,8 @@ class ProPowerArmer:
     self.attempts += 1
     self.phase = self.PRESSING
     self._press_until = i.now + PPO_PRESS_S
-    self._say(f"pressing to arm Pro Power (attempt {self.attempts})")
+    # ppostandstill2pnw: name the gear. A press in Drive is now legitimate, so a drive log must be
+    # able to distinguish "armed while parked up" from "armed at a red light" without inference.
+    where = "in Park" if i.parked else "at a standstill, NOT in Park"
+    self._say(f"pressing to arm Pro Power {where} (attempt {self.attempts})")
     return PPO_PRESS_ON

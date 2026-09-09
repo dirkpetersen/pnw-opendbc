@@ -98,13 +98,44 @@ def test_a_never_reported_state_says_so_once_instead_of_sitting_silent():
   assert a.attempts == 0, "and it must still never have pressed"
 
 
-def test_it_will_not_press_at_a_red_light_in_Drive():
-  """standstill alone is not 'parked'. `card` restarts on crash, so a fresh armer can appear
-  mid-drive; without the gear gate it would press at the next red light, in Drive (CLAUDE.md rule 3
-  -- the GEAR is the truth source)."""
+def test_it_DOES_press_at_a_red_light_in_Drive():
+  """ppostandstill2pnw (2026-09-09) — this test asserted the OPPOSITE until the driver overruled it.
+
+  The old bound was standstill AND Park, reasoning that a `card` restart mid-drive would otherwise
+  press at the next red light. Real consequence, 2026-09-09: the truck was started and driven away
+  within 16 s, the armer never saw Park-at-standstill, and Pro Power stayed OFF for the whole drive
+  with a cooler of food aboard. Driver: "why does it have to be in park ... this is not a driving
+  critical function I just wanted it to be on."
+
+  The panda's `!vehicle_moving` half is NOT relaxed and still bounds this in C."""
   a = fresh()
-  assert run(a, PPO_SETTLE_S + 5.0, parked=False) == [], "stopped but in Drive must send nothing"
-  assert a.attempts == 0
+  sent = run(a, PPO_SETTLE_S + 5.0, parked=False)
+  assert sent, "stopped in Drive must now press"
+  assert all(f == PPO_PRESS_ON for f in sent), "and only ever the ON-press payload"
+  # the stub never flips ppo_on, so it retries -- what matters is that it pressed AT ALL, and that
+  # relaxing the gear gate did not relax the attempt cap
+  assert 1 <= a.attempts <= PPO_MAX_ATTEMPTS
+
+
+def test_a_press_in_Drive_says_so_in_the_log():
+  """A red-light arm and a parked arm must be distinguishable in a drive log without inference."""
+  a = fresh()
+  run(a, PPO_SETTLE_S + 1.0, parked=False)
+  note = a.take_note()
+  assert "NOT in Park" in note, note
+
+  b = fresh()
+  run(b, PPO_SETTLE_S + 1.0, parked=True)
+  assert "in Park" in b.take_note()
+
+
+def test_moving_is_still_refused_regardless_of_gear():
+  """The bound that did NOT move. Relaxing Park must not have relaxed standstill."""
+  for parked in (True, False):
+    a = fresh()
+    assert run(a, PPO_SETTLE_S + 5.0, standstill=False, parked=parked) == [], \
+      f"a moving truck must never see a frame (parked={parked})"
+    assert a.attempts == 0
 
 
 def test_it_can_never_turn_pro_power_OFF():
@@ -234,15 +265,17 @@ def test_being_held_at_the_gate_eventually_says_so():
   run._t = 0.0
   assert armer.take_note() == ""
 
-  # never in Park -> the armer can never act, and must say which gate is holding it
-  run(armer, PPO_SETTLE_S * 2 + 1.0, parked=False)
+  # never at a standstill -> the armer can never act, and must say which gate is holding it
+  # (ppostandstill2pnw: this used to be parked=False; the gear no longer gates, so the only gate
+  # left to be held by is standstill)
+  run(armer, PPO_SETTLE_S * 2 + 1.0, standstill=False)
   assert armer.phase == ProPowerArmer.IDLE
   note = armer.take_note()
-  assert "not in Park" in note, note
+  assert "not at a standstill" in note, note
   assert armer.take_note() == "", "a note must be drained exactly once, not repeated every tick"
 
   # and it says it ONCE, not on every subsequent tick
-  run(armer, 30.0, parked=False)
+  run(armer, 30.0, standstill=False)
   assert armer.take_note() == ""
 
 
