@@ -82,9 +82,24 @@ THE ENVELOPE, and why each bound exists
     loudly and stop. We are spoofing an undocumented frame whose real sender keeps transmitting at
     10 Hz alongside us; whether the receiving module honours our copy is a question about the truck
     that could not be answered from a desk, and this is how it gets answered on the road.
-  * NEVER TURNS IT OFF. The only payload this module can emit is PPO_ON. If the driver has it ON
-    already we do nothing; if they turn it OFF deliberately after we have acted, we do not fight
-    them — we are done for the cycle.
+  * NEVER TURNS IT OFF. The only payload this module can emit is PPO_ON, pinned in the panda in C.
+    There is no path in this module, or reachable from it, that can request OFF.
+  * ...BUT IT DOES NOW TURN IT BACK ON, every PPO_REARM_S. ⚠️ THIS OVERTURNS THE SECOND HALF OF THE
+    RULE ABOVE, which used to read "if they turn it OFF deliberately after we have acted, we do not
+    fight them — we are done for the cycle." That is no longer true and the driver asked for exactly
+    that: "please rearm every 15 min".
+
+    Consequence, stated plainly because it is a real loss: THE DRIVER CAN NO LONGER TURN THIS OFF
+    AND HAVE IT STAY OFF while driving. Switch it off and it comes back within 15 minutes. There is
+    currently no opt-out short of the whole feature. If that becomes annoying the answer is a
+    settings toggle, not a shorter timer.
+
+    Why it is nonetheless right here: the thing being fought is not the driver, it is the TRUCK.
+    Measured 2026-09-09 (see PPO_REARM_S), a request-OFF press arrived from the truck side 19.6 s
+    after we armed it. Against that, one-shot-per-ignition loses every time.
+
+    Bounded: at most PPO_MAX_ATTEMPTS presses per re-arm window, so at most 3 per 15 min = 12/hour
+    worst case, each a 0.5 s pulse on a body-module button.
 """
 from dataclasses import dataclass
 
@@ -107,6 +122,20 @@ PPO_VERIFY_S = 3.0
 # Total presses per ignition cycle. Three is enough to ride out one dropped frame and small enough
 # that a misunderstanding of the protocol cannot become a body-button machine gun.
 PPO_MAX_ATTEMPTS = 3
+# pporearm2pnw (2026-09-09, driver: "please rearm every 15 min"). How long after finishing -- armed,
+# or out of attempts -- before the armer wakes up and looks again.
+#
+# THIS REVERSES THE "we do not fight the driver" CONTRACT, deliberately and at the driver's
+# instruction. Read the envelope note below before changing it.
+#
+# What produced the request, measured from raw CAN 2026-09-09:
+#     08:13:08.110  STATE  0 -> 1        our press armed it
+#     08:13:27.699  BUTTON byte1=0x00    a REQUEST-OFF press, 19.6 s later, six frames
+#     08:13:28.239  STATE  1 -> 0        off again
+# byte1 0x00 is "request OFF", which the panda physically forbids us from sending (the payload is
+# pinned in C to 0x40), so that press came from the truck side. Something clears the setting shortly
+# after it is set, and a one-shot-per-ignition armer can never win against that.
+PPO_REARM_S = 15 * 60.0
 
 
 @dataclass
@@ -138,6 +167,9 @@ class ProPowerArmer:
     self._t0 = None          # first tick we saw, for the settle window
     self._press_until = 0.0
     self._verify_until = 0.0
+    # pporearm2pnw: when to wake up and look again. None = never (the feature is genuinely inert, so
+    # retrying is pure noise); a float = re-arm at that monotonic time.
+    self._rearm_at = None
     self.note = ""           # last line said, for tests and introspection
     self._pending_note = ""  # drained by the caller via take_note(); see WHY below
     self._said_unread = False
@@ -164,8 +196,21 @@ class ProPowerArmer:
     if self._t0 is None:
       self._t0 = i.now
 
-    if not i.enabled or self.phase in (self.DONE, self.FAILED):
+    if not i.enabled:
       return None
+
+    if self.phase in (self.DONE, self.FAILED):
+      # pporearm2pnw: wake up and look again, rather than being finished for the ignition cycle.
+      if self._rearm_at is None or i.now < self._rearm_at:
+        return None
+      self.phase = self.IDLE
+      self.attempts = 0                 # a fresh budget per window -- see the envelope's bound
+      self._rearm_at = None
+      # let the one-shot diagnostics speak again in the new window: a feature that goes quiet after
+      # its first cycle is the failure mode this file already paid for once.
+      self._said_blocked = False
+      self._said_unread = False
+      self._say(f"re-arm window: {PPO_REARM_S / 60:.0f} min elapsed, checking Pro Power again")
 
     # Outer bound. A moving truck never sees a frame from this module, in any phase -- including
     # mid-press: if the driver pulls away while we are pressing, we stop transmitting immediately.
@@ -202,10 +247,12 @@ class ProPowerArmer:
     if self.phase == self.VERIFYING:
       if i.ppo_on:
         self.phase = self.DONE
+        self._rearm_at = i.now + PPO_REARM_S      # pporearm2pnw: look again in 15 min
         self._say(f"Pro Power armed after {self.attempts} press(es)")
       elif i.now >= self._verify_until:
         if self.attempts >= PPO_MAX_ATTEMPTS:
           self.phase = self.FAILED
+          self._rearm_at = i.now + PPO_REARM_S    # pporearm2pnw: the module may honour a later press
           self._say(" ".join([
             f"gave up after {self.attempts} presses -- the state bit never flipped.",
             "Either the panda is dropping the TX (0x455 must be in the Ford allowlist and the",
@@ -225,11 +272,16 @@ class ProPowerArmer:
         self._said_unread = True
         self._say("Pro Power state never reported on the bus -- feature inert this drive")
         self.phase = self.FAILED
+        # pporearm2pnw: deliberately NO re-arm here. The other terminal states are "it might work
+        # next time"; this one is "the truck never told us the state at all", and waking every
+        # 15 minutes to re-discover that is noise in the log with nothing to act on.
+        self._rearm_at = None
       return None
     if i.now - self._t0 < PPO_SETTLE_S:
       return None                                  # too early to trust the read
     if i.ppo_on:
       self.phase = self.DONE
+      self._rearm_at = i.now + PPO_REARM_S        # pporearm2pnw: it can be cleared later; look again
       self._say("already armed; nothing to do")
       return None
 
@@ -246,7 +298,8 @@ class ProPowerArmer:
     # module being hammered.
     if self.attempts >= PPO_MAX_ATTEMPTS:
       self.phase = self.FAILED
-      self._say(f"gave up: {self.attempts} presses started, none confirmed -- not pressing again this ignition")
+      self._rearm_at = i.now + PPO_REARM_S        # pporearm2pnw: creep-aborts should not end the drive
+      self._say(f"gave up: {self.attempts} presses started, none confirmed -- retrying in {PPO_REARM_S / 60:.0f} min")
       return None
 
     self.attempts += 1

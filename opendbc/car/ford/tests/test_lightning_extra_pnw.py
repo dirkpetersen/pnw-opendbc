@@ -4,6 +4,7 @@ Every bound in ProPowerArmer gets a test that FAILS if the bound is removed. The
 these drive it directly with a PpoInputs sequence.
 """
 from opendbc.car.ford.lightning_extra_pnw import (PPO_MAX_ATTEMPTS, PPO_PRESS_ON, PPO_PRESS_S,
+                                                  PPO_REARM_S,
                                                   PPO_SETTLE_S, PPO_VERIFY_S, PpoInputs,
                                                   ProPowerArmer)
 
@@ -332,3 +333,75 @@ def test_stop_and_go_creep_cannot_machine_gun_the_body_button():
   assert a.phase == ProPowerArmer.FAILED, "and it must STOP, not sit in IDLE re-pressing forever"
   assert len(frames) <= PPO_MAX_ATTEMPTS * int(PPO_PRESS_S / DT) + 5, \
     f"{len(frames)} frames handed to pandad in 60 s of creep"
+
+
+# ---------------------------------------------------------------------------------------------------
+# pporearm2pnw (2026-09-09, driver: "please rearm every 15 min")
+#
+# Measured from raw CAN the same morning, which is what the request is about:
+#     08:13:08.110  STATE  0 -> 1        our press armed it
+#     08:13:27.699  BUTTON byte1=0x00    a request-OFF press, 19.6 s later
+#     08:13:28.239  STATE  1 -> 0        off again
+# byte1 0x00 is "request OFF", which the panda forbids US from sending, so it came from the truck
+# side. A one-shot-per-ignition armer loses to that every time.
+
+def test_it_rearms_after_the_window_when_the_truck_clears_it():
+  """THE scenario. Arm it, let the truck clear it, and the armer must come back."""
+  a = fresh()
+  assert run(a, PPO_SETTLE_S + 1.0, ppo_on=False), "first press"
+  run(a, 1.0, ppo_on=True)                     # the truck confirms -> DONE
+  assert a.phase == ProPowerArmer.DONE
+  a.take_note()
+
+  # ...the truck clears it 20 s later. Before this change the armer was finished for the cycle.
+  assert run(a, 60.0, ppo_on=False) == [], "must NOT press again inside the window"
+
+  # after the window it wakes and presses again
+  sent = run(a, PPO_REARM_S, ppo_on=False)
+  assert sent, "the armer must re-arm after PPO_REARM_S"
+  assert all(f == PPO_PRESS_ON for f in sent), "still only ever the ON-press payload"
+
+
+def test_the_rearm_budget_is_bounded_per_window():
+  """At most PPO_MAX_ATTEMPTS presses per window -- the cap resets per window, it is not removed."""
+  a = fresh()
+  run(a, PPO_SETTLE_S + 1.0, ppo_on=False)
+  run(a, 30.0, ppo_on=False)                   # burn the budget: never confirmed
+  assert a.attempts <= PPO_MAX_ATTEMPTS
+  assert a.phase == ProPowerArmer.FAILED
+  a.take_note()
+  # one window later it must be able to press AGAIN -- asserting `attempts <= MAX` alone is VACUOUS
+  # (without the reset, attempts stays at MAX and the cap fires instantly, which also satisfies it).
+  # The property that matters is that frames actually come out.
+  sent = run(a, PPO_REARM_S + 30.0, ppo_on=False)
+  assert sent, "a fresh window must grant a fresh budget, not stay exhausted"
+  assert a.attempts <= PPO_MAX_ATTEMPTS, "...but still bounded within the new window"
+
+
+def test_an_already_armed_check_also_schedules_the_next_look():
+  """"already armed; nothing to do" must NOT mean "finished forever" -- that is exactly the state the
+  truck then clears out from under us."""
+  a = fresh()
+  run(a, PPO_SETTLE_S + 1.0, ppo_on=True)
+  assert a.phase == ProPowerArmer.DONE
+  a.take_note()
+  assert run(a, PPO_REARM_S + 1.0, ppo_on=False), "must look again and press once it reads OFF"
+
+
+def test_a_truck_that_never_reports_state_does_NOT_rearm():
+  """The one terminal state with no re-arm: if the state was never on the bus, waking every 15 min to
+  re-discover that is noise in the log with nothing to act on."""
+  a = fresh()
+  run(a, PPO_SETTLE_S * 2 + 2.0, state_valid=False)
+  assert a.phase == ProPowerArmer.FAILED
+  a.take_note()
+  assert run(a, PPO_REARM_S * 3, state_valid=False) == []
+  assert a.take_note() == "", "and it must stay quiet, not re-announce every window"
+
+
+def test_it_still_cannot_press_while_moving_after_a_rearm():
+  """The bound that must survive every change here."""
+  a = fresh()
+  run(a, PPO_SETTLE_S + 1.0, ppo_on=True)
+  a.take_note()
+  assert run(a, PPO_REARM_S + 5.0, ppo_on=False, standstill=False) == []
