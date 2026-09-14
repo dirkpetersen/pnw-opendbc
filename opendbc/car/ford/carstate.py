@@ -242,6 +242,8 @@ class CarState(CarStateBase):
     if self._gear_seen_logged:
       return
     now = cp._last_update_nanos
+    if now == 0:
+      return        # no CAN batch yet: starting the wait at 0 would make the first real batch look ages late
     if self._gear_wait_start_nanos is None:
       self._gear_wait_start_nanos = now
     waited = (now - self._gear_wait_start_nanos) / 1e9

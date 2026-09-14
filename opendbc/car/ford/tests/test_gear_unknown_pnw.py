@@ -41,14 +41,14 @@ class Truck:
   """A Lightning CarInterface plus a clock. The gear decode needs the automatic branch, which the
   interface picks from Gear_Shift_by_Wire_FD1 (0x5A) in the fingerprint."""
 
-  def __init__(self, transmission_addr=0x5A):
+  def __init__(self, transmission_addr=0x5A, t0=0):
     CarInterface = interfaces[LIGHTNING]
     fp = gen_empty_fingerprint()
     if transmission_addr is not None:
       fp[0][transmission_addr] = 8
     self.CI = CarInterface(CarInterface.get_params(LIGHTNING, fp, [], False, False, False))
     self.packer = CANPacker(DBC)
-    self.t = 0
+    self.t = t0
     self.cs = self.CI.update([(self.t, [])])      # first update registers the messages, as in card
 
   def frame(self, msg, values):
@@ -66,6 +66,16 @@ class Truck:
   def other_traffic(self):
     # a real powertrain frame that is not the gear message: the bus is alive, the PCM is not talking
     return self.frame("Yaw_Data_FD1", {"VehYaw_W_Actl": 0.0})
+
+  def all_registered(self, trn_rng):
+    """One frame of EVERY alive-checked message both parsers registered, on its own bus, so canValid can be True."""
+    frames = [self.gear(trn_rng)]
+    for parser in self.CI.can_parsers.values():
+      for st in parser.message_states.values():
+        if not st.ignore_alive and st.name != "PowertrainData_10":
+          addr, dat, _ = self.packer.make_can_msg(st.name, parser.bus, {})
+          frames.append(CanData(addr, dat, parser.bus))
+    return frames
 
   def run(self, seconds, *frames):
     for _ in range(int(round(seconds * 100))):
@@ -134,6 +144,31 @@ class TestOnceReceived:
     assert truck.run(1, truck.gear(0)).gearShifter == GearShifter.park
 
 
+class TestWithValidCan:
+  """The tests above never make canValid True. Here every registered message is on the bus."""
+
+  def test_all_messages_present_is_valid_and_decodes(self, logs):
+    truck = Truck()
+    for trn_rng, gear in ((0, GearShifter.park), (3, GearShifter.drive), (1, GearShifter.reverse), (0, GearShifter.park)):
+      cs = truck.run(2, *truck.all_registered(trn_rng))
+      assert cs.canValid
+      assert cs.gearShifter == gear
+
+  def test_valid_can_from_the_first_frame_never_reports_unknown(self, logs):
+    truck = Truck()
+    frames = truck.all_registered(3)
+    gears = [truck.tick(*frames).gearShifter for _ in range(300)]
+    assert all(g == GearShifter.drive for g in gears)   # compare enums, never a set (capnp enums do not hash as ints)
+    assert truck.cs.canValid
+
+  def test_losing_only_the_gear_message_holds_it_and_invalidates(self, logs):
+    truck = Truck()
+    truck.run(2, *truck.all_registered(3))
+    others = truck.all_registered(3)[1:]
+    cs = truck.run(5, *others)
+    assert cs.gearShifter == GearShifter.drive and not cs.canValid
+
+
 class TestLogging:
   def test_first_received_logged_once(self, logs):
     truck = Truck()
@@ -166,6 +201,16 @@ class TestLogging:
     truck.run(1, truck.gear(0))
     assert [lvl for lvl, m in logs] == ["error", "warning"]
     assert truck.cs.gearShifter == GearShifter.park
+
+  def test_first_update_without_a_batch_does_not_fake_a_long_wait(self, logs):
+    # card-like clock: logMonoTime is nanoseconds since boot, so the first real batch is far from 0
+    truck = Truck(t0=0)
+    truck.t = 600 * 10**9                          # the first real batch arrives 10 minutes of uptime later
+    truck.run(ford_carstate.GEAR_MISSING_LOG_S - 0.5, truck.other_traffic())
+    assert [m for lvl, m in logs if "not received" in m] == []
+    truck.run(1, truck.gear(0))
+    firsts = [m for lvl, m in logs if "first received" in m]
+    assert len(firsts) == 1 and " 9.5 s " in firsts[0]
 
   def test_normal_start_is_one_line(self, logs):
     truck = Truck()
