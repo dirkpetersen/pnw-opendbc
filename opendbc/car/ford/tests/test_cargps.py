@@ -124,3 +124,86 @@ class TestGpsBusRegistration:
       cp.update([[t, []]])
       last = cp.can_valid
     assert not last, "control failed: parser must still enforce its REAL messages"
+
+
+class TestDeadReckoningFlag:
+  """truckdecode2pnw: 0x463 APIMGPS_Data_Nav_2_FD1 GPS_Actual_vs_Infer_pos reaches CarGps as `dr` / `drAge`.
+
+  Every frame below is a REAL payload from a local Lightning rlog, sent through the real Ford CarInterface.update
+  (the same path card runs), so the bus, the DBC bit position and the decimated publish are all exercised:
+    DR = 1  -- 0000012f--817cabeb76--1, Sat 2026-09-12 06:25 PT, the NF Road 70 cold start (HDOP 3.8)
+    DR = 0  -- 00000131--4c7547abb4--10, Sat 2026-09-12 12:25 PT, normal driving (HDOP 0.4)
+    1 -> 0  -- 00000132--592eb3d350--6, Sat 2026-09-12 14:18:44/45 PT, two consecutive frames
+  """
+  COLD = {0x462: "84120b361d725260", 0x463: "686488a956808000", 0x464: "f89eb022040a9898"}
+  NORMAL = {0x462: "83e26b461c94299c", 0x463: "9864844916808000", 0x464: "faaf2022fd221020"}
+  RECOVER_BEFORE, RECOVER_AFTER = "a848b02956808000", "a848b42916808000"
+
+  class _Capture:
+    def __init__(self):
+      self.blobs = []
+
+    def put_nonblocking(self, key, val):
+      assert key == "CarGps"
+      self.blobs.append(dict(val))
+
+  def _truck(self):
+    from opendbc.car import gen_empty_fingerprint
+    from opendbc.car.car_helpers import interfaces
+    from opendbc.car.ford.values import CAR
+    CarInterface = interfaces[CAR.FORD_F_150_LIGHTNING_MK1]
+    fp = gen_empty_fingerprint()
+    fp[0][0x5A] = 8
+    CI = CarInterface(CarInterface.get_params(CAR.FORD_F_150_LIGHTNING_MK1, fp, [], False, False, False))
+    cap = self._Capture()
+    CI.CS._cargps_params = cap
+    return CI, cap
+
+  @staticmethod
+  def _run(CI, seconds, frames, t0=0):
+    """100 Hz updates; `frames` {addr: hex} are sent once per second on bus 0, as the GWM does."""
+    t = t0
+    for i in range(int(seconds * 100)):
+      t += 10_000_000
+      batch = [(a, bytes.fromhex(h), 0) for a, h in frames.items()] if i % 100 == 0 else []
+      CI.update([(t, batch)])
+    return t
+
+  def test_real_cold_start_frame_is_inferred(self):
+    CI, cap = self._truck()
+    self._run(CI, 3, self.COLD)
+    assert cap.blobs, "nothing published"
+    assert cap.blobs[-1]["dr"] == 1
+    assert cap.blobs[-1]["hdop"] == pytest.approx(3.8)       # the position publish itself is unchanged
+
+  def test_real_normal_frame_is_actual(self):
+    CI, cap = self._truck()
+    self._run(CI, 3, self.NORMAL)
+    assert cap.blobs[-1]["dr"] == 0
+    assert cap.blobs[-1]["hdop"] == pytest.approx(0.4)
+
+  def test_real_recovery_transition(self):
+    CI, cap = self._truck()
+    t = self._run(CI, 3, {**self.NORMAL, 0x463: self.RECOVER_BEFORE})
+    assert cap.blobs[-1]["dr"] == 1
+    self._run(CI, 3, {**self.NORMAL, 0x463: self.RECOVER_AFTER}, t0=t)
+    assert cap.blobs[-1]["dr"] == 0
+
+  def test_absent_nav2_is_None_and_the_position_still_publishes(self):
+    """0x463 is OPTIONAL: its absence must never cost the position fix (gpssel2pnw selects on it)."""
+    CI, cap = self._truck()
+    self._run(CI, 3, {a: h for a, h in self.COLD.items() if a != 0x463})
+    assert cap.blobs, "a missing 0x463 stopped the position publish"
+    assert cap.blobs[-1]["dr"] is None and cap.blobs[-1]["drAge"] is None
+    assert cap.blobs[-1]["lat"] == pytest.approx(43.067862, abs=1e-6)    # the real NF Road 70 fix, Klamath Co.
+    assert cap.blobs[-1]["lon"] == pytest.approx(-121.958787, abs=1e-6)
+
+  def test_drAge_grows_when_nav2_stops_but_the_fix_keeps_coming(self):
+    """A stale flag must not read as live: `drAge` is the Nav_2 frame's own age, not the fix's."""
+    CI, cap = self._truck()
+    t = self._run(CI, 2, self.COLD)
+    assert cap.blobs[-1]["drAge"] <= 1.0
+    self._run(CI, 5, {a: h for a, h in self.COLD.items() if a != 0x463}, t0=t)
+    assert cap.blobs[-1]["dr"] == 1                           # last value held ...
+    assert cap.blobs[-1]["drAge"] >= 4.0                      # ... and visibly old
+    assert cap.blobs[-1]["age"] <= 1.0                        # while the fix itself is fresh

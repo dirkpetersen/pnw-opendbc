@@ -307,6 +307,21 @@ class CarState(CarStateBase):
       lon_deg = float(nav1["GPS_Longitude_Degrees"])
       if lat_deg == 0.0 and lon_deg == 0.0:
         return                            # no fix yet -- publish nothing rather than 0,0
+      # truckdecode2pnw: the GWM's own position-source flag, 0x463 GPS_Actual_vs_Infer_pos (1 =
+      # "Inferred_Position", i.e. dead reckoning; 0 = "Actual_Postition"). Telemetry only. Measured on all
+      # 24 local Lightning rlog segments (drives/2026-09-12/central-oregon-weekend/TRUCK_DECODE.md): 1 on all
+      # 243 frames of the Sat 09-12 06:24 PT cold start (HDOP 3.8-5.4), 0 on all 1,140 frames of 22
+      # normal-driving segments, and one 1 -> 0 transition, parked (Sat 14:18:45 PT, HDOP already 1.0).
+      # OPTIONAL: a missing 0x463 must never stop the position publish above, so it is not in the guard;
+      # `dr` is None until a frame has arrived (ts_nanos stays 0 until then, see _read_pro_power), and
+      # `drAge` is the frame's own age on the parser clock, like `age`, so the consumer can tell a stale
+      # flag from a live one (the wrong-bus lesson below).
+      dr = dr_age = None
+      if "APIMGPS_Data_Nav_2_FD1" in cp.vl:
+        nav2_ns = int(cp.ts_nanos["APIMGPS_Data_Nav_2_FD1"]["GPS_Actual_vs_Infer_pos"])
+        if nav2_ns != 0:
+          dr = int(cp.vl["APIMGPS_Data_Nav_2_FD1"]["GPS_Actual_vs_Infer_pos"])
+          dr_age = round((cp._last_update_nanos - nav2_ns) / 1e9, 2)
       self._cargps_params.put_nonblocking("CarGps", {
         "lat": round(_dm_to_deg(lat_deg, nav1["GPS_Latitude_Minutes"], nav1["GPS_Latitude_Min_dec"]), 6),
         "lon": round(_dm_to_deg(lon_deg, nav1["GPS_Longitude_Minutes"], nav1["GPS_Longitude_Min_dec"]), 6),
@@ -325,6 +340,8 @@ class CarState(CarStateBase):
         # disagree, and clamping would turn that into a permanent "age 0.0", i.e. the exact
         # reads-as-live failure this commit exists to fix (Fable, 2026-09-05).
         "age": round((cp._last_update_nanos - last_ns) / 1e9, 2),
+        "dr": dr,
+        "drAge": dr_age,
       })
     except Exception:
       # Rule 2: silence here is what let the wrong-bus bug run a whole drive. The catch itself has to
@@ -347,7 +364,9 @@ class CarState(CarStateBase):
   # with no SYNC nav, an asleep APIM, or a GPS fault would render the CAR UNUSABLE for a telemetry
   # field. nan makes that impossible: the messages are decoded when present and simply absent
   # otherwise.
-  GPS_MSGS = ("APIMGPS_Data_Nav_1_FD1", "APIMGPS_Data_Nav_3_FD1")
+  # truckdecode2pnw: Nav_2 (0x463) carries the dead-reckoning flag. Same bus (measured: 60 frames per 60 s
+  # segment on src 0 in all 24 local Lightning rlog segments), same nan registration, same DBC probe.
+  GPS_MSGS = ("APIMGPS_Data_Nav_1_FD1", "APIMGPS_Data_Nav_3_FD1", "APIMGPS_Data_Nav_2_FD1")
 
   # lightning-extra2pnw: the two messages that carry the Pro Power Onboard state, found by CAN diff
   # while the driver toggled the setting ten times (drives/2026-09-07/propower-toggle-scan/). Both
