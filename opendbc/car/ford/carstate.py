@@ -17,8 +17,8 @@ TransmissionType = structs.CarParams.TransmissionType
 # is not a slow start.
 GEAR_MISSING_LOG_S = 10.0
 # truckdecode2pnw: the cluster-unit decode says so if it is still unknown this long after carState started, and
-# otherwise logs a change at most once per this many seconds (the camera's IsaVLimUnit_D_Rq arrives at ~17 Hz,
-# so a flapping value must not become 17 lines a second).
+# otherwise logs a change at most once per this many seconds (Cluster_Info1_FD1 arrives at ~10 Hz, so a flapping
+# bit must not become 10 lines a second).
 UNIT_LOG_S = 10.0
 
 
@@ -240,43 +240,47 @@ class CarState(CarStateBase):
                    "gearShifter stays unknown, so Park cannot be confirmed and the device keeps recording")
 
   def _cluster_unit(self, cp, cp_cam) -> structs.CarState.CruiseState.SpeedUnit:
-    """truckdecode2pnw: the unit the CAN FD cluster shows the set speed in, or `unknown`.
+    """units2pnw: the unit the CAN FD cluster shows the set speed (Veh_V_DsplyCcSet) in, or `unknown`.
 
-    cruiseState.speed is NOT touched: it stays Veh_V_DsplyCcSet x MPH_TO_MS, upstream's CAN FD assumption, which
-    every stock-ACC consumer (ICBM, the resume executor) is built on. Only a consumer that needs the true unit
-    reads this -- today pnw-pilot's madsresume_pnw overshoot-cancel rule, which on a km/h cluster would read every
-    set ~1.6x high and cancel every gas-set.
+    THE SOURCE IS Cluster_Info1_FD1 (0x430, bus 0, sent by the GWM) MetricActv_B_Actl, DBC "0 =Inactive(English),
+    1=Active(Metric)": 1 -> kph, 0 -> mph, and `unknown` until a Cluster_Info1_FD1 frame has been RECEIVED (a
+    never-seen message is not mph; the gearunknown2pnw pattern).
 
-    TWO SIGNALS MUST AGREE, because each alone has a hole. Measured on all 24 local Lightning rlog segments, an mph
-    cluster (drives/2026-09-12/central-oregon-weekend/TRUCK_DECODE.md):
-      * IPMA_Data2 (0x3D9, camera bus) IsaVLimUnit_D_Rq: 2 "Mph" on all 23,027 frames of 23 segments;
-        3 "NoDataExists" on 463 of 464 frames of one parked segment. 1 "Kph" was never seen. It is the unit of
-        the camera's speed-limit request, so it may follow the SIGN region rather than the cluster -- a US truck
-        in Canada could report Kph. Not verifiable here.
-      * Cluster_Info1_FD1 (0x430, bus 0, the GWM) MetricActv_B_Actl, DBC "0 =Inactive(English), 1=Active(Metric)":
-        0 on all 13,936 frames. English is the all-zero value, so on its own it cannot prove the bit is populated.
-    mph = (Mph, English); kph = (Kph, Metric); anything else -- never received, NoDataExists, Null, or the two
-    disagreeing -- is `unknown`, which the consumer must treat as today's mph assumption and log.
+    PROVEN on the owner's truck, whose cluster switched to km/h on Sun 2026-09-13 21:06-21:08 PT
+    (drives/2026-09-14/units-kmh/DRIVE_REPORT.md, "Which signal Veh_V_DsplyCcSet follows"):
+      * Veh_V_RqCcSet (0x202, DBC unit kph) / Veh_V_DsplyCcSet while ACC is engaged: 1.571-1.587 on every segment
+        with MetricActv_B_Actl 0 (09-11/09-12, 17 segments), 0.976-0.978 on every segment with it 1 (09-13 21:09 on).
+        1.609 x 0.977 = 1.572: the same set speed, read in mph and then in km/h.
+      * held speed, engaged with no lead: MetricActv 0 -> vEgo within -0.3..-0.8 mph of the set (+19..+27 if km/h);
+        MetricActv 1 -> set 42 held at 41.1 km/h (-16.5 if mph); the 21:16 Corvallis set 55 held 53.7-54.0 km/h.
+    NOT IPMA_Data2 (0x3D9, camera) IsaVLimUnit_D_Rq: it read 2 "Mph" in BOTH regimes, so it does not follow the set
+    speed (an earlier version of this decode required it to agree, which would have reported mph on the km/h truck).
+    It is decoded for the log line only and never selects the unit. Mc_VehUntTrpCoUsrSel_St (0x2FD) also stayed 1.
+    Not separable from this data: Traffic_RecognitnData (0x3CD, camera) TsrVlUnitMsgTxt_D_Rq flipped with
+    MetricActv_B_Actl in every segment. MetricActv_B_Actl is used because it is the cluster's own state, on bus 0.
 
-    PRESENCE IS TESTED WITH ts_nanos (see _read_pro_power). IPMA_Data2 is registered ignore_alive in
-    get_can_parsers, and indexed only after the `in` check, which never lazily registers (see _publish_car_gps),
-    so it can never make canValid false. Never raises: a car path exception would take down card.
+    PRESENCE IS TESTED WITH ts_nanos (see _read_pro_power). Cluster_Info1_FD1 is already read (lazily registered,
+    alive-checked) by upstream's espDisabled and nonAdaptive lines, so this adds no canValid dependency. IPMA_Data2 is
+    registered ignore_alive in get_can_parsers and indexed only after the `in` check, which never lazily registers
+    (see _publish_car_gps), so it can never make canValid false. Never raises: a car path exception would take down
+    card; a decode failure reports unknown and logs.
     """
     unit, isa, metric = SpeedUnit.unknown, None, None
     try:
-      if "IPMA_Data2" in cp_cam.vl and cp_cam.ts_nanos["IPMA_Data2"]["IsaVLimUnit_D_Rq"] != 0:
-        isa = int(cp_cam.vl["IPMA_Data2"]["IsaVLimUnit_D_Rq"])
       if cp.ts_nanos["Cluster_Info1_FD1"]["MetricActv_B_Actl"] != 0:
         metric = int(cp.vl["Cluster_Info1_FD1"]["MetricActv_B_Actl"])
-      if (isa, metric) == (2, 0):
-        unit = SpeedUnit.mph
-      elif (isa, metric) == (1, 1):
+      if metric == 1:
         unit = SpeedUnit.kph
+      elif metric == 0:
+        unit = SpeedUnit.mph
+      # telemetry only: carried in the log line, never part of the decision above
+      if "IPMA_Data2" in cp_cam.vl and cp_cam.ts_nanos["IPMA_Data2"]["IsaVLimUnit_D_Rq"] != 0:
+        isa = int(cp_cam.vl["IPMA_Data2"]["IsaVLimUnit_D_Rq"])
       self._log_cluster_unit(cp, unit, isa, metric)
     except Exception:
       self._unit_err += 1
       if self._unit_err == 1 or self._unit_err % 6000 == 0:
-        carlog.exception("truckdecode2pnw: cluster unit decode failed (%d so far); reporting unknown", self._unit_err)
+        carlog.exception("units2pnw: cluster unit decode failed (%d so far); reporting unknown", self._unit_err)
       unit = SpeedUnit.unknown
     return unit
 
@@ -294,8 +298,8 @@ class CarState(CarStateBase):
       return
     self._unit_logged, self._unit_log_nanos = unit, now
     name = {SpeedUnit.mph: "mph", SpeedUnit.kph: "kph"}.get(unit, "unknown")   # the builder enum is a bare int
-    line = (f"truckdecode2pnw: cluster set-speed unit {name} (IPMA_Data2.IsaVLimUnit_D_Rq={isa}, " +
-            f"Cluster_Info1_FD1.MetricActv_B_Actl={metric}; None = never received)")
+    line = (f"units2pnw: cluster set-speed unit {name} (Cluster_Info1_FD1.MetricActv_B_Actl={metric}; " +
+            f"IPMA_Data2.IsaVLimUnit_D_Rq={isa}, telemetry only; None = never received)")
     if unit == SpeedUnit.unknown:
       carlog.warning(line + " -- consumers fall back to the mph assumption")
     else:
@@ -450,11 +454,11 @@ class CarState(CarStateBase):
   # without them must not be rendered unusable over a body-comfort feature.
   PPO_MSGS = ("EffDrvModeData", "HEV_Powertrain_Data6")
 
-  # truckdecode2pnw: the camera's IPMA_Data2 (0x3D9) carries IsaVLimUnit_D_Rq, one half of the cluster-unit decode
-  # (_cluster_unit). It originates on bus 2 and is relayed onto bus 0 with the TX flag (src 128; measured 1,000
-  # frames per 60 s on src 2 and src 128), so only the CAMERA parser can see it. nan frequency for the same reason
-  # as GPS_MSGS: a missing unit message must not make the car undriveable. Registered on CAN FD only, where the
-  # decode runs.
+  # truckdecode2pnw: the camera's IPMA_Data2 (0x3D9) carries IsaVLimUnit_D_Rq, logged next to the cluster-unit decode
+  # (_cluster_unit) as telemetry only (units2pnw: it does not follow the set-speed unit). It originates on bus 2 and
+  # is relayed onto bus 0 with the TX flag (src 128; measured 1,000 frames per 60 s on src 2 and src 128), so only the
+  # CAMERA parser can see it. nan frequency for the same reason as GPS_MSGS: a missing message must not make the car
+  # undriveable. Registered on CAN FD only, where the decode runs.
   UNIT_CAM_MSGS = ("IPMA_Data2",)
 
   @staticmethod

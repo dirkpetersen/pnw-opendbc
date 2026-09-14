@@ -1,12 +1,17 @@
-"""truckdecode2pnw (B): carState.cruiseState.speedClusterUnit on Ford CAN FD -- the unit the cluster shows the set in.
+"""units2pnw: carState.cruiseState.speedClusterUnit on Ford CAN FD -- the unit the cluster shows the set in.
 
-Every frame goes through the real DBC and the real Ford CarInterface.update, the path card runs. The Mph, NoDataExists
-and English payloads are REAL frames from local Lightning rlogs (drives/2026-09-12/central-oregon-weekend/TRUCK_DECODE.md):
-  IPMA_MPH     0x3D9 src 2  0000012f--817cabeb76--1, Sat 2026-09-12 06:25 PT     IsaVLimUnit_D_Rq = 2 "Mph"
-  IPMA_NODATA  0x3D9 src 2  00000132--592eb3d350--6, Sat 2026-09-12 14:18 PT     IsaVLimUnit_D_Rq = 3 "NoDataExists"
-  CLUSTER_ENG  0x430 src 0  0000012f--817cabeb76--1                             MetricActv_B_Actl = 0 (English)
-The owner's cluster is mph, so a Kph / Metric frame was never observed: those two are the real frames with ONLY the
-unit bits changed (IsaVLimUnit_D_Rq -> 1, MetricActv_B_Actl -> 1), checked against the DBC below.
+The source is Cluster_Info1_FD1 (0x430) MetricActv_B_Actl alone: 1 kph, 0 mph, unknown until the message has been
+received. IPMA_Data2 (0x3D9) IsaVLimUnit_D_Rq is telemetry only -- on the owner's truck it read "Mph" while the cluster
+and Veh_V_DsplyCcSet were in km/h (drives/2026-09-14/units-kmh/DRIVE_REPORT.md).
+
+Every frame goes through the real DBC and the real Ford CarInterface.update, the path card runs. ALL payloads below are
+REAL frames from local Lightning rlogs, except IPMA_KPH (never observed: the camera kept "Mph" on the km/h truck):
+  CLUSTER_ENG     0x430 src 0  0000012f--817cabeb76--1, Sat 2026-09-12 06:25 PT   MetricActv_B_Actl = 0 (English)
+  CLUSTER_METRIC  0x430 src 0  0000015e--10e6920ab7--3, Mon 2026-09-14 12:40 PT   MetricActv_B_Actl = 1 (Metric)
+  IPMA_MPH        0x3D9 src 2  0000012f--817cabeb76--1                            IsaVLimUnit_D_Rq = 2 "Mph"
+  IPMA_MPH_KMH    0x3D9 src 2  0000015e--10e6920ab7--3 (the km/h truck)           IsaVLimUnit_D_Rq = 2 "Mph"
+  IPMA_NODATA     0x3D9 src 2  00000132--592eb3d350--6, Sat 2026-09-12 14:18 PT   IsaVLimUnit_D_Rq = 3 "NoDataExists"
+  IPMA_KPH        IPMA_MPH with only bits 15..14 changed to 01 (checked against the DBC below)
 """
 import pytest
 
@@ -23,10 +28,11 @@ DBC = "ford_lincoln_base_pt"
 DT = 10_000_000
 
 IPMA_MPH = "fe8cfe28401800f5"
+IPMA_MPH_KMH = "328cfe28401800f5"
 IPMA_NODATA = "feccfe10401800fb"
-IPMA_KPH = "fe4cfe28401800f5"        # IPMA_MPH with bits 15..14 = 01
+IPMA_KPH = "fe4cfe28401800f5"
 CLUSTER_ENG = "09008cd108046401"
-CLUSTER_METRIC = "49008cd108046401"  # CLUSTER_ENG with bit 6 = 1
+CLUSTER_METRIC = "49008e7908046401"
 
 
 def _decode(msg, sig, hexdat, addr, bus):
@@ -37,11 +43,11 @@ def _decode(msg, sig, hexdat, addr, bus):
 
 def test_the_payloads_mean_what_the_names_say():
   assert _decode("IPMA_Data2", "IsaVLimUnit_D_Rq", IPMA_MPH, 0x3D9, 2) == 2        # "Mph"
+  assert _decode("IPMA_Data2", "IsaVLimUnit_D_Rq", IPMA_MPH_KMH, 0x3D9, 2) == 2    # "Mph", on the km/h truck
   assert _decode("IPMA_Data2", "IsaVLimUnit_D_Rq", IPMA_NODATA, 0x3D9, 2) == 3     # "NoDataExists"
   assert _decode("IPMA_Data2", "IsaVLimUnit_D_Rq", IPMA_KPH, 0x3D9, 2) == 1        # "Kph"
   assert _decode("Cluster_Info1_FD1", "MetricActv_B_Actl", CLUSTER_ENG, 0x430, 0) == 0
   assert _decode("Cluster_Info1_FD1", "MetricActv_B_Actl", CLUSTER_METRIC, 0x430, 0) == 1
-  # only the unit bits differ: every other IPMA_Data2 signal decodes the same
   for sig in ("IsaVLim_D_Rq", "IaccVLim_D_Rq", "TsrRegionTxt_D_Stat", "LongCtrlEnbl_D_Rq"):
     assert _decode("IPMA_Data2", sig, IPMA_KPH, 0x3D9, 2) == _decode("IPMA_Data2", sig, IPMA_MPH, 0x3D9, 2)
 
@@ -52,7 +58,7 @@ def logs(monkeypatch):
 
   def capture(level):
     def log(msg, *a, **kw):
-      if "truckdecode2pnw" in str(msg):
+      if "units2pnw" in str(msg):
         seen.append((level, str(msg)))
     return log
   monkeypatch.setattr(carlog, "warning", capture("warning"))
@@ -79,47 +85,48 @@ class Car:
     return self.cs
 
 
-def unit_of(ipma=None, cluster=None, ipma_src=2, seconds=1.0):
+def unit_of(ipma=None, cluster=None, cluster_src=0, seconds=1.0):
   car = Car()
-  frames = ([(0x3D9, ipma, ipma_src)] if ipma else []) + ([(0x430, cluster, 0)] if cluster else [])
+  frames = ([(0x3D9, ipma, 2)] if ipma else []) + ([(0x430, cluster, cluster_src)] if cluster else [])
   return car.run(seconds, frames).cruiseState.speedClusterUnit
 
 
 class TestDecode:
-  def test_real_mph_frames_are_mph(self, logs):
+  def test_real_mph_truck_is_mph(self, logs):
     assert unit_of(IPMA_MPH, CLUSTER_ENG) == SpeedUnit.mph
 
-  def test_both_metric_is_kph(self, logs):
-    assert unit_of(IPMA_KPH, CLUSTER_METRIC) == SpeedUnit.kph
+  def test_real_kmh_truck_is_kph_although_the_camera_says_mph(self, logs):
+    """The 2026-09-14 truck, both frames real: the cluster is metric, IsaVLimUnit_D_Rq still "Mph". The old
+    two-signals-must-agree decode reported this as not-kph."""
+    assert unit_of(IPMA_MPH_KMH, CLUSTER_METRIC) == SpeedUnit.kph
 
-  def test_real_nodataexists_is_unknown(self, logs):
-    assert unit_of(IPMA_NODATA, CLUSTER_ENG) == SpeedUnit.unknown
+  @pytest.mark.parametrize("ipma", [None, IPMA_MPH, IPMA_NODATA, IPMA_KPH])
+  def test_the_camera_unit_never_selects(self, logs, ipma):
+    assert unit_of(ipma, CLUSTER_METRIC) == SpeedUnit.kph
+    assert unit_of(ipma, CLUSTER_ENG) == SpeedUnit.mph
 
-  @pytest.mark.parametrize("ipma, cluster", [(IPMA_KPH, CLUSTER_ENG), (IPMA_MPH, CLUSTER_METRIC)])
-  def test_disagreement_is_unknown(self, logs, ipma, cluster):
-    """A Kph speed-limit unit on an English cluster is exactly the sign-region case: never believed alone."""
-    assert unit_of(ipma, cluster) == SpeedUnit.unknown
+  @pytest.mark.parametrize("ipma", [None, IPMA_MPH, IPMA_KPH])
+  def test_cluster_message_never_received_is_unknown_not_mph(self, logs, ipma):
+    """MetricActv_B_Actl's English value is the parser's default 0: a never-received frame must not read mph."""
+    assert unit_of(ipma, None) == SpeedUnit.unknown
 
-  def test_camera_message_missing_is_unknown(self, logs):
-    assert unit_of(None, CLUSTER_ENG) == SpeedUnit.unknown
+  def test_a_cluster_frame_on_the_camera_bus_does_not_count(self, logs):
+    """The pt parser reads bus 0; a 0x430 seen only on another bus is not the GWM's frame."""
+    assert unit_of(None, CLUSTER_METRIC, cluster_src=2) == SpeedUnit.unknown
 
-  def test_cluster_message_missing_is_unknown(self, logs):
-    """MetricActv_B_Actl's English value is the parser's default 0: a never-received cluster frame must not read English."""
-    assert unit_of(IPMA_MPH, None) == SpeedUnit.unknown
-
-  def test_the_relayed_copy_on_bus0_does_not_decode(self, logs):
-    """0x3D9 originates on the camera bus; the panda's relay onto bus 0 carries src 128 and is not the camera."""
-    assert unit_of(IPMA_MPH, CLUSTER_ENG, ipma_src=128) == SpeedUnit.unknown
+  def test_the_unit_follows_a_live_change(self, logs):
+    car = Car()
+    assert car.run(1, [(0x430, CLUSTER_ENG, 0)]).cruiseState.speedClusterUnit == SpeedUnit.mph
+    assert car.run(0.2, [(0x430, CLUSTER_METRIC, 0)]).cruiseState.speedClusterUnit == SpeedUnit.kph
+    assert car.run(0.2, [(0x430, CLUSTER_ENG, 0)]).cruiseState.speedClusterUnit == SpeedUnit.mph
 
   def test_speed_is_untouched_by_the_unit(self, logs):
-    """cruiseState.speed keeps upstream's CAN FD mph assumption whatever the unit says: ICBM and the resume
-    executor are built on it. Only speedClusterUnit changes."""
+    """cruiseState.speed keeps upstream's CAN FD mph assumption in this commit; only speedClusterUnit changes."""
     from opendbc.can.packer import CANPacker
     eb = CANPacker(DBC).make_can_msg("EngBrakeData", 0, {"Veh_V_DsplyCcSet": 55, "CcStat_D_Actl": 5})
     speeds = {}
-    for name, ipma, cluster in (("mph", IPMA_MPH, CLUSTER_ENG), ("kph", IPMA_KPH, CLUSTER_METRIC)):
-      car = Car()
-      cs = car.run(1.0, [(0x3D9, ipma, 2), (0x430, cluster, 0), (eb[0], eb[1].hex(), 0)])
+    for name, cluster in (("mph", CLUSTER_ENG), ("kph", CLUSTER_METRIC)):
+      cs = Car().run(1.0, [(0x3D9, IPMA_MPH, 2), (0x430, cluster, 0), (eb[0], eb[1].hex(), 0)])
       speeds[name] = (cs.cruiseState.speed, cs.cruiseState.speedClusterUnit)
     assert speeds["mph"] == (pytest.approx(55 * CV.MPH_TO_MS), SpeedUnit.mph)
     assert speeds["kph"] == (pytest.approx(55 * CV.MPH_TO_MS), SpeedUnit.kph)
@@ -131,12 +138,11 @@ class TestRegistration:
     car = Car()
     cam = car.CI.can_parsers[Bus.cam]
     st = cam.message_states[0x3D9]
-    assert st.ignore_alive, "a missing unit message must never make canValid false"
+    assert st.ignore_alive, "a missing telemetry message must never make canValid false"
 
   def test_absence_never_costs_can_valid(self):
-    """The failure that would matter: the camera parser's can_valid is ANDed into carState.canValid. Drive a real
-    alive-checked camera message (registered lazily, exactly as carstate's cp_cam.vl indexing does) with zero
-    IPMA_Data2 past the timeout horizon: still valid. Control: stop the real message and it must go invalid."""
+    """The camera parser's can_valid is ANDed into carState.canValid. Drive a real alive-checked camera message with
+    zero IPMA_Data2 past the timeout horizon: still valid. Control: stop the real message and it must go invalid."""
     from opendbc.can.packer import CANPacker
     from opendbc.car import Bus
     cam = Car().CI.CS.get_can_parsers(Car().CI.CP)[Bus.cam]
@@ -160,38 +166,40 @@ class TestRegistration:
     from opendbc.car.ford.values import FordFlags
     assert not car.CI.CP.flags & FordFlags.CANFD
     assert 0x3D9 not in car.CI.can_parsers[Bus.cam].message_states
-    # past the never-received threshold: a car that does not decode the unit must not report it missing either
-    assert car.run(ford_carstate.UNIT_LOG_S + 5, [(0x3D9, IPMA_MPH, 2)]).cruiseState.speedClusterUnit == SpeedUnit.unknown
+    # past the never-received threshold, with the metric frame present: the decode is CAN FD only
+    cs = car.run(ford_carstate.UNIT_LOG_S + 5, [(0x3D9, IPMA_MPH, 2), (0x430, CLUSTER_METRIC, 0)])
+    assert cs.cruiseState.speedClusterUnit == SpeedUnit.unknown
     assert logs == []
 
 
 class TestLogging:
-  def test_normal_start_is_one_line(self, logs):
+  def test_normal_start_is_one_line_with_both_raw_values(self, logs):
     car = Car()
-    car.run(60, [(0x3D9, IPMA_MPH, 2), (0x430, CLUSTER_ENG, 0)])
-    assert len(logs) == 1 and "unit mph" in logs[0][1] and "IsaVLimUnit_D_Rq=2" in logs[0][1], logs
+    car.run(60, [(0x3D9, IPMA_MPH_KMH, 2), (0x430, CLUSTER_METRIC, 0)])
+    assert len(logs) == 1 and "unit kph" in logs[0][1], logs
+    assert "MetricActv_B_Actl=1" in logs[0][1] and "IsaVLimUnit_D_Rq=2" in logs[0][1], logs
 
   def test_never_received_is_said_after_the_threshold(self, logs):
     car = Car()
-    car.run(ford_carstate.UNIT_LOG_S - 0.5, [(0x430, CLUSTER_ENG, 0)])
+    car.run(ford_carstate.UNIT_LOG_S - 0.5, [(0x3D9, IPMA_MPH, 2)])
     assert logs == []
-    car.run(60, [(0x430, CLUSTER_ENG, 0)])
-    assert len(logs) == 1 and "unit unknown" in logs[0][1] and "IsaVLimUnit_D_Rq=None" in logs[0][1]
-    assert "mph assumption" in logs[0][1]
+    car.run(60, [(0x3D9, IPMA_MPH, 2)])
+    assert len(logs) == 1 and "unit unknown" in logs[0][1] and "MetricActv_B_Actl=None" in logs[0][1], logs
+    assert "mph" in logs[0][1].split(" -- ")[1]
 
-  def test_a_change_to_unknown_is_logged_with_the_raw_values(self, logs):
+  def test_a_change_is_logged_with_the_raw_values(self, logs):
     car = Car()
     car.run(15, [(0x3D9, IPMA_MPH, 2), (0x430, CLUSTER_ENG, 0)])
-    car.run(15, [(0x3D9, IPMA_NODATA, 2), (0x430, CLUSTER_ENG, 0)])
-    assert [m.split(" (")[0].rsplit(" ", 1)[-1] for _, m in logs] == ["mph", "unknown"], logs
-    assert "IsaVLimUnit_D_Rq=3" in logs[1][1] and "MetricActv_B_Actl=0" in logs[1][1]
+    car.run(15, [(0x3D9, IPMA_MPH, 2), (0x430, CLUSTER_METRIC, 0)])
+    assert [m.split(" (")[0].rsplit(" ", 1)[-1] for _, m in logs] == ["mph", "kph"], logs
+    assert "MetricActv_B_Actl=0" in logs[0][1] and "MetricActv_B_Actl=1" in logs[1][1]
 
   def test_a_flapping_value_is_rate_limited(self, logs):
     car = Car()
-    car.run(1, [(0x3D9, IPMA_MPH, 2), (0x430, CLUSTER_ENG, 0)])
-    for _ in range(300):              # 30 s of the value changing every 50 ms
-      car.run(0.05, [(0x3D9, IPMA_NODATA, 2), (0x430, CLUSTER_ENG, 0)])
-      car.run(0.05, [(0x3D9, IPMA_MPH, 2), (0x430, CLUSTER_ENG, 0)])
+    car.run(1, [(0x430, CLUSTER_ENG, 0)])
+    for _ in range(300):              # 30 s of the bit changing every 50 ms
+      car.run(0.05, [(0x430, CLUSTER_METRIC, 0)])
+      car.run(0.05, [(0x430, CLUSTER_ENG, 0)])
     assert 2 <= len(logs) <= 1 + 30 / ford_carstate.UNIT_LOG_S + 1, logs
 
 
