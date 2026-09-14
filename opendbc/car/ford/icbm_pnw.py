@@ -41,6 +41,11 @@ from dataclasses import dataclass
 # (100 Hz) so the 10 Hz SCCM stream reliably carries it, then release for at least GAP_FRAMES.
 MPH_TO_MS = 0.44704
 STEP_MS = 1.0 * MPH_TO_MS         # one tap's worth of set-speed change
+# units2pnw: a tap moves the set by ONE CLUSTER UNIT, so on a km/h cluster it is 1 km/h. Measured on the owner's truck
+# after its cluster switched to km/h (qlog 0000013f seg 0, Sun 2026-09-13 21:14:22-37 PT): 42 -> 27 -> 42 in steps of
+# exactly 1 at the 0.4 s tap cadence. The caller passes it as `step_ms` (carState.cruiseState.speedClusterUnit);
+# anything but kph -- including unknown -- keeps STEP_MS, matching carstate's mph assumption for cruiseState.speed.
+STEP_KPH_MS = 1.0 / 3.6
 DEADBAND_MS = 0.6 * STEP_MS       # don't chase differences smaller than this
 PRESS_FRAMES = 10                 # 100 ms press
 GAP_FRAMES = 30                   # 300 ms release between taps — clearly discrete taps, never a
@@ -63,9 +68,11 @@ class IcbmCommand:
 
 
 def decide_press(stock_set_ms: float, cmd: IcbmCommand | None, now: float,
-                 cruise_enabled: bool, driver_override: bool) -> str | None:
+                 cruise_enabled: bool, driver_override: bool, step_ms: float = STEP_MS) -> str | None:
   """Pure decision: which button (if any) SHOULD be pressed this instant, ignoring cadence.
-  Returns 'dec', 'inc' or None. Cadence/timing is PressGovernor's job."""
+  Returns 'dec', 'inc' or None. Cadence/timing is PressGovernor's job. `step_ms` is one tap in the
+  cluster's unit (units2pnw); the deadband is 0.6 of it, as DEADBAND_MS is of a 1 mph tap."""
+  deadband = 0.6 * step_ms
   if cmd is None or not cruise_enabled or driver_override:
     return None
   if now - cmd.ts > STALE_LIMIT_S:
@@ -87,10 +94,10 @@ def decide_press(stock_set_ms: float, cmd: IcbmCommand | None, now: float,
     # icbmrestore2pnw RESTORE path: press UP toward the (ceiling-clamped) restore target only.
     # NEVER a dec from an inc command — the two directions can't oscillate within one command, and
     # a cap (dec) command always replaces an inc one at the brain (dec wins).
-    if stock_set_ms < target - DEADBAND_MS:
+    if stock_set_ms < target - deadband:
       return "inc"
     return None                   # reached (or passed) the restore point: silent
-  if stock_set_ms > target + DEADBAND_MS:
+  if stock_set_ms > target + deadband:
     return "dec"
   return None                     # caps stay DEC-ONLY: never press up on a cap command
 
@@ -216,7 +223,7 @@ class RestoreGuard:
     return self._blocked
 
   def filter(self, intent: str | None, stock_set_ms: float, now: float, restoring: bool,
-             ceiling: float | None = None, dec_owns_bus: bool = False) -> str | None:
+             ceiling: float | None = None, dec_owns_bus: bool = False, step_ms: float = STEP_MS) -> str | None:
     """Pass every frame. `restoring` = SOME brain still has a live inc/restore offer pending (not
     merely "the command arbitrate() picked to press this exact tick is an inc" — see class docstring).
     `ceiling` identifies WHICH restore episode is being offered; a change in ceiling while restoring
@@ -225,7 +232,8 @@ class RestoreGuard:
     `dec_owns_bus` = the command arbitrate() picked to press THIS tick is a dec (see class docstring's
     Fable fail-safe fix): movement-judgment is skipped entirely on these ticks — the latch is neither
     set NOR cleared, only the movement baseline is dropped. `dec` (or no) intent is NEVER filtered by
-    this latch, regardless of `_blocked`."""
+    this latch, regardless of `_blocked`. `step_ms` is one tap in the cluster's unit (units2pnw): both
+    movement thresholds below are measured in taps, so they scale with it."""
     if not restoring:
       # no brain has a live inc offer at all -> fully stand down, clear the latch, never filter dec
       self._blocked = False
@@ -252,9 +260,9 @@ class RestoreGuard:
     else:
       if self._last_set is not None and stock_set_ms > 0:
         dt = max(now - (self._last_t or now), 0.0)
-        if stock_set_ms < self._last_set - 0.6 * STEP_MS:
+        if stock_set_ms < self._last_set - 0.6 * step_ms:
           self._blocked = True                          # set went DOWN while we only press up
-        elif stock_set_ms > self._last_set + STEP_MS * (dt / TAP_PERIOD_S + 1.6):
+        elif stock_set_ms > self._last_set + step_ms * (dt / TAP_PERIOD_S + 1.6):
           self._blocked = True                          # rose faster than our own taps can
       if stock_set_ms > 0:
         self._last_set = stock_set_ms

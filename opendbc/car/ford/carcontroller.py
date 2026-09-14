@@ -393,7 +393,7 @@ class CarController(CarControllerBase):
   def _icbm_buttons(self, CS) -> str | None:
     """Poll both brains' targets at ~4 Hz, arbitrate, run the executor at 100 Hz. Returns 'dec'/'inc'/None."""
     import time
-    from opendbc.car.ford.icbm_pnw import arbitrate, decide_press
+    from opendbc.car.ford.icbm_pnw import STEP_KPH_MS, STEP_MS, arbitrate, decide_press
     if (self.frame % 25) == 0:  # 4 Hz mem-param read
       try:
         self._icbm_cmd = self._parse_button_cmd(self._icbm_params.get("IcbmTarget"))
@@ -406,6 +406,10 @@ class CarController(CarControllerBase):
     driver_override = bool(CS.out.gasPressed or CS.out.brakePressed)
     now = time.time()
     stock_set = float(CS.out.cruiseState.speed)
+    # units2pnw: stock_set is true m/s (carstate converts by the cluster unit), but one tap moves it by ONE cluster
+    # unit -- 1 km/h on a km/h cluster. Deadband and restore-guard thresholds are in taps. unknown keeps 1 mph, as
+    # carstate keeps its mph assumption for the speed itself.
+    step = STEP_KPH_MS if CS.out.cruiseState.speedClusterUnit == structs.CarState.CruiseState.SpeedUnit.kph else STEP_MS
     # reduce every brain's command to the ONE unified button-management target before deciding what
     # to press — see arbitrate()'s docstring (DEC always wins; most-restrictive dec wins across
     # sources, with a debounce before a fresh inc after a dec). Extensible: any future brain just adds
@@ -414,7 +418,7 @@ class CarController(CarControllerBase):
     if cmd is not None and getattr(cmd, "dir", "dec") == "dec":
       self._last_dec_ts = now
     intent = decide_press(stock_set, cmd, now,
-                          bool(CS.out.cruiseState.enabled), driver_override)
+                          bool(CS.out.cruiseState.enabled), driver_override, step)
     # restore2pnw-hardening (cross-brain dec-interlude fix): the guard's veto latch must survive a
     # brief dec interlude from a DIFFERENT brain while THIS restore episode is still being offered
     # underneath — key `restoring`/`ceiling` to whether ANY brain still has a fresh inc command
@@ -430,7 +434,7 @@ class CarController(CarControllerBase):
     # dec, so it freezes movement-judgment rather than mistaking a dec interlude's own SET- taps for a
     # driver SET- and falsely latching the restore veto — see RestoreGuard.filter's docstring.
     dec_owns_bus = cmd is not None and getattr(cmd, "dir", "dec") == "dec"
-    intent = self._icbm_guard.filter(intent, stock_set, now, restoring, ceiling, dec_owns_bus)
+    intent = self._icbm_guard.filter(intent, stock_set, now, restoring, ceiling, dec_owns_bus, step)
     return self._icbm_governor.update(self.frame, intent)
 
   def update(self, CC, CS, now_nanos):
