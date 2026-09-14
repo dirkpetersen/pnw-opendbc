@@ -111,10 +111,15 @@ class CarState(CarStateBase):
 
     # cruise state
     is_metric = cp.vl["INSTRUMENT_PANEL"]["METRIC_UNITS"] == 1 if not self.CP.flags & FordFlags.CANFD else False
-    ret.cruiseState.speed = cp.vl["EngBrakeData"]["Veh_V_DsplyCcSet"] * (CV.KPH_TO_MS if is_metric else CV.MPH_TO_MS)
     if self.CP.flags & FordFlags.CANFD:
-      # truckdecode2pnw: `speed` above is unchanged (CAN FD still assumes mph); this only REPORTS the unit.
-      ret.cruiseState.speedClusterUnit = self._cluster_unit(cp, cp_cam)
+      # units2pnw: on CAN FD, Veh_V_DsplyCcSet is in the cluster's unit, which MetricActv_B_Actl gives (proven on the
+      # owner's truck after its cluster switched to km/h; see _cluster_unit). Upstream hardcoded mph here, so every
+      # consumer read a km/h set 1.609x high. `unknown` (Cluster_Info1_FD1 never received) keeps that mph assumption
+      # and the decode logs it.
+      unit = self._cluster_unit(cp, cp_cam)
+      ret.cruiseState.speedClusterUnit = unit
+      is_metric = unit == SpeedUnit.kph
+    ret.cruiseState.speed = cp.vl["EngBrakeData"]["Veh_V_DsplyCcSet"] * (CV.KPH_TO_MS if is_metric else CV.MPH_TO_MS)
     ret.cruiseState.enabled = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (4, 5)
     ret.cruiseState.available = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (3, 4, 5)
     ret.cruiseState.nonAdaptive = cp.vl["Cluster_Info1_FD1"]["AccEnbl_B_RqDrv"] == 0
@@ -259,6 +264,10 @@ class CarState(CarStateBase):
     Not separable from this data: Traffic_RecognitnData (0x3CD, camera) TsrVlUnitMsgTxt_D_Rq flipped with
     MetricActv_B_Actl in every segment. MetricActv_B_Actl is used because it is the cluster's own state, on bus 0.
 
+    update() converts cruiseState.speed with this unit (kph -> KPH_TO_MS; mph and unknown -> MPH_TO_MS), so every
+    consumer gets true m/s. speedClusterUnit stays published for what needs the cluster's own step: one SET tap moves
+    the set by one unit, 1 km/h on a kph cluster (the ICBM executor).
+
     PRESENCE IS TESTED WITH ts_nanos (see _read_pro_power). Cluster_Info1_FD1 is already read (lazily registered,
     alive-checked) by upstream's espDisabled and nonAdaptive lines, so this adds no canValid dependency. IPMA_Data2 is
     registered ignore_alive in get_can_parsers and indexed only after the `in` check, which never lazily registers
@@ -301,7 +310,7 @@ class CarState(CarStateBase):
     line = (f"units2pnw: cluster set-speed unit {name} (Cluster_Info1_FD1.MetricActv_B_Actl={metric}; " +
             f"IPMA_Data2.IsaVLimUnit_D_Rq={isa}, telemetry only; None = never received)")
     if unit == SpeedUnit.unknown:
-      carlog.warning(line + " -- consumers fall back to the mph assumption")
+      carlog.warning(line + " -- cruiseState.speed ASSUMES mph (Veh_V_DsplyCcSet x MPH_TO_MS)")
     else:
       carlog.warning(line)
 

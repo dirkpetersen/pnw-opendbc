@@ -12,6 +12,12 @@ REAL frames from local Lightning rlogs, except IPMA_KPH (never observed: the cam
   IPMA_MPH_KMH    0x3D9 src 2  0000015e--10e6920ab7--3 (the km/h truck)           IsaVLimUnit_D_Rq = 2 "Mph"
   IPMA_NODATA     0x3D9 src 2  00000132--592eb3d350--6, Sat 2026-09-12 14:18 PT   IsaVLimUnit_D_Rq = 3 "NoDataExists"
   IPMA_KPH        IPMA_MPH with only bits 15..14 changed to 01 (checked against the DBC below)
+Set speed (0x165 EngBrakeData, src 0), all real except EB_KMH_55 (the 21:16 frame itself was only parsed on the device):
+  EB_MPH_35       00000131--4c7547abb4--11, Sat 2026-09-12 12:26 PT (mph truck)      Veh_V_DsplyCcSet 35, CcStat 5 Active
+  EB_KMH_42       0000013f--14c6a10731--0, Sun 2026-09-13 21:14 PT (km/h truck)     Veh_V_DsplyCcSet 42, CcStat 5 Active
+  EB_KMH_42_STBY  0000013f--14c6a10731--2, Sun 2026-09-13 21:16:16 PT (Corvallis)   Veh_V_DsplyCcSet 42, CcStat 3 Standby
+  EB_KMH_55       EB_KMH_42 with only the set byte changed to 55 (checked against the DBC below)
+  CLUSTER_METRIC_2116  0x430, 0000013f--14c6a10731--2, 21:16:16 PT                  MetricActv_B_Actl = 1
 """
 import pytest
 
@@ -33,6 +39,11 @@ IPMA_NODATA = "feccfe10401800fb"
 IPMA_KPH = "fe4cfe28401800f5"
 CLUSTER_ENG = "09008cd108046401"
 CLUSTER_METRIC = "49008e7908046401"
+CLUSTER_METRIC_2116 = "49008e6d08046401"
+EB_MPH_35 = "10cd230000000000"
+EB_KMH_42 = "10cd2a0000000000"
+EB_KMH_42_STBY = "50c32a0000000000"
+EB_KMH_55 = "10cd370000000000"
 
 
 def _decode(msg, sig, hexdat, addr, bus):
@@ -50,6 +61,14 @@ def test_the_payloads_mean_what_the_names_say():
   assert _decode("Cluster_Info1_FD1", "MetricActv_B_Actl", CLUSTER_METRIC, 0x430, 0) == 1
   for sig in ("IsaVLim_D_Rq", "IaccVLim_D_Rq", "TsrRegionTxt_D_Stat", "LongCtrlEnbl_D_Rq"):
     assert _decode("IPMA_Data2", sig, IPMA_KPH, 0x3D9, 2) == _decode("IPMA_Data2", sig, IPMA_MPH, 0x3D9, 2)
+  assert _decode("Cluster_Info1_FD1", "MetricActv_B_Actl", CLUSTER_METRIC_2116, 0x430, 0) == 1
+  for h, want_set, want_stat in ((EB_MPH_35, 35, 5), (EB_KMH_42, 42, 5), (EB_KMH_42_STBY, 42, 3), (EB_KMH_55, 55, 5)):
+    assert (_decode("EngBrakeData", "Veh_V_DsplyCcSet", h, 0x165, 0), _decode("EngBrakeData", "CcStat_D_Actl", h, 0x165, 0)) \
+      == (want_set, want_stat), h
+  from opendbc.can.dbc import DBC as _D
+  for sig in _D(DBC).name_to_msg["EngBrakeData"].sigs:
+    if sig != "Veh_V_DsplyCcSet":
+      assert _decode("EngBrakeData", sig, EB_KMH_55, 0x165, 0) == _decode("EngBrakeData", sig, EB_KMH_42, 0x165, 0), sig
 
 
 @pytest.fixture
@@ -120,16 +139,43 @@ class TestDecode:
     assert car.run(0.2, [(0x430, CLUSTER_METRIC, 0)]).cruiseState.speedClusterUnit == SpeedUnit.kph
     assert car.run(0.2, [(0x430, CLUSTER_ENG, 0)]).cruiseState.speedClusterUnit == SpeedUnit.mph
 
-  def test_speed_is_untouched_by_the_unit(self, logs):
-    """cruiseState.speed keeps upstream's CAN FD mph assumption in this commit; only speedClusterUnit changes."""
-    from opendbc.can.packer import CANPacker
-    eb = CANPacker(DBC).make_can_msg("EngBrakeData", 0, {"Veh_V_DsplyCcSet": 55, "CcStat_D_Actl": 5})
-    speeds = {}
-    for name, cluster in (("mph", CLUSTER_ENG), ("kph", CLUSTER_METRIC)):
-      cs = Car().run(1.0, [(0x3D9, IPMA_MPH, 2), (0x430, cluster, 0), (eb[0], eb[1].hex(), 0)])
-      speeds[name] = (cs.cruiseState.speed, cs.cruiseState.speedClusterUnit)
-    assert speeds["mph"] == (pytest.approx(55 * CV.MPH_TO_MS), SpeedUnit.mph)
-    assert speeds["kph"] == (pytest.approx(55 * CV.MPH_TO_MS), SpeedUnit.kph)
+
+class TestSpeed:
+  """units2pnw (2/3): cruiseState.speed is TRUE m/s -- Veh_V_DsplyCcSet in the cluster's unit."""
+
+  def test_real_mph_truck(self, logs):
+    cs = Car().run(1.0, [(0x430, CLUSTER_ENG, 0), (0x165, EB_MPH_35, 0)])
+    assert (cs.cruiseState.speed, cs.cruiseState.speedClusterUnit) == (pytest.approx(35 * CV.MPH_TO_MS), SpeedUnit.mph)
+
+  def test_real_kmh_truck(self, logs):
+    cs = Car().run(1.0, [(0x3D9, IPMA_MPH_KMH, 2), (0x430, CLUSTER_METRIC, 0), (0x165, EB_KMH_42, 0)])
+    assert (cs.cruiseState.speed, cs.cruiseState.speedClusterUnit) == (pytest.approx(42 * CV.KPH_TO_MS), SpeedUnit.kph)
+    assert cs.cruiseState.speedCluster == pytest.approx(42 * CV.KPH_TO_MS), "the UI's vCruiseCluster source follows"
+
+  def test_corvallis_2116_standby_42_then_engaged_55_are_kmh(self, logs):
+    """Sun 2026-09-13 21:16 PT: standby 42, our SET- engaged at "55" while the truck did 34.4 mph = 55.3 km/h. With
+    the cluster's real metric frame from that segment, 55 is 15.28 m/s -- the tap speed -- not 24.59."""
+    car = Car()
+    stby = car.run(1.0, [(0x430, CLUSTER_METRIC_2116, 0), (0x165, EB_KMH_42_STBY, 0)])
+    assert (stby.cruiseState.enabled, stby.cruiseState.speed) == (False, pytest.approx(42 / 3.6))
+    eng = car.run(0.2, [(0x430, CLUSTER_METRIC_2116, 0), (0x165, EB_KMH_55, 0)])
+    assert (eng.cruiseState.enabled, eng.cruiseState.speed) == (True, pytest.approx(15.278, abs=1e-3))
+
+  def test_never_received_cluster_keeps_the_mph_assumption(self, logs):
+    car = Car()
+    cs = car.run(ford_carstate.UNIT_LOG_S + 1, [(0x165, EB_KMH_55, 0)])
+    assert (cs.cruiseState.speed, cs.cruiseState.speedClusterUnit) == (pytest.approx(55 * CV.MPH_TO_MS), SpeedUnit.unknown)
+    assert len(logs) == 1 and "ASSUMES mph" in logs[0][1], logs
+
+  def test_speed_follows_a_unit_change(self, logs):
+    car = Car()
+    assert car.run(1, [(0x430, CLUSTER_ENG, 0), (0x165, EB_KMH_42, 0)]).cruiseState.speed == pytest.approx(42 * CV.MPH_TO_MS)
+    assert car.run(0.2, [(0x430, CLUSTER_METRIC, 0), (0x165, EB_KMH_42, 0)]).cruiseState.speed == pytest.approx(42 * CV.KPH_TO_MS)
+
+  def test_non_canfd_ford_speed_is_upstreams(self, logs):
+    """A metric 0x430 must not reach a non-CAN FD Ford: its speed keeps upstream's INSTRUMENT_PANEL.METRIC_UNITS path."""
+    cs = Car(CAR.FORD_EXPLORER_MK6).run(1.0, [(0x430, CLUSTER_METRIC, 0), (0x165, EB_KMH_42, 0)])
+    assert cs.cruiseState.speed == pytest.approx(42 * CV.MPH_TO_MS)
 
 
 class TestRegistration:
