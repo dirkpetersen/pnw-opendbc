@@ -543,7 +543,13 @@ class LateralAngleExt:
     # collapsed value is 0.125, not ~0.15. Kept his comment text unmodified for fidelity -- see
     # ALAN-POLK-PORT-DEVIATIONS.md's "issues found in his code, not fixed" section.)
     _pscm_lim = getattr(CS, 'lat_ctl_lim_stat', 0)
-    # In angle mode, LatCtlLim_D_Stat (→ lat_ctl_lim_stat) does not fire.
+    # pscmlimlog2pnw (2026-09-14): his comment here said LatCtlLim_D_Stat "does not fire" in angle mode. It DOES on the
+    # 2025 Lightning: LimitClose, then LimitReached, on 2026-09-08 19:44 PT (pnw workbench
+    # drives/2026-09-12/central-oregon-weekend/PSCM_LIMITREACHED.md). It is deliberately NOT fed here: nothing sets
+    # `lat_ctl_lim_stat`, so _pscm_lim is always 0 and the PSCM half of the blend collapse and of the clamp below is dead
+    # code. Fed as written, it would have frozen that command below what the truck was still delivering. pnw-pilot's
+    # card logs the signal under another name (selfdrive/car/pscmlim_pnw.py); a CarState attribute with THIS name would
+    # switch the clamp on, and pnw-pilot's selfdrive/car/tests/test_pscmlim_pnw.py fails if one appears.
     # His earlier version used angleState.saturated (CtrSat) as a proxy, but CtrSat fires whenever
     # the car lags the commanded path_angle by > 2.5° — which happens during any normal curve entry.
     # That caused a positive-feedback flat-line: under-steer → CtrSat → path_angle frozen → more under-steer.
@@ -618,7 +624,8 @@ class LateralAngleExt:
     path_angle = path_angle_calc
 
     # PSCM authority limit clamp.
-    # On CANFD Fords in angle mode, LatCtlLim_D_Stat does not fire, so _pscm_lim stays 0.
+    # _pscm_lim is always 0 in this tree because nothing sets lat_ctl_lim_stat (the PSCM does fire it -- see the
+    # pscmlimlog2pnw note above), so only _dbc_sat can reach these branches.
     # _in_hard_sat (computed above) combines _pscm_lim >= 2 with _dbc_sat (path_angle near ±0.5 rad limit).
     # LimitClose (_pscm_lim >= 1 only): block magnitude increases — exit-biased blend provides unwind.
     # Hard saturation (_in_hard_sat): block increases AND rate-limit decreases to _PSCM_SAT_UNWIND_RATE.
