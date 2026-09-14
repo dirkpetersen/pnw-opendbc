@@ -247,6 +247,17 @@ struct CarState {
     nonAdaptive @5 :Bool;
 
     speedOffsetDEPRECATED @3 :Float32;
+
+    # pnw truckdecode2pnw: the unit the car's own cluster shows the set speed in, where the carstate can
+    # establish it (Ford CAN FD). `unknown` on every other car, and whenever the source signals are missing
+    # or disagree. It does NOT change `speed`; it tells a consumer what `speed` was decoded from.
+    speedClusterUnit @7 :SpeedUnit;
+
+    enum SpeedUnit {
+      unknown @0;
+      mph @1;
+      kph @2;
+    }
   }
 
   enum GearShifter {
