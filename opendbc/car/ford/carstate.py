@@ -11,6 +11,11 @@ ButtonType = structs.CarState.ButtonEvent.Type
 GearShifter = structs.CarState.GearShifter
 TransmissionType = structs.CarParams.TransmissionType
 
+# gearunknown2pnw: PowertrainData_10 is a 10 Hz frame (measured: 600 of 6001 bus-0 batches in a parked
+# rlog), and card's CarState starts after fingerprinting, when the bus is already awake. 10 s without one
+# is not a slow start.
+GEAR_MISSING_LOG_S = 10.0
+
 
 class CarState(CarStateBase):
   def __init__(self, CP):
@@ -51,6 +56,11 @@ class CarState(CarStateBase):
       self._cargps_params = None
     self._cargps_decim = 0
     self._cargps_err = 0
+
+    # gearunknown2pnw: Rule 2 bookkeeping for the gear message (see _gear_from_can).
+    self._gear_wait_start_nanos: int | None = None
+    self._gear_seen_logged = False
+    self._gear_missing_logged = False
 
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
@@ -101,8 +111,7 @@ class CarState(CarStateBase):
 
     # gear
     if self.CP.transmissionType == TransmissionType.automatic:
-      gear = self.shifter_values.get(cp.vl["PowertrainData_10"]["TrnRng_D_Rq"])
-      ret.gearShifter = self.parse_gear_shifter(gear)
+      ret.gearShifter = self._gear_from_can(cp)
     elif self.CP.transmissionType == TransmissionType.manual:
       if bool(cp.vl["BCM_Lamp_Stat_FD1"]["RvrseLghtOn_B_Stat"]):
         ret.gearShifter = GearShifter.reverse
@@ -172,6 +181,49 @@ class CarState(CarStateBase):
     self._read_pro_power(cp)
     self._publish_car_gps(cp)
     return ret
+
+  def _gear_from_can(self, cp) -> structs.CarState.GearShifter:
+    """gearunknown2pnw: the automatic's gear, or `unknown` until PowertrainData_10 has been received.
+
+    The parser starts every signal at 0, and TrnRng_D_Rq 0 means "Park". Decoding it before a frame
+    has arrived therefore reported a confident Park from a bus that had said nothing at all -- a dead
+    powertrain bus, or the start of every card session. Consumers that trust the gear without also
+    checking canValid (loggerd's parked-video/thin-rlog gate, card's GearPark writer) could not tell
+    that apart from a real Park.
+
+    PRESENCE IS TESTED WITH ts_nanos, as in _read_pro_power: it stays 0 until a frame has been parsed
+    successfully and never returns to 0 afterwards. Once the message has been seen, the decode is
+    exactly what it was before this change, including holding the last value if the message later
+    goes quiet (that case is reported by canValid, which this message's alive check makes False).
+    """
+    # ORDER MATTERS: indexing cp.vl is what registers the message with the parser (alive-checked, as it
+    # always was); cp.ts_nanos is a plain dict and raises KeyError for a message not yet registered.
+    trn_rng = cp.vl["PowertrainData_10"]["TrnRng_D_Rq"]
+    seen = cp.ts_nanos["PowertrainData_10"]["TrnRng_D_Rq"] != 0
+    self._log_gear_presence(cp, seen)
+    if not seen:
+      return GearShifter.unknown
+    return self.parse_gear_shifter(self.shifter_values.get(trn_rng))
+
+  def _log_gear_presence(self, cp, seen: bool) -> None:
+    """Rule 2: say once when the gear becomes known, and once if it still is not after GEAR_MISSING_LOG_S.
+
+    card only runs with ignition on, so the wait is measured from this CarState's first update, on the
+    parser's own clock (logMonoTime of the CAN batches), which also keeps it meaningful under replay."""
+    if self._gear_seen_logged:
+      return
+    now = cp._last_update_nanos
+    if self._gear_wait_start_nanos is None:
+      self._gear_wait_start_nanos = now
+    waited = (now - self._gear_wait_start_nanos) / 1e9
+    if seen:
+      self._gear_seen_logged = True
+      carlog.warning(f"gearunknown2pnw: PowertrainData_10 first received {waited:.1f} s after carState started; gearShifter decoded from here on")
+    elif not self._gear_missing_logged and waited >= GEAR_MISSING_LOG_S:
+      self._gear_missing_logged = True
+      bus = "the powertrain bus has traffic" if cp.last_nonempty_nanos != 0 else "NO powertrain bus traffic at all"
+      carlog.error(f"gearunknown2pnw: PowertrainData_10 not received {waited:.0f} s after carState started ({bus}); " +
+                   "gearShifter stays unknown, so Park cannot be confirmed and the device keeps recording")
 
   def _read_pro_power(self, cp) -> None:
     """lightning-extra2pnw: latch the Pro Power Onboard state from the two messages that carry it.
