@@ -4,6 +4,7 @@ from opendbc.car import Bus, create_button_events, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.ford.fordcan import CanBus
 from opendbc.car.ford.values import DBC, CarControllerParams, FordFlags
+from opendbc.car.ford.everdrive_pnw import ENERGY_MSGS, EverDrive   # everdrive2pnw: display-only telemetry, all logic lives there
 from opendbc.car.carlog import carlog
 from opendbc.car.interfaces import CarStateBase
 
@@ -66,6 +67,12 @@ class CarState(CarStateBase):
     self._gear_wait_start_nanos: int | None = None
     self._gear_seen_logged = False
     self._gear_missing_logged = False
+
+    # everdrive2pnw: aftermarket EverDrive AC-charger + truck energy snapshot -> /dev/shm
+    # EverDriveStatus, for a read-only onroad box. Construction is free (no import, no Params, no
+    # registry); with no EverDrive broadcasting it costs one time.monotonic() + one compare per
+    # update() and publishes NOTHING, so the UI's key is simply absent. See everdrive_pnw.py.
+    self._everdrive = EverDrive()
 
     # truckdecode2pnw: Rule 2 bookkeeping for the cluster-unit decode (see _cluster_unit).
     self._unit_start_nanos: int | None = None
@@ -199,6 +206,9 @@ class CarState(CarStateBase):
 
     self._read_pro_power(cp)
     self._publish_car_gps(cp)
+    # everdrive2pnw: last, alongside the other two /dev/shm telemetry publishers, and AFTER every
+    # ret.* field is populated so ret.vEgo is the final filtered speed rather than a partial state.
+    self._everdrive.update(cp, ret.vEgo)
     return ret
 
   def _gear_from_can(self, cp) -> structs.CarState.GearShifter:
@@ -481,7 +491,12 @@ class CarState(CarStateBase):
     try:
       from opendbc.can.parser import DBC as _DBC
       known = _DBC(dbc_name).name_to_msg
-      pt_msgs = [(m, float("nan")) for m in CarState.GPS_MSGS + CarState.PPO_MSGS if m in known]
+      # everdrive2pnw: ENERGY_MSGS ride the SAME probe and the SAME float("nan") frequency, and the
+      # nan is load-bearing for exactly the reason spelled out above GPS_MSGS -- a Ford with no
+      # EverDrive fitted (or a non-EV Ford with no HEV energy messages) must not be rendered
+      # UNDRIVEABLE by can_valid going False over a display box. Measured: lazy registration via
+      # cp.vl["name"] is alive-checked and does exactly that.
+      pt_msgs = [(m, float("nan")) for m in CarState.GPS_MSGS + CarState.PPO_MSGS + ENERGY_MSGS if m in known]
       if CP.flags & FordFlags.CANFD:
         cam_msgs = [(m, float("nan")) for m in CarState.UNIT_CAM_MSGS if m in known]
     except Exception:

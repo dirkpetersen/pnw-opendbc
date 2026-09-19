@@ -33,7 +33,7 @@ NS_ :
 
 BS_:
 
-BU_: VDM CMR_DSMC SOBDMC_HPCM_FD1 IPMA_ADAS PSCM ABS_ESC TCCM TCM_DSL PCM_HEV PCM ECM_Diesel GENERIC_GWMWakeup GWM _delete TSTR
+BU_: VDM CMR_DSMC SOBDMC_HPCM_FD1 IPMA_ADAS PSCM ABS_ESC TCCM TCM_DSL PCM_HEV PCM ECM_Diesel GENERIC_GWMWakeup GWM _delete TSTR EVERDRIVE_SOBDMA
 
 VAL_TABLE_ DcacRdy_D_Stat 7 "NotUsed_2" 6 "NotUsed_1" 5 "Faulted" 4 "ProtectionTempearture" 3 "ProtectionOverload" 2 "ProtectionGfci" 1 "Active" 0 "Idle";
 VAL_TABLE_ HvacCmprLim_D_Stat 7 "NotUsed_2" 6 "NotUsed_1" 5 "CompressorHeadPressure" 4 "AvailableTorque" 3 "PedalPosition" 2 "RPM" 1 "ECT" 0 "NoLimit";
@@ -3621,6 +3621,10 @@ BO_ 922 DCACA_Data1_FD1: 8 GWM
 BO_ 1082 INSTRUMENT_PANEL: 8 GWM
  SG_ METRIC_UNITS : 54|1@0+ (1,0) [0|1] "SED"  IPMA,PCM,PCM_HEV
 
+BO_ 679 EverDrive_AC_Meter_FD1: 8 EVERDRIVE_SOBDMA
+ SG_ EvrDrvAc_I_Actl : 7|16@0+ (0.00625,0) [0|409.59375] "ampere" Vector__XXX
+ SG_ EvrDrvAc_U_Actl : 39|16@0+ (0.125,0) [0|8191.875] "volt" Vector__XXX
+
 BO_TX_BU_ 2612224016 : ECM_Diesel,PCM,PCM_HEV;
 BO_TX_BU_ 878 : PCM,PCM_HEV;
 BO_TX_BU_ 1085 : ECM_Diesel,PCM;
@@ -3659,6 +3663,10 @@ BO_TX_BU_ 357 : ECM_Diesel,PCM,PCM_HEV;
 BO_TX_BU_ 342 : ECM_Diesel,PCM,PCM_HEV;
 BO_TX_BU_ 71 : ECM_Diesel,PCM,PCM_HEV;
 
+CM_ BU_ EVERDRIVE_SOBDMA "everdrive2pnw: AFTERMARKET, NOT FORD. The EverDrive auxiliary AC charger's own meter module, added by the owner. No Ford ECU transmits or receives 0x2A7 -- a factory truck simply never puts this address on the bus.";
+CM_ BO_ 679 "everdrive2pnw: AFTERMARKET EverDrive AC input meter, 1 Hz on openpilot bus 0 (Ford CAN FD powertrain). NOT from any Ford DBC or release -- hand-decoded on VIN 1FT6W3L78SWG05094 on 2026-09-19 and recorded in CANbus/ford/f-150/lightning/2024-25/ENERGY-RANGE-SIGNALS.md. Ground truth: payload 07 D0 00 00 03 68 00 00 while charging = 12.50 A / 109.0 V / 1.363 kW; 865 consecutive all-zero payloads while unplugged. D2:D3 and D6:D7 were zero in every frame observed and are deliberately left undecoded rather than guessed. Only D0:D1 and D4:D5 are claimed.";
+CM_ SG_ 679 EvrDrvAc_I_Actl "everdrive2pnw: AC input current, (D0<<8|D1)/160 A. Aftermarket, hand-decoded, verified against the measured payload above -- see CM_ BO_ 679.";
+CM_ SG_ 679 EvrDrvAc_U_Actl "everdrive2pnw: AC input voltage, (D4<<8|D5)/8 V. Aftermarket, hand-decoded, verified against the measured payload above -- see CM_ BO_ 679.";
 CM_ "New CAN FD network";
 CM_ BU_ CMR_DSMC "Driver Status Monitor Camera";
 CM_ BU_ IPMA_ADAS "Assist Driving Alert System";
