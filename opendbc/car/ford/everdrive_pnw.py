@@ -171,20 +171,26 @@ class EverDrive:
     # which would read as a live 1.4 kW forever. Differenced against the parser's OWN clock
     # (_last_update_nanos, the logMonoTime of the batch just consumed) because ts_nanos is stamped
     # from the same CLOCK_BOOTTIME source and it keeps this meaningful under REPLAY.
-    live = ac_ns != 0 and (cp._last_update_nanos - ac_ns) <= AC_QUIET_NS
-    if not live:
-      if self._live:
-        self._live = False
-        self._log(("everdrive2pnw: 0x2A7 quiet for >%.0f s (last seen %.1f s ago) -- EverDrive " +
-                   "stopped broadcasting; EverDriveStatus is no longer published")
-                  % (AC_QUIET_S, (cp._last_update_nanos - ac_ns) / 1e9))
-      return                           # PUBLISH NOTHING: an absent key is "no module fitted"
-
-    if self._params is None and not self._open_params():
-      return
-
-    self._next_mono = now + PUBLISH_S
+    # EVERYTHING FROM HERE IS INSIDE THE try (Fable review 2026-09-19). The docstring promises this
+    # method never raises, and `card` dies -- taking the car with it -- if that promise is broken. The
+    # liveness line below dereferences `cp._last_update_nanos`, a PRIVATE CANParser attribute: an
+    # upstream rename would be an AttributeError escaping straight into CarState.update(). The publish
+    # call was already guarded; the guard now starts one step earlier so the promise is actually true
+    # rather than nearly true.
     try:
+      live = ac_ns != 0 and (cp._last_update_nanos - ac_ns) <= AC_QUIET_NS
+      if not live:
+        if self._live:
+          self._live = False
+          self._log(("everdrive2pnw: 0x2A7 quiet for >%.0f s (last seen %.1f s ago) -- EverDrive " +
+                     "stopped broadcasting; EverDriveStatus is no longer published")
+                    % (AC_QUIET_S, (cp._last_update_nanos - ac_ns) / 1e9))
+        return                         # PUBLISH NOTHING: an absent key is "no module fitted"
+
+      if self._params is None and not self._open_params():
+        return
+
+      self._next_mono = now + PUBLISH_S
       self._publish(cp, v_ego)
     except Exception:
       self._log_err()

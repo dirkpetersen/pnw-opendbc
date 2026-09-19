@@ -19,8 +19,6 @@ CANbus/ford/f-150/lightning/2024-25/ENERGY-RANGE-SIGNALS.md):
   0x2A7 payload 07 D0 00 00 03 68 00 00 while charging = 12.50 A / 109.0 V = 1.3625 kW
   0x2A7 payload 00 00 00 00 00 00 00 00 x 865 consecutive frames while unplugged = a REAL zero
 """
-import math
-
 import pytest
 
 from opendbc.can import CANPacker
@@ -209,7 +207,7 @@ class TestCanValidIsNeverRiskedForADisplayBox:
       state = pt.message_states[addr]
       assert state.ignore_alive, \
         f"{name} is ALIVE-CHECKED: a Ford that never transmits it goes can_valid False -> UNDRIVEABLE"
-      assert math.isnan(float("nan")) and state.timeout_threshold > 0   # freq came from the nan probe
+      assert state.timeout_threshold > 0   # nan freq still gets the 1 Hz fallback threshold   # freq came from the nan probe
 
   def test_twenty_seconds_of_real_ford_traffic_with_no_energy_messages_stays_valid(self, monkeypatch, carlogs):
     """End to end through the real CarInterface: > 15 s (the 10 s lazy timeout plus margin) of a
@@ -661,6 +659,32 @@ class TestNoExceptionCanEscapeIntoTheCar:
     assert len(logged) == 1, "Rule 2: the generic catch must not be silent either"
     assert dev._off is False, "only a DBC that cannot carry the message is a permanent latch"
     assert dev._params.blobs == []
+
+  def test_a_failure_in_the_LIVENESS_path_is_swallowed_AND_logged(self, monkeypatch, carlogs):
+    """Added after the Fable review 2026-09-19. The liveness line dereferences
+    `cp._last_update_nanos` -- a PRIVATE CANParser attribute this feature has no contract over. It
+    used to sit OUTSIDE the try, so an upstream rename would have been an AttributeError escaping
+    into CarState.update(), killing `card` and taking the car offroad for a display box.
+
+    The presence probe must SUCCEED here (a real ts_nanos) so the failure lands in the liveness
+    block specifically, not in the probe's own handler tested above."""
+    clock = Clock()
+    monkeypatch.setattr(ed, "time", clock)
+    dev = ed.EverDrive()
+    dev._params = Capture()
+
+    class NoClock:
+      ts_nanos = {ed.AC_MSG: {"EvrDrvAc_I_Actl": 10**12}}   # probe succeeds: a frame WAS seen
+
+      def __getattr__(self, name):                          # ._last_update_nanos is gone
+        raise AttributeError(f"CANParser has no attribute {name!r}")
+
+    clock.t += 10.0
+    dev.update(NoClock(), 0.0)                              # must not raise
+    logged = [m for lvl, m, a in carlogs if lvl == "exception" and "telemetry publish failed" in m]
+    assert len(logged) == 1, "Rule 2: swallowed is not enough, it must also be logged"
+    assert dev._off is False, "a transient parser fault is not a permanent latch"
+    assert dev._params.blobs == [], "nothing may be published from a failed liveness check"
 
   def test_a_failure_in_the_decode_path_is_swallowed_AND_logged(self, monkeypatch, carlogs):
     """Not just the param write -- anything inside the try."""
