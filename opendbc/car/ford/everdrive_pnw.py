@@ -72,7 +72,25 @@ LOG_EVERY_S = 60.0
 # is wrong" failure this project keeps paying for.
 RANGE_KM_BAND = (0.0, 409.3)      # 409.3 = the DBC's own stated max, below the two sentinels
 SOC_PCT_BAND = (0.0, 100.0)       # a real SoC cannot exceed 100 %
-EFF_WH_KM_BAND = (-99.9, 1159.9)  # exclusive of the -100 floor and of both sentinels
+# The efficiency lower bound is POSITIVE, not -99.9. `effOk` means "this is a real measurement", and a
+# negative average Wh/km is not one -- raws 1..9 decode to -90..-10 Wh/km, which are inside the signal's
+# declared range and are not sentinels, so nothing else would reject them. The consumer also DIVIDES by
+# this (the gain rate) and MULTIPLIES by it (assumed power), so a negative arrives as a confidently
+# signed wrong answer rather than an obviously broken one.
+EFF_WH_KM_BAND = (0.1, 1159.9)    # exclusive of the -100 floor, of negatives, and of both sentinels
+
+# everdrive2pnw: PLAUSIBILITY BAND ON THE AFTERMARKET AC METER. Unlike the three truck signals above,
+# 0x2A7 comes from a third-party module, and its DBC entry has NO counter and NO checksum -- so a
+# garbled frame is accepted by the parser as readily as a good one. Unbanded, the decode ceiling is
+# 409.6 A x 8191.9 V = 3.3 MW, which would (a) be published as fact and (b) overflow the UI's
+# fixed-width box and clip. Bands are PHYSICAL rather than an arbitrary kW cap:
+#   current  0 .. 100 A   -- beyond any plausible EVSE; 0 is required for the genuine unplugged frame
+#   voltage  0 .. 277 V   -- single-phase AC mains ceiling (277 V line-to-neutral on a 480Y system);
+#                            0 likewise, since the unplugged frame is all zeros and that is a REAL zero
+# Measured on this truck at L1: 12.50 A x 109.0 V. The implied ceiling, 27.7 kW, also bounds the UI's
+# gain-rate digits to the two the fixed-width exemplar allows.
+AC_I_BAND = (0.0, 100.0)
+AC_U_BAND = (0.0, 277.0)
 
 
 def _usable(seen: bool, value: float, band: tuple[float, float], nd: int) -> float | None:
@@ -173,7 +191,19 @@ class EverDrive:
 
   def _publish(self, cp, v_ego: float) -> None:
     ac = cp.vl[AC_MSG]
-    kw = (ac["EvrDrvAc_I_Actl"] * ac["EvrDrvAc_U_Actl"]) / 1000.0
+    amps, volts = ac["EvrDrvAc_I_Actl"], ac["EvrDrvAc_U_Actl"]
+
+    # everdrive2pnw: Rule 2 -- an implausible reading is NOT published as fact. 0x2A7 is aftermarket
+    # with no counter and no checksum, so a garbled frame decodes silently into a huge number. Skip
+    # this cycle instead: the key simply goes stale, the UI hides the box after its own _STALE_S, and
+    # the next good frame republishes. Logged (rate-limited) so a persistently garbled module is
+    # visible rather than looking like "the charger is unplugged".
+    if not (AC_I_BAND[0] <= amps <= AC_I_BAND[1] and AC_U_BAND[0] <= volts <= AC_U_BAND[1]):
+      self._log(("everdrive2pnw: 0x2A7 outside the physical band (%.3f A, %.1f V) -- frame " +
+                 "ignored, EverDriveStatus not updated this cycle") % (amps, volts))
+      return
+
+    kw = (amps * volts) / 1000.0
 
     # ORDER IS LOAD-BEARING, DO NOT REORDER THESE BELOW THE cp.vl READS. cp.ts_nanos is a plain dict
     # and RAISES KeyError for an unregistered message; cp.vl is a VLDict whose __getitem__ LAZILY

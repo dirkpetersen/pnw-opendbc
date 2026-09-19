@@ -442,18 +442,40 @@ class TestSentinelsAndEncodingFloorsAreNoneNeverNumbers:
     last = self._publish(monkeypatch, range_km=180.2, eff_wh_km=1160.0, soc_pct=49.99)   # raw 126
     assert last["effWhKm"] is None and last["effOk"] is False
 
+  @pytest.mark.parametrize("eff_wh_km", [-90.0, -50.0, -10.0])
+  def test_a_NEGATIVE_efficiency_is_None_and_effOk_is_False(self, monkeypatch, carlogs, eff_wh_km):
+    """Added 2026-09-19 to kill mutation M10f, which survived the first pass.
+
+    VehElEffAvg_No_Dsply has offset -100, so raws 1..9 decode to -90..-10 Wh/km: inside the signal's
+    declared range, not a sentinel, and (before this band) reported as a real measurement. `effOk`
+    means "this is a usable measurement", and a negative average Wh/km is not one. It also reaches
+    the consumer as BOTH a divisor (the gain rate) and a multiplier (assumed power), so a negative
+    would come back as a confidently-signed wrong answer rather than an obvious one.
+
+    The UI rejects eff <= 0 independently, so this is defence in depth -- but the producer is where
+    the claim "this is a measurement" is made, so it is where the band belongs."""
+    last = self._publish(monkeypatch, range_km=180.2, eff_wh_km=eff_wh_km, soc_pct=49.99)
+    assert last["effWhKm"] is None, f"{eff_wh_km} Wh/km was published as a real efficiency"
+    assert last["effOk"] is False
+    assert last["rangeKm"] == pytest.approx(180.2), "the other fields must be unaffected"
+
   def test_a_never_received_truck_message_is_None_not_zero(self, monkeypatch, carlogs):
     """A CANParser signal that has never arrived reads a PRE-FILLED 0.0 -- not its decoded floor,
-    the literal 0.0 (parser.py `_add_message`: `{s: 0.0 for s in signal_names}`). So a never-received
-    efficiency reads 0 Wh/km and a never-received SoC reads 0 %, BOTH OF WHICH ARE INSIDE THEIR
-    PLAUSIBILITY BANDS. The bands cannot catch this; only ts_nanos can."""
+    the literal 0.0 (parser.py `_add_message`: `{s: 0.0 for s in signal_names}`). A never-received SoC
+    therefore reads 0 %, and a never-received range reads 0 km, BOTH OF WHICH ARE INSIDE THEIR
+    PLAUSIBILITY BANDS. The bands cannot catch this; only ts_nanos can.
+
+    (EFF_WH_KM_BAND's lower bound was tightened to +0.1 on 2026-09-19 so `effOk` cannot be True for a
+    negative average Wh/km, which incidentally also excludes the 0.0 pre-fill. That is a HAPPY
+    ACCIDENT and must not be mistaken for the protection: SoC and range still admit 0.0, and mutation
+    M4d -- deleting `_usable`'s `seen` gate -- is what proves the ts_nanos check is load-bearing.)"""
     truck = Truck(monkeypatch)
     truck.run(6.0, ac=CHARGING, energy=truck.energy(range_km=180.2))   # eff + soc never transmitted
     last = truck.cap.blobs[-1]
     assert truck.pt.vl[ed.EFF_MSG]["VehElEffAvg_No_Dsply"] == 0.0     # the pre-fill that lies ...
     assert truck.pt.vl[ed.SOC_MSG]["BattTracSoc2_Pc_Actl"] == 0.0
-    assert ed.EFF_WH_KM_BAND[0] <= 0.0 <= ed.EFF_WH_KM_BAND[1]        # ... and the band accepts it
-    assert ed.SOC_PCT_BAND[0] <= 0.0 <= ed.SOC_PCT_BAND[1]
+    assert ed.SOC_PCT_BAND[0] <= 0.0 <= ed.SOC_PCT_BAND[1]            # ... and its band accepts it
+    assert ed.RANGE_KM_BAND[0] <= 0.0 <= ed.RANGE_KM_BAND[1]          # ... as does range's
     assert truck.pt.ts_nanos[ed.EFF_MSG]["VehElEffAvg_No_Dsply"] == 0
     assert last["rangeKm"] == pytest.approx(180.2)
     assert last["effWhKm"] is None and last["effOk"] is False
@@ -672,3 +694,67 @@ class TestNoExceptionCanEscapeIntoTheCar:
     dev.update(cp, 0.0)                                    # no openpilot on the path in a bare opendbc
     assert dev._off is True
     assert [m for lvl, m, a in carlogs if "could not open /dev/shm params" in m]
+
+
+# ---------------------------------------------------------------- T10
+class TestAcMeterPlausibilityBand:
+  """everdrive2pnw (added 2026-09-19 during Opus verification, closing two findings from the test pass):
+
+  `acKw` was the ONLY published number with no plausibility band. Unlike the three truck signals it
+  comes from an AFTERMARKET module, and its DBC entry has no counter and no checksum -- so a garbled
+  0x2A7 is accepted by the parser exactly as readily as a good one, and decodes to as much as
+  409.6 A x 8191.9 V = 3.3 MW. That would be (a) published as fact and (b) turned by the UI into a
+  gain-rate term wide enough to overflow the fixed-width box and CLIP the whole line.
+
+  The band is PHYSICAL, not an arbitrary kW cap: 0..100 A is beyond any plausible EVSE, and 0..277 V
+  is the single-phase AC mains ceiling (277 V line-to-neutral on a 480Y system). Zero is IN band in
+  both, because the unplugged frame is all zeros and that is a REAL measured zero -- the one case
+  that must keep publishing."""
+
+  # raw 20000 -> 125.0 A (over) with the measured 109.0 V; raw 4000 -> 500.0 V (over) with 12.5 A
+  OVER_CURRENT = bytes.fromhex("4e20000003680000")
+  OVER_VOLTAGE = bytes.fromhex("07d000000fa00000")   # 12.5 A x raw 4000 = 500.0 V (over)
+  ALL_ONES = b"\xff" * 8                       # 409.59375 A x 8191.875 V = 3.35 MW
+  AT_LIMIT = bytes.fromhex("3e80000008a80000")  # exactly 100.0 A x 277.0 V -- the inclusive boundary
+
+  def _run(self, monkeypatch, ac):
+    truck = Truck(monkeypatch)
+    truck.run(6.0, ac=ac, energy=truck.energy(range_km=180.2, eff_wh_km=320.0, soc_pct=49.99))
+    return truck
+
+  @pytest.mark.parametrize("name", ["OVER_CURRENT", "OVER_VOLTAGE", "ALL_ONES"])
+  def test_an_out_of_band_frame_is_not_published_and_is_logged(self, monkeypatch, carlogs, name):
+    """Rule 2: skipped, and SAID SO. Silently dropping it would look identical to 'unplugged'."""
+    truck = self._run(monkeypatch, getattr(self, name))
+    assert truck.cap.blobs == [], f"{name} was published as fact"
+    assert [m for lvl, m, a in carlogs if "outside the physical band" in m], f"{name} dropped silently"
+
+  def test_the_inclusive_boundary_still_publishes(self, monkeypatch, carlogs):
+    """The positive control. Without it, a band of (0,0) would pass every test above."""
+    truck = self._run(monkeypatch, self.AT_LIMIT)
+    assert truck.cap.blobs, "a frame exactly at the band limits must still publish"
+    assert truck.cap.blobs[-1]["acKw"] == pytest.approx(100.0 * 277.0 / 1000.0)
+
+  def test_the_real_charging_frame_is_unaffected(self, monkeypatch, carlogs):
+    """The measured frame must sail through untouched -- the band must not cost us the feature."""
+    truck = self._run(monkeypatch, CHARGING)
+    assert truck.cap.blobs[-1]["acKw"] == pytest.approx(1.363)   # producer rounds to 3 dp
+    assert not [m for lvl, m, a in carlogs if "outside the physical band" in m]
+
+  def test_the_unplugged_all_zero_frame_still_publishes_a_real_zero(self, monkeypatch, carlogs):
+    """0 A / 0 V is IN band on purpose: it is a measurement, not a fault. Collapsing it into the
+    out-of-band path would destroy the very distinction this feature exists to make."""
+    truck = self._run(monkeypatch, UNPLUGGED)
+    assert truck.cap.blobs, "the unplugged frame must still publish"
+    assert truck.cap.blobs[-1]["acKw"] == 0.0
+    assert truck.cap.blobs[-1]["acSeen"] is True
+
+  def test_a_garbled_frame_does_not_latch_the_feature_off(self, monkeypatch, carlogs):
+    """One bad frame must not end the session: the next good frame republishes."""
+    truck = Truck(monkeypatch)
+    energy = truck.energy(range_km=180.2, eff_wh_km=320.0, soc_pct=49.99)
+    truck.run(6.0, ac=self.ALL_ONES, energy=energy)
+    assert truck.cap.blobs == []
+    truck.run(6.0, ac=CHARGING, energy=energy)
+    assert truck.cap.blobs, "a good frame after a garbled one must republish"
+    assert truck.cap.blobs[-1]["acKw"] == pytest.approx(1.363)   # producer rounds to 3 dp
