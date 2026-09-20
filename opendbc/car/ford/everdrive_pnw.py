@@ -18,8 +18,12 @@ CANbus/ford/f-150/lightning/2024-25/ENERGY-RANGE-SIGNALS.md):
 ⚠️ HONESTY NOTE FOR WHOEVER BUILDS THE "->117mi" PROJECTION: `effWhKm` is NOT measured consumption.
 ENERGY-RANGE-SIGNALS.md §3 measured it constant at raw 42 (320 Wh/km) for an entire 13-minute drive,
 and §2 shows RngPerChrgAvg x it = 127.2 kWh against a 131 kWh pack -- i.e. it is the truck's
-REFERENCE efficiency used for range estimation (~the EPA figure), not a rolling average. A projection
-built on it is "range this supply buys at the EPA rate", not "at the rate you are actually driving".
+REFERENCE efficiency used for range estimation, not a rolling average. CORRECTED 2026-09-20: an
+earlier draft called it "~the EPA figure" and that is WRONG. 320 Wh/km = 515 Wh/mi = 1.94 mi/kWh,
+against an EPA-equivalent ~2.44 mi/kWh (320 mi / 131 kWh) and a MEASURED 3.8 mi/kWh on the city drive.
+So it is ~26% more pessimistic than EPA and about half the measured figure -- it behaves like the
+truck's own LONG-RUN average (unmoved off raw 42 across a drive and a full day). A projection built on
+it is "range this supply buys at the truck's own long-run rate", which is the conservative direction.
 That document also records (§3) that NO broadcast signal gives real vehicle consumption.
 """
 import time
@@ -38,7 +42,10 @@ AC_MSG = "EverDrive_AC_Meter_FD1"
 RANGE_MSG = "MtrTrac_Data2_FD1"
 EFF_MSG = "HEV_Powertrain_Data7_FD1"
 SOC_MSG = "Battery_Traction_4_FD1"
-ENERGY_MSGS = (AC_MSG, RANGE_MSG, EFF_MSG, SOC_MSG)
+# everdrive2pnw (2026-09-20): the truck's UNADJUSTED full-charge range. Paired with VehElEffAvg it
+# yields the pack's usable capacity without hardcoding one -- see CAP_* below.
+RPC_MSG = "Cluster_HEV_Data10_FD1"
+ENERGY_MSGS = (AC_MSG, RANGE_MSG, EFF_MSG, SOC_MSG, RPC_MSG)
 
 PARAM_KEY = "EverDriveStatus"
 
@@ -70,8 +77,19 @@ LOG_EVERY_S = 60.0
 #                        raw 126 NoDataExists / 127 Faulty -> 1160 / 1170 Wh/km
 # Shipping 254 mi of range because the BECM said NoDataExists is exactly the "plausible number that
 # is wrong" failure this project keeps paying for.
-RANGE_KM_BAND = (0.0, 409.3)      # 409.3 = the DBC's own stated max, below the two sentinels
+# 409.2, not 409.3. 4093 is the DBC's own GenSigStartValue for BOTH VehElRnge_L_Dsply (dbc:8128) and
+# RngPerChrgAvg_L_Dsply (dbc:9542) -- the value these signals carry BEFORE the ECU has an estimate,
+# which _usable()'s inclusive compare would otherwise accept. It is not a sentinel in the VAL_ table,
+# so nothing else rejects it, and it decodes to a completely plausible number: 409.3 km = 254 mi of
+# range, or 409.3 x 320 Wh/km = 131.0 kWh -- landing exactly on Ford's headline capacity, which is
+# the one wrong answer nobody would question. 4092 is the largest raw that is neither a start value
+# nor a sentinel. (Fable review 2026-09-20; the sibling RngPerChrgInst was observed saturating at
+# raw 4093 in 759 of 1547 samples on this truck, so this family does put 4093 on the wire.)
+RANGE_KM_BAND = (0.0, 409.25)
 SOC_PCT_BAND = (0.0, 100.0)       # a real SoC cannot exceed 100 %
+# RngPerChrgAvg band: 409.3 is the DBC's own max, below its sentinels. POSITIVE lower bound because
+# this is a load-bearing input to the derived capacity, and a zero or negative would poison it.
+RPC_KM_BAND = (0.1, 409.25)
 # The efficiency lower bound is POSITIVE, not -99.9. `effOk` means "this is a real measurement", and a
 # negative average Wh/km is not one -- raws 1..9 decode to -90..-10 Wh/km, which are inside the signal's
 # declared range and are not sentinels, so nothing else would reject them. The consumer also DIVIDES by
@@ -217,11 +235,13 @@ class EverDrive:
     # turns into can_valid False and an undriveable car. Touching ts_nanos first means a message the
     # DBC probe skipped fails loudly into _log_err() instead of silently arming that hazard.
     ts_range = cp.ts_nanos[RANGE_MSG]["VehElRnge_L_Dsply"]
+    ts_rpc = cp.ts_nanos[RPC_MSG]["RngPerChrgAvg_L_Dsply"]
     ts_eff = cp.ts_nanos[EFF_MSG]["VehElEffAvg_No_Dsply"]
     ts_soc = cp.ts_nanos[SOC_MSG]["BattTracSoc2_Pc_Actl"]
 
     # rounded to each signal's own DBC resolution: 0.1 km/bit, 10 Wh/km, 0.01 %/bit
     range_km = _usable(ts_range != 0, cp.vl[RANGE_MSG]["VehElRnge_L_Dsply"], RANGE_KM_BAND, 1)
+    rpc_km = _usable(ts_rpc != 0, cp.vl[RPC_MSG]["RngPerChrgAvg_L_Dsply"], RPC_KM_BAND, 1)
     eff_wh_km = _usable(ts_eff != 0, cp.vl[EFF_MSG]["VehElEffAvg_No_Dsply"], EFF_WH_KM_BAND, 0)
     soc_pct = _usable(ts_soc != 0, cp.vl[SOC_MSG]["BattTracSoc2_Pc_Actl"], SOC_PCT_BAND, 2)
 
@@ -243,6 +263,17 @@ class EverDrive:
       # REFERENCE efficiency, not measured consumption -- see the module docstring.)
       "effOk": eff_wh_km is not None,
       "socPct": soc_pct,
+      # everdrive2pnw (2026-09-20): the pack's usable capacity in kWh, DERIVED from the truck's own
+      # two numbers -- RngPerChrgAvg (unadjusted full-charge range) x VehElEffAvg -- rather than a
+      # hardcoded constant. Measured 2026-09-20: 396.9 km x 320 Wh/km = 127.0 kWh, against Ford's
+      # stated 131 kWh usable (3% apart). Deriving it means the figure follows if the truck revises
+      # its own estimate, and it stays self-consistent with the range shown beside it.
+      #
+      # !! UNVALIDATED, and the consumer must not present it as precise. Differencing SoC against the
+      # !! trip meter over the 2026-09-19 drive implies a usable capacity of 98-107 kWh instead -- a
+      # !! ~30% spread nobody has resolved. See ENERGY-RANGE-SIGNALS.md "kWh per % of SoC". One 20+
+      # !! mile drive with trip 1 reset settles it.
+      "capKwh": None if (rpc_km is None or eff_wh_km is None) else round(rpc_km * eff_wh_km / 1000.0, 2),
       "vMs": round(float(v_ego), 2),
     })
 
@@ -255,14 +286,17 @@ class EverDrive:
                        kw, ac["EvrDrvAc_I_Actl"], ac["EvrDrvAc_U_Actl"], range_km, eff_wh_km, soc_pct)
 
     # Rule 2: an EverDrive that IS talking on this bus means we are on the Lightning, so the truck's
-    # own three energy messages must be there too. If one is not, the DBC/bus assumption is wrong and
-    # that has to be visible rather than showing up as a silently missing half of the display box.
-    if not self._truck_gap_logged and (range_km is None or eff_wh_km is None or soc_pct is None):
+    # own energy messages must be there too. If one is not, the DBC/bus assumption is wrong and that
+    # has to be visible rather than showing up as a silently missing part of the display box.
+    # RngPerChrgAvg is included (2026-09-20) because capKwh depends on it: without it the consumer
+    # simply drops the kWh figure, which would otherwise be an invisible degradation.
+    if not self._truck_gap_logged and (range_km is None or eff_wh_km is None or soc_pct is None
+                                       or rpc_km is None):
       self._truck_gap_logged = True
       carlog.error("everdrive2pnw: 0x2A7 is live but a truck energy signal is not usable " +
-                   "(rangeKm=%s ts=%d, effWhKm=%s ts=%d, socPct=%s ts=%d; ts 0 = NEVER RECEIVED, " +
-                   "non-zero ts with a None value = sentinel or encoding floor)",
-                   range_km, ts_range, eff_wh_km, ts_eff, soc_pct, ts_soc)
+                   "(rangeKm=%s ts=%d, effWhKm=%s ts=%d, socPct=%s ts=%d, rngPerChrgKm=%s ts=%d; " +
+                   "ts 0 = NEVER RECEIVED, non-zero ts with a None value = sentinel or floor)",
+                   range_km, ts_range, eff_wh_km, ts_eff, soc_pct, ts_soc, rpc_km, ts_rpc)
 
   def _open_params(self) -> bool:
     """everdrive2pnw: build the /dev/shm handle ON FIRST PRESENCE, not at construction, so a truck

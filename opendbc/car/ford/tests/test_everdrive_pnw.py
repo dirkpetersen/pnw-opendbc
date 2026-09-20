@@ -40,6 +40,7 @@ AC_ADDR = 0x2A7
 RANGE_ADDR = 0x442
 EFF_ADDR = 0x36D
 SOC_ADDR = 0x24C
+RPC_ADDR = 0x471
 
 # The LITERAL payloads off the truck. Not reconstructed from a packer -- the bytes as captured.
 CHARGING = bytes.fromhex("07d0000003680000")
@@ -122,7 +123,7 @@ class Truck:
   def frame(self, msg: str, values: dict, bus: int = 0) -> CanData:
     return CanData(*self.packer.make_can_msg(msg, bus, values))
 
-  def energy(self, range_km=None, eff_wh_km=None, soc_pct=None) -> list[CanData]:
+  def energy(self, range_km=None, eff_wh_km=None, soc_pct=None, rpc_km=None) -> list[CanData]:
     """The truck's own three energy frames, packed from PHYSICAL values (the packer converts to raw
     with the DBC's own factor/offset, so e.g. 409.4 km == raw 4094 == NoDataExists)."""
     out = []
@@ -132,6 +133,8 @@ class Truck:
       out.append(self.frame("HEV_Powertrain_Data7_FD1", {"VehElEffAvg_No_Dsply": eff_wh_km}))
     if soc_pct is not None:
       out.append(self.frame("Battery_Traction_4_FD1", {"BattTracSoc2_Pc_Actl": soc_pct}))
+    if rpc_km is not None:
+      out.append(self.frame("Cluster_HEV_Data10_FD1", {"RngPerChrgAvg_L_Dsply": rpc_km}))
     return out
 
   def tick(self, *extra: CanData):
@@ -195,12 +198,18 @@ class TestCanValidIsNeverRiskedForADisplayBox:
     CP.flags = int(FordFlags.CANFD)
     return CP
 
-  def test_all_four_energy_messages_are_registered_ignore_alive(self):
-    """Structural: the nan probe is what makes them ignore_alive, and nothing else does."""
+  def test_every_energy_message_is_registered_ignore_alive(self):
+    """Structural: the nan probe is what makes them ignore_alive, and nothing else does.
+
+    The exact-set assertion below is DELIBERATE and must be updated by hand when a message is added
+    (it caught RngPerChrgAvg on 2026-09-20). That is the point: a new message that reaches `cp.vl`
+    WITHOUT going through the nan probe is alive-checked, and on a Ford that never transmits it that
+    is can_valid False -> ret.canValid False -> an undriveable car. Failing here is cheap; the
+    alternative is not."""
     pt = CarState.get_can_parsers(self._CP())[Bus.pt]
-    assert set(ed.ENERGY_MSGS) == {ed.AC_MSG, ed.RANGE_MSG, ed.EFF_MSG, ed.SOC_MSG}
+    assert set(ed.ENERGY_MSGS) == {ed.AC_MSG, ed.RANGE_MSG, ed.EFF_MSG, ed.SOC_MSG, ed.RPC_MSG}
     assert [pt.dbc.name_to_msg[m].address for m in ed.ENERGY_MSGS] == \
-           [AC_ADDR, RANGE_ADDR, EFF_ADDR, SOC_ADDR]        # 0x2A7 / 0x442 / 0x36D / 0x24C
+           [AC_ADDR, RANGE_ADDR, EFF_ADDR, SOC_ADDR, RPC_ADDR]   # 0x2A7/0x442/0x36D/0x24C/0x471
     for name in ed.ENERGY_MSGS:
       addr = pt.dbc.name_to_msg[name].address
       assert addr in pt.addresses, f"{name} must be registered up front, not lazily"
@@ -412,9 +421,18 @@ class TestSentinelsAndEncodingFloorsAreNoneNeverNumbers:
     assert self._publish(monkeypatch, range_km=409.5, eff_wh_km=320.0, soc_pct=49.99)["rangeKm"] is None
 
   def test_range_at_the_declared_maximum_is_still_a_real_reading(self, monkeypatch, carlogs):
-    """409.3 is the DBC's own stated max, one bit below the first sentinel. Not a sentinel."""
+    """CORRECTED 2026-09-20 (Fable). This test used to assert that 409.3 IS a real reading, on the
+    reasoning that it is the DBC's stated max and one bit below the first sentinel. That reasoning
+    checked the VAL_ sentinel table and missed `GenSigStartValue SG_ 1090 VehElRnge_L_Dsply 4093`
+    (dbc:8128) -- 409.3 is what the signal carries BEFORE the ECU has an estimate, and it decodes to
+    254 mi of range that does not exist. The band now stops below it.
+
+    The largest genuinely-real value is raw 4092 = 409.2 km, which must still pass -- that is what
+    this test now pins. See TestDbcStartValuesAreRejected for the rejection side."""
+    assert self._publish(monkeypatch, range_km=409.2, eff_wh_km=320.0,
+                         soc_pct=49.99)["rangeKm"] == pytest.approx(409.2)
     assert self._publish(monkeypatch, range_km=409.3, eff_wh_km=320.0,
-                         soc_pct=49.99)["rangeKm"] == pytest.approx(409.3)
+                         soc_pct=49.99)["rangeKm"] is None, "the start value is not a reading"
 
   def test_soc_NoDataExists_is_None_not_163_percent(self, monkeypatch, carlogs):
     last = self._publish(monkeypatch, range_km=180.2, eff_wh_km=320.0, soc_pct=163.82)
@@ -782,3 +800,97 @@ class TestAcMeterPlausibilityBand:
     truck.run(6.0, ac=CHARGING, energy=energy)
     assert truck.cap.blobs, "a good frame after a garbled one must republish"
     assert truck.cap.blobs[-1]["acKw"] == pytest.approx(1.363)   # producer rounds to 3 dp
+
+
+# ---------------------------------------------------------------- T11
+class TestDerivedPackCapacity:
+  """everdrive2pnw (2026-09-20): `capKwh` is the pack's usable energy, DERIVED from the truck's own
+  two numbers (RngPerChrgAvg x VehElEffAvg) instead of a hardcoded constant, so it follows if the
+  truck revises and stays self-consistent with the range shown beside it.
+
+  ⚠️ It is NOT a measurement of pack health. VehElEffAvg has 10 Wh/km resolution, so ONE LSB moves
+  the answer from 123.0 to 131.0 kWh at the observed 396.9 km -- Ford's stated 131 kWh usable sits
+  exactly on the next LSB up. Anyone reading a 127-vs-131 gap as degradation is reading quantisation.
+  test_one_lsb_of_efficiency_spans_fords_stated_capacity pins that so the claim cannot be lost."""
+
+  def _pub(self, monkeypatch, **energy):
+    truck = Truck(monkeypatch)
+    truck.run(6.0, ac=CHARGING, energy=truck.energy(**energy))
+    assert truck.cap.blobs, "nothing published -- the rest would be vacuous"
+    return truck.cap.blobs[-1]
+
+  def test_capacity_is_the_product_of_the_trucks_own_two_numbers(self, monkeypatch, carlogs):
+    last = self._pub(monkeypatch, range_km=156.1, eff_wh_km=320.0, soc_pct=43.85, rpc_km=396.9)
+    assert last["capKwh"] == pytest.approx(396.9 * 320.0 / 1000.0, abs=0.01)
+
+  @pytest.mark.parametrize("missing", ["rpc_km", "eff_wh_km"])
+  def test_capacity_is_None_when_either_input_is_missing(self, monkeypatch, carlogs, missing):
+    """Rule 2: half an input must not produce a confident number. NEVER a 0.0-as-a-guess."""
+    kw = dict(range_km=156.1, eff_wh_km=320.0, soc_pct=43.85, rpc_km=396.9)
+    kw.pop(missing)
+    assert self._pub(monkeypatch, **kw)["capKwh"] is None, f"missing {missing} must give None"
+
+  def test_a_sentinel_RngPerChrgAvg_is_None_not_a_capacity(self, monkeypatch, carlogs):
+    """raw 4094 NoDataExists decodes to 409.4 km -- which would imply a plausible 131 kWh."""
+    last = self._pub(monkeypatch, range_km=156.1, eff_wh_km=320.0, soc_pct=43.85, rpc_km=409.4)
+    assert last["capKwh"] is None
+
+  def test_a_missing_RngPerChrgAvg_is_logged_loudly(self, monkeypatch, carlogs):
+    """Without this the kWh figure just silently vanishes from the box -- an invisible degradation."""
+    self._pub(monkeypatch, range_km=156.1, eff_wh_km=320.0, soc_pct=43.85)
+    assert [m for lvl, m, a in carlogs if lvl == "error" and "rngPerChrgKm" in m]
+
+  def test_one_lsb_of_efficiency_spans_fords_stated_capacity(self, monkeypatch, carlogs):
+    """THE anti-misreading test. VehElEffAvg is 10 Wh/km per bit. At the observed 396.9 km one LSB
+    moves the derived capacity across Ford's entire stated figure, so a 127-vs-131 'gap' is
+    quantisation, not a degraded pack."""
+    caps = {}
+    for eff in (310.0, 320.0, 330.0):
+      caps[eff] = self._pub(monkeypatch, range_km=156.1, eff_wh_km=eff,
+                            soc_pct=43.85, rpc_km=396.9)["capKwh"]
+    assert caps[310.0] == pytest.approx(123.0, abs=0.05)
+    assert caps[320.0] == pytest.approx(127.0, abs=0.05)
+    assert caps[330.0] == pytest.approx(131.0, abs=0.05), "one LSB up IS Ford's 131 kWh"
+    assert caps[330.0] - caps[310.0] > 7.5, "the +/-1 LSB band must straddle 131 kWh"
+
+
+class TestDbcStartValuesAreRejected:
+  """Fable review 2026-09-20. `GenSigStartValue` is what a signal carries BEFORE its ECU has a real
+  estimate. For both 12-bit range signals that value is **4093**:
+
+      dbc:8128  VehElRnge_L_Dsply      GenSigStartValue 4093   -> 409.3 km = 254 mi of range
+      dbc:9542  RngPerChrgAvg_L_Dsply  GenSigStartValue 4093   -> 409.3 km -> 131.0 kWh capacity
+
+  Neither is in the VAL_ sentinel table, so nothing else rejects them, and both decode to a number a
+  human would accept without blinking -- 131.0 kWh is Ford's own headline capacity. The bands stop at
+  409.2 (4092, the largest raw that is neither a start value nor a sentinel) precisely for this.
+
+  The sibling RngPerChrgInst_L_Dsply -- same PCM_HEV, same 12-bit encoding -- was observed saturating
+  at raw 4093 in 759 of 1547 samples on this truck, so this signal family does put 4093 on the wire."""
+
+  def _pub(self, monkeypatch, **energy):
+    truck = Truck(monkeypatch)
+    truck.run(6.0, ac=CHARGING, energy=truck.energy(**energy))
+    assert truck.cap.blobs, "nothing published -- the rest would be vacuous"
+    return truck.cap.blobs[-1]
+
+  def test_RngPerChrgAvg_start_value_4093_is_not_a_131kWh_pack(self, monkeypatch, carlogs):
+    last = self._pub(monkeypatch, range_km=156.1, eff_wh_km=320.0, soc_pct=43.85, rpc_km=409.3)
+    assert last["capKwh"] is None, "409.3 km x 320 Wh/km = 131.0 kWh, indistinguishable from the truth"
+
+  def test_VehElRnge_start_value_4093_is_not_254_miles_of_range(self, monkeypatch, carlogs):
+    last = self._pub(monkeypatch, range_km=409.3, eff_wh_km=320.0, soc_pct=43.85, rpc_km=396.9)
+    assert last["rangeKm"] is None, "409.3 km = 254 mi -- a range the driver would plan a trip on"
+
+  def test_the_largest_REAL_value_still_passes(self, monkeypatch, carlogs):
+    """Positive control: the band must reject 4093, not everything near it."""
+    last = self._pub(monkeypatch, range_km=409.2, eff_wh_km=320.0, soc_pct=43.85, rpc_km=409.2)
+    assert last["rangeKm"] == pytest.approx(409.2)
+    assert last["capKwh"] == pytest.approx(409.2 * 320.0 / 1000.0, abs=0.01)
+
+  def test_a_zero_RngPerChrgAvg_is_None_not_a_zero_capacity(self, monkeypatch, carlogs):
+    """Kills mutation P7 (lower bound 0.1 -> 0.0), which survived the author's own pass. A zero
+    full-charge range would publish capKwh 0.0, and the UI would then print '(0.000kwh)' -- an empty
+    pack, from a signal that simply had not populated."""
+    last = self._pub(monkeypatch, range_km=156.1, eff_wh_km=320.0, soc_pct=43.85, rpc_km=0.0)
+    assert last["capKwh"] is None
