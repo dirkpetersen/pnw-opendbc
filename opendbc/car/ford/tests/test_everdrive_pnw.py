@@ -137,9 +137,10 @@ class Truck:
       out.append(self.frame("Cluster_HEV_Data10_FD1", {"RngPerChrgAvg_L_Dsply": rpc_km}))
     return out
 
-  def tick(self, *extra: CanData):
-    self.t += DT
-    self.clock.t += DT / 1e9
+  def tick(self, *extra: CanData, dt: int = DT):
+    # `dt` defaults to card's real 100 Hz; the one caller that overrides it says why at its use site.
+    self.t += dt
+    self.clock.t += dt / 1e9
     self.i += 1
     self.cs = self.CI.update([(self.t, self.stream + list(extra))])
     return self.cs
@@ -894,3 +895,366 @@ class TestDbcStartValuesAreRejected:
     pack, from a signal that simply had not populated."""
     last = self._pub(monkeypatch, range_km=156.1, eff_wh_km=320.0, soc_pct=43.85, rpc_km=0.0)
     assert last["capKwh"] is None
+
+
+# ---------------------------------------------------------------- T12
+def synth_drive(dev, *, kw, mph, seconds, cap=126.0, soc=50.0, ac_kw=0.0, t0=0.0,
+                dt=ed.PUBLISH_S, quantise=True):
+  """everdrive2pnw: feed `_gross_kw` a synthetic constant-power drive at the real publish cadence.
+
+  SoC is QUANTISED to its true 0.01 %/bit before being handed over, because the whole point of
+  MIN_DSOC_PCT is the quantisation: an un-quantised ramp would clear any floor instantly and every
+  test below would be measuring a resolution the signal does not have.
+
+  `kw` is the NET pack drain (what SoC actually sees). A charging EverDrive therefore shows up as a
+  smaller `kw` plus a non-zero `ac_kw`, which is exactly the situation grossKw has to undo.
+  Returns [(t, soc, gross_or_None), ...]."""
+  out = []
+  t = t0
+  end = t0 + seconds
+  v_ego = mph / 2.23694
+  while t < end - 1e-9:
+    s = soc - kw * (t - t0) / 3600.0 / cap * 100.0
+    if quantise:
+      s = int(s * 100.0) / 100.0        # the BECM puts whole LSBs on the wire, not a real number
+    out.append((t, s, dev._gross_kw(t, s, cap, v_ego, ac_kw)))
+    t += dt
+  return out
+
+
+class TestRollingConsumption:
+  """everdrive2pnw (2026-09-20): the rolling pack-consumption window behind the UI's "range at the
+  speed you are doing right now".
+
+  It is differenced out of pack SoC because ENERGY-RANGE-SIGNALS.md §3 ruled out every broadcast
+  power signal on this truck. That makes it a QUANTISED measurement -- 0.01 %/bit is 12.6 Wh at the
+  125.96 kWh measured over UDS on 2026-09-20 -- so most of what is tested here is the difference
+  between a number and a number-shaped piece of noise."""
+
+  def test_a_steady_drive_recovers_the_power_that_produced_it(self):
+    """The positive control the rest of the class depends on. 20 kW at 60 mph for 5 minutes."""
+    dev = ed.EverDrive()
+    got = [g for _t, _s, g in synth_drive(dev, kw=20.0, mph=60.0, seconds=300.0)]
+    live = [g for g in got if g is not None]
+    assert live, "a 5-minute steady drive must produce a consumption figure"
+    # +/-5 % is exactly what MIN_DSOC_PCT promises; assert it rather than a loose band.
+    assert all(19.0 <= g <= 21.0 for g in live), f"{min(live)}..{max(live)} kW for a 20 kW drive"
+
+  def test_nothing_is_reported_until_the_floor_is_met(self):
+    """Rule 2: a provisional figure is indistinguishable from a settled one once it is on screen.
+    WINDOW_MIN_S of moving time is required, so the first ~60 s must be None -- not a guess."""
+    dev = ed.EverDrive()
+    got = synth_drive(dev, kw=20.0, mph=60.0, seconds=120.0)
+    early = [g for t, _s, g in got if t < ed.WINDOW_MIN_S]
+    assert set(early) == {None}, "reported before WINDOW_MIN_S of moving time had elapsed"
+    assert any(g is not None for _t, _s, g in got), "positive control: it must start eventually"
+
+  def test_a_low_power_drive_waits_for_the_floor_instead_of_reporting_noise(self):
+    """3 kW at 15 mph: a 60 s window moves 0.04 % = 4 LSB, i.e. +/-25 % quantisation error. The floor
+    has to hold it back until 0.20 % has accumulated, which at 3 kW takes 302 s -- longer than
+    WINDOW_MAX_S, so on this input it must NEVER report."""
+    dev = ed.EverDrive()
+    got = [g for _t, _s, g in synth_drive(dev, kw=3.0, mph=15.0, seconds=600.0)]
+    assert set(got) == {None}, "0.04 %/min of SoC is noise; it must not be published as consumption"
+
+  def test_the_floor_is_the_stated_number_of_LSBs(self):
+    """Pins the arithmetic in the constant's comment: 0.20 % at 126 kWh is 0.252 kWh = 20 LSB."""
+    assert ed.MIN_DSOC_PCT == 0.20
+    assert ed.MIN_DSOC_PCT / 100.0 * 126.0 == pytest.approx(0.252)
+    assert ed.MIN_DSOC_PCT / 0.01 == 20               # LSBs -> +/-5 % worst-case quantisation
+
+  def test_grossKw_adds_the_everdrive_input_back(self):
+    """THE reason grossKw exists. SoC-derived consumption is already NET of whatever the charger is
+    feeding in, so a truck drawing 21.4 kW while taking 1.4 kW from the EverDrive drains the pack at
+    20 kW. Handing the UI that 20 kW and letting it apply `range * P/(P - acKw)` would count the
+    charger TWICE. grossKw must read 21.4."""
+    net = ed.EverDrive()
+    gross = ed.EverDrive()
+    n = [g for _t, _s, g in synth_drive(net, kw=20.0, mph=60.0, seconds=300.0, ac_kw=0.0)]
+    g = [x for _t, _s, x in synth_drive(gross, kw=20.0, mph=60.0, seconds=300.0, ac_kw=1.4)]
+    nl = [x for x in n if x is not None]
+    gl = [x for x in g if x is not None]
+    assert nl and gl and len(nl) == len(gl)
+    assert all(b - a == pytest.approx(1.4, abs=0.011) for a, b in zip(nl, gl, strict=True))
+    assert all(20.4 <= x <= 22.4 for x in gl), f"{min(gl)}..{max(gl)} for 20 kW net + 1.4 kW in"
+
+  def test_below_ten_mph_nothing_accumulates_at_all(self):
+    """Driver's explicit spec 2026-09-20. Below MOVING_MS the truck is drawing accessories with no
+    distance, which is not what this number means -- and `energy / grossKw x speed` would then be
+    extrapolating a road-speed average down to walking pace."""
+    dev = ed.EverDrive()
+    got = synth_drive(dev, kw=20.0, mph=9.9, seconds=600.0)
+    assert {g for _t, _s, g in got} == {None}, "accumulated below the moving threshold"
+    assert dev._cum_s == 0.0 and dev._cum_kwh == 0.0 and not dev._win
+    # and the boundary is inclusive on the moving side -- the positive control for the band
+    ok = ed.EverDrive()
+    assert any(g is not None for _t, _s, g in synth_drive(ok, kw=20.0, mph=10.1, seconds=300.0))
+
+  def test_a_stop_contributes_neither_time_nor_energy(self):
+    """A red light burns ~1.2 kW of accessory load over no distance. If the stop were folded in, the
+    consumption would read high and the range low. Drive, stop with the pack STILL DRAINING, drive
+    again: the figure must stay the moving figure."""
+    dev = ed.EverDrive()
+    a = synth_drive(dev, kw=20.0, mph=60.0, seconds=120.0)
+    soc_a = a[-1][1]
+    # 40 s stopped, SoC still falling at 1.2 kW -- and 10 samples of it are fed in at 0 mph
+    stopped = synth_drive(dev, kw=1.2, mph=0.0, seconds=40.0, soc=soc_a, t0=120.0)
+    assert {g for _t, _s, g in stopped} == {None}, "a stopped truck must not report"
+    b = synth_drive(dev, kw=20.0, mph=60.0, seconds=120.0, soc=stopped[-1][1], t0=160.0)
+    live = [g for _t, _s, g in b if g is not None]
+    assert live, "it must come back once moving again"
+    assert all(19.0 <= g <= 21.0 for g in live), \
+      f"the stop leaked into the average: {min(live)}..{max(live)} kW for a 20 kW drive"
+
+  def test_a_long_stop_ages_the_window_out_instead_of_reporting_it_later(self):
+    """Rule 2: a stale window must not be reported as current. After WINDOW_MAX_S parked, the whole
+    history is gone and the figure has to be rebuilt from scratch."""
+    dev = ed.EverDrive()
+    synth_drive(dev, kw=20.0, mph=60.0, seconds=180.0)
+    assert dev._win, "positive control: there was a window before the stop"
+    synth_drive(dev, kw=1.2, mph=0.0, seconds=ed.WINDOW_MAX_S + 5.0, soc=49.0, t0=180.0)
+    assert not dev._win, "a window older than WINDOW_MAX_S is not current and must be discarded"
+    back = synth_drive(dev, kw=20.0, mph=60.0, seconds=40.0, soc=49.0, t0=180.0 + ed.WINDOW_MAX_S + 5.0)
+    assert {g for _t, _s, g in back} == {None}, "40 s is below WINDOW_MIN_S -- it must rebuild, not resume"
+
+  def test_a_rising_soc_reports_nothing_rather_than_a_negative(self):
+    """SoC RISES on a long descent and while an EverDrive charges a moving truck. A negative window
+    total must not reach the UI, which DIVIDES by this number -- a negative kW is a negative range."""
+    dev = ed.EverDrive()
+    got = [g for _t, _s, g in synth_drive(dev, kw=-15.0, mph=60.0, seconds=300.0)]
+    assert set(got) == {None}, "a rising SoC produced a consumption figure"
+    assert dev._cum_kwh < 0.0, "positive control: the window really did accumulate a NEGATIVE drop"
+
+  def test_regen_inside_a_net_discharge_is_kept_not_discarded(self):
+    """The counterpart: an individual negative increment is real and belongs in the average. Only the
+    window TOTAL has to be positive. A drive that regenerates for a third of its length must report a
+    LOWER consumption, not no consumption."""
+    flat = ed.EverDrive()
+    synth_drive(flat, kw=30.0, mph=60.0, seconds=200.0)
+    steady = [g for _t, _s, g in synth_drive(flat, kw=30.0, mph=60.0, seconds=100.0, soc=48.0, t0=200.0)
+              if g is not None]
+    hilly = ed.EverDrive()
+    a = synth_drive(hilly, kw=30.0, mph=60.0, seconds=200.0)
+    b = synth_drive(hilly, kw=-20.0, mph=60.0, seconds=100.0, soc=a[-1][1], t0=200.0)
+    live = [g for _t, _s, g in b if g is not None]
+    assert steady and live
+    assert min(live) < min(steady), "the regen stretch must pull the average DOWN, not be dropped"
+    assert min(live) > 0.0, "and the reported figure must still be positive"
+
+  @pytest.mark.parametrize("cap_before,cap_after", [(127.0, 131.0), (131.0, 127.0)])
+  def test_a_capacity_revision_is_not_consumption(self, cap_before, cap_after):
+    """THE reason the increment is dSoC x capacity and not d(SoC x capacity). VehElEffAvg is
+    10 Wh/km per bit, so ONE LSB moves capKwh by ~4 kWh -- at 50 % SoC that is ~2 kWh of apparent
+    energy appearing in a single 0.2 s step, which differencing the PRODUCT would publish as ~100 kW
+    of consumption (inside NET_KW_MAX, so nothing else would catch it).
+
+    BOTH DIRECTIONS matter and they fail differently: a revision UP makes the window total negative
+    and the figure vanish; a revision DOWN manufactures the ~100 kW spike. Only the downward case is
+    dangerous, and only the upward case is obvious, so both are pinned."""
+    dev = ed.EverDrive()
+    a = synth_drive(dev, kw=20.0, mph=60.0, seconds=150.0, cap=cap_before)
+    before = [g for _t, _s, g in a if g is not None][-1]
+    # the truck revises its long-run efficiency by one LSB: 396.9 km x 330 Wh/km instead of x 320
+    b = synth_drive(dev, kw=20.0, mph=60.0, seconds=60.0, cap=cap_after, soc=a[-1][1], t0=150.0)
+    live = [g for _t, _s, g in b if g is not None]
+    assert live, "the revision must not stop the figure either"
+    assert max(live) < 30.0, f"a capacity revision was published as {max(live)} kW of consumption"
+    assert abs(max(live) - before) < 5.0, "the step must not move the figure by more than the rescale"
+
+  def test_a_dip_in_consumption_does_not_throw_the_figure_away(self):
+    """The window is shortened toward WINDOW_MIN_S by CHOOSING a newer baseline, not by discarding
+    the older snapshots. Discarding them (the first implementation here) makes the shortening
+    irreversible: the window settles at 60 s, consumption dips, the floor stops clearing and there is
+    no history left to grow back into. Replayed on route 000001b8--a46fe398b3 that flickered the
+    first number on and off in 10 blocks of median 14 s.
+
+    25 kW for 200 s (a 60 s window clears the floor with 1.65x margin), then 12 kW, at which a 60 s
+    window holds only 0.20 kWh against a 0.252 kWh floor. It must keep reporting throughout."""
+    dev = ed.EverDrive()
+    a = synth_drive(dev, kw=25.0, mph=60.0, seconds=200.0)
+    assert [g for _t, _s, g in a if g is not None], "positive control: it was reporting"
+    assert 12.0 * 60.0 / 3600.0 < ed.MIN_DSOC_PCT / 100.0 * 126.0, \
+      "premise: 12 kW over WINDOW_MIN_S must NOT clear the floor on its own"
+    b = synth_drive(dev, kw=12.0, mph=40.0, seconds=120.0, soc=a[-1][1], t0=200.0)
+    gaps = [g for _t, _s, g in b if g is None]
+    assert not gaps, f"the figure was lost for {len(gaps) * ed.PUBLISH_S:.1f} s of a 12 kW stretch"
+
+  def test_an_implausible_rolling_power_is_None_and_is_logged(self, monkeypatch, carlogs):
+    """The BECM's SoC is an ESTIMATE and can step. A 5 % step down is 6.3 kWh appearing at once; over
+    a 60 s window that is ~378 kW, and the UI would turn it into a 9-mile range on a healthy truck."""
+    monkeypatch.setattr(ed, "time", Clock())
+    dev = ed.EverDrive()
+    a = synth_drive(dev, kw=20.0, mph=60.0, seconds=150.0)
+    assert [g for _t, _s, g in a if g is not None], "positive control: it was reporting"
+    stepped = a[-1][1] - 5.0                      # the BECM re-estimates 5 points lower
+    got = [g for _t, _s, g in synth_drive(dev, kw=20.0, mph=60.0, seconds=30.0,
+                                          soc=stepped, t0=150.0)]
+    assert set(got) == {None}, "a stepped SoC estimate was published as consumption"
+    assert [m for lvl, m, _a in carlogs if "plausibility ceiling" in m], \
+      "Rule 2: skipping it silently looks exactly like 'the window is not full yet'"
+
+  def test_missing_inputs_drop_the_window_rather_than_pausing_it(self):
+    """Rule 2: if socPct or capKwh goes away the window stops being a continuous measurement. It must
+    be discarded, not resumed later as though nothing had happened."""
+    dev = ed.EverDrive()
+    synth_drive(dev, kw=20.0, mph=60.0, seconds=150.0)
+    assert dev._win and dev._cum_s > 0.0
+    assert dev._gross_kw(150.0, None, 126.0, 30.0, 0.0) is None          # socPct gone
+    assert not dev._win and dev._cum_s == 0.0 and dev._last_sample is None
+    synth_drive(dev, kw=20.0, mph=60.0, seconds=150.0, soc=49.0, t0=200.0)
+    assert dev._win, "and it rebuilds afterwards"
+    assert dev._gross_kw(400.0, 49.0, None, 30.0, 0.0) is None           # capKwh gone
+    assert not dev._win
+
+  def test_an_unwatched_gap_is_not_folded_into_the_window(self):
+    """Samples arrive every PUBLISH_S. A gap longer than SAMPLE_GAP_MAX_S means we were NOT watching
+    -- the module went quiet, or a garbled frame was skipped -- so the energy spent across it was
+    spent at a speed nobody measured. It must not become an increment.
+
+    The gap below is a LITERAL 3.0 s, not `SAMPLE_GAP_MAX_S + something`. Writing it in terms of the
+    constant makes the test scale with the constant and therefore prove nothing: mutation P7 raised
+    SAMPLE_GAP_MAX_S to 1e9 and the original version of this test moved its gap to 1e9 + 0.5 and
+    passed. The constant is asserted separately, once."""
+    assert ed.SAMPLE_GAP_MAX_S == 1.0, "5x PUBLISH_S -- tolerates dropped cycles, not a stop"
+    dev = ed.EverDrive()
+    dev._gross_kw(0.0, 50.0, 126.0, 30.0, 0.0)
+    dev._gross_kw(3.0, 49.0, 126.0, 30.0, 0.0)                           # 1 % "consumed" unseen
+    assert dev._cum_kwh == 0.0, "energy from an unwatched gap entered the window"
+    assert dev._cum_s == 0.0
+
+  def test_a_brief_dip_below_the_threshold_breaks_the_increment_chain(self):
+    """A dip below MOVING_MS SHORTER than SAMPLE_GAP_MAX_S -- a speed bump, a tight turn -- is the
+    one case where the moving gate is the only thing protecting the window: the gap guard cannot see
+    it, because the samples either side are less than a second apart.
+
+    2.0 s at 60 mph (9 increments = 1.8 s), 0.6 s below 10 mph, 2.0 s at 60 mph. The dip must
+    contribute NOTHING, and the first sample after it must start a FRESH increment rather than one
+    spanning it -- which is worth exactly 0.8 s of moving time that was never moving."""
+    dev = ed.EverDrive()
+    a = synth_drive(dev, kw=20.0, mph=60.0, seconds=2.0)
+    assert dev._cum_s == pytest.approx(1.8, abs=1e-9), "premise: 9 increments of PUBLISH_S"
+    b = synth_drive(dev, kw=20.0, mph=5.0, seconds=0.6, soc=a[-1][1], t0=2.0)
+    assert dev._cum_s == pytest.approx(1.8, abs=1e-9), "a sub-threshold sample accumulated"
+    synth_drive(dev, kw=20.0, mph=60.0, seconds=2.0, soc=b[-1][1], t0=2.6)
+    assert dev._cum_s == pytest.approx(3.6, abs=1e-9), \
+      "the increment after the dip spanned it -- 0.8 s of not-moving became moving time"
+
+  def test_a_fresh_object_carries_nothing_over_an_ignition_cycle(self):
+    """card is only_onroad, so CarState -- and this object -- are rebuilt on every onroad transition.
+    That IS the ignition reset, and it only works because no window state is global or class-level."""
+    dev = ed.EverDrive()
+    synth_drive(dev, kw=20.0, mph=60.0, seconds=200.0)
+    assert dev._win and dev._cum_s > 0.0
+    fresh = ed.EverDrive()
+    assert not fresh._win and fresh._cum_s == 0.0 and fresh._cum_kwh == 0.0
+    assert fresh._last_sample is None
+    assert {g for _t, _s, g in synth_drive(fresh, kw=20.0, mph=60.0, seconds=40.0)} == {None}
+
+  def test_the_window_never_grows_without_bound(self):
+    """Two hours of driving must not leave two hours of samples in memory."""
+    dev = ed.EverDrive()
+    synth_drive(dev, kw=20.0, mph=60.0, seconds=1200.0)
+    assert len(dev._win) <= int(ed.WINDOW_MAX_S / ed.PUBLISH_S) + 2
+    assert (dev._win[-1][0] - dev._win[0][0]) <= ed.WINDOW_MAX_S + ed.PUBLISH_S
+
+  def test_the_figure_tracks_a_change_of_road_within_the_window(self):
+    """"Short enough to track reality": after a sustained step from 20 kW to 45 kW the reported
+    figure must converge on the new number, not stay on the old one."""
+    dev = ed.EverDrive()
+    a = synth_drive(dev, kw=20.0, mph=60.0, seconds=200.0)
+    b = synth_drive(dev, kw=45.0, mph=70.0, seconds=ed.WINDOW_MAX_S, soc=a[-1][1], t0=200.0)
+    live = [g for _t, _s, g in b if g is not None]
+    assert live[-1] == pytest.approx(45.0, abs=2.5), f"still reading {live[-1]} kW after the step"
+
+
+class TestPublishedEnergyAndConsumption:
+  """The two new payload keys, end to end through the real Lightning CarInterface and the real DBC --
+  the same path `card` runs. The maths itself is unit-tested above; this is the WIRING."""
+
+  def test_energyKwh_is_socPct_times_capKwh(self, monkeypatch, carlogs):
+    truck = Truck(monkeypatch)
+    truck.run(6.0, ac=CHARGING, energy=truck.energy(range_km=156.1, eff_wh_km=320.0,
+                                                    soc_pct=43.85, rpc_km=396.9))
+    last = truck.cap.blobs[-1]
+    assert last["capKwh"] == pytest.approx(127.01, abs=0.01)
+    assert last["energyKwh"] == pytest.approx(43.85 / 100.0 * 127.01, abs=0.01)
+
+  @pytest.mark.parametrize("missing", ["soc_pct", "rpc_km", "eff_wh_km"])
+  def test_energyKwh_is_None_when_an_input_is_missing_never_zero(self, monkeypatch, carlogs, missing):
+    """Rule 2. A 0.0 here would print as an empty pack and as a zero range."""
+    kw = dict(range_km=156.1, eff_wh_km=320.0, soc_pct=43.85, rpc_km=396.9)
+    kw.pop(missing)
+    truck = Truck(monkeypatch)
+    truck.run(6.0, ac=CHARGING, energy=truck.energy(**kw))
+    assert truck.cap.blobs[-1]["energyKwh"] is None, f"missing {missing} must give None"
+
+  def test_grossKw_is_published_and_is_None_on_a_short_parked_session(self, monkeypatch, carlogs):
+    """The key must EXIST (the UI reads it every poll) and must be None until earned. A parked truck
+    with the charger plugged in is exactly the state the device sits in for hours."""
+    truck = Truck(monkeypatch)
+    truck.run(6.0, ac=CHARGING, energy=truck.energy(range_km=180.2, eff_wh_km=320.0,
+                                                    soc_pct=49.99, rpc_km=396.9))
+    last = truck.cap.blobs[-1]
+    assert "grossKw" in last, "the UI polls this key every cycle; it must always be present"
+    assert last["grossKw"] is None
+
+  def test_the_window_is_stepped_on_EVERY_publish_not_only_when_it_has_an_answer(self, monkeypatch,
+                                                                                 carlogs):
+    """Kills mutation P18. A window that is only advanced once it already has an answer can never
+    acquire one -- it would be a feature that quietly does nothing forever, with every other test in
+    this file still green because they all assert None on short runs."""
+    truck = Truck(monkeypatch)
+    calls = []
+    real = ed.EverDrive._gross_kw
+    monkeypatch.setattr(ed.EverDrive, "_gross_kw",
+                        lambda self, *a: (calls.append(a), real(self, *a))[1])
+    truck.run(6.0, ac=CHARGING, energy=truck.energy(range_km=180.2, eff_wh_km=320.0,
+                                                    soc_pct=49.99, rpc_km=396.9))
+    assert len(calls) == len(truck.cap.blobs), "one window step per published payload, always"
+    assert len(calls) > 10, "positive control: it really did publish repeatedly"
+    assert all(a[1] == pytest.approx(49.99) and a[2] is not None for a in calls), \
+      "the window must be handed the decoded SoC and capacity, not None"
+
+  def test_a_real_number_reaches_the_payload_and_is_rounded(self, monkeypatch, carlogs):
+    """The other half of P18: whatever the window computes has to actually land in `grossKw`. The
+    window's own maths is unit-tested above; this pins the WIRING, which no other test reaches
+    because a credible window needs a minute of driving that the 100 Hz harness cannot afford."""
+    truck = Truck(monkeypatch)
+    monkeypatch.setattr(ed.EverDrive, "_gross_kw", lambda self, *a: 21.4)
+    truck.run(6.0, ac=CHARGING, energy=truck.energy(range_km=180.2, eff_wh_km=320.0,
+                                                    soc_pct=49.99, rpc_km=396.9))
+    assert truck.cap.blobs[-1]["grossKw"] == 21.4
+
+  def test_end_to_end_a_minute_of_real_driving_produces_a_real_consumption(self, monkeypatch,
+                                                                           carlogs):
+    """THE integration test: the real Lightning CarInterface, the real DBC, the real CANPacker, a
+    falling SoC and a moving truck -- and a number out the far end. Everything in between (the nan
+    probe, the AC liveness gate, the 5 Hz publish, the window) has to work for this to pass.
+
+    30 kW at 62 mph for 75 s: 0.625 kWh = 0.49 % of SoC, comfortably over the 0.20 % floor, and
+    75 s is WINDOW_MIN_S plus the ~3 s the AC meter takes to arm.
+
+    Ticked at 20 Hz rather than card's 100 Hz, purely for runtime -- 75 s of simulated driving is
+    1500 CarInterface.update calls instead of 7500. Nothing under test depends on the tick rate
+    (the publisher gates on wall time, and every message still arrives far inside its alive
+    threshold, which `canValid` below asserts); the real 5 Hz publish cadence is pinned separately
+    by test_publishes_at_five_hz_while_live."""
+    truck = Truck(monkeypatch)
+    cap = 396.9 * 320.0 / 1000.0                       # what the producer will derive: 127.01 kWh
+    soc0, kw = 49.99, 30.0
+    hz, secs = 20, 75
+    for i in range(hz * secs):
+      slow = []
+      if i % hz == 0:
+        soc = soc0 - kw * (i / hz) / 3600.0 / cap * 100.0
+        slow = truck.energy(range_km=180.2, eff_wh_km=320.0, soc_pct=round(soc, 2), rpc_km=396.9)
+        slow.append(CanData(AC_ADDR, CHARGING, 0))
+      truck.tick(truck.frame("BrakeSysFeatures", {"Veh_V_ActlBrk": 100.0}), *slow,
+                 dt=int(1e9 / hz))
+      assert truck.cs.canValid, "the bus went invalid -- this test would then prove nothing"
+    assert truck.cs.vEgo > 25.0, "positive control: the truck must actually be moving"
+    gross = [b["grossKw"] for b in truck.cap.blobs if b["grossKw"] is not None]
+    assert gross, "75 s of 30 kW driving produced no consumption figure at all"
+    # 30 kW net + the measured 1.3625 kW of EverDrive input added back
+    assert all(29.0 <= g <= 33.0 for g in gross), f"{min(gross)}..{max(gross)} kW for a 30 kW drive"
+    assert truck.cap.blobs[-1]["energyKwh"] == pytest.approx(49.5 / 100.0 * cap, abs=0.4)

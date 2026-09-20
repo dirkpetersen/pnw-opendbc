@@ -27,6 +27,7 @@ it is "range this supply buys at the truck's own long-run rate", which is the co
 That document also records (§3) that NO broadcast signal gives real vehicle consumption.
 """
 import time
+from collections import deque
 
 from opendbc.car.carlog import carlog
 
@@ -110,6 +111,81 @@ EFF_WH_KM_BAND = (0.1, 1159.9)    # exclusive of the -100 floor, of negatives, a
 AC_I_BAND = (0.0, 100.0)
 AC_U_BAND = (0.0, 277.0)
 
+# everdrive2pnw (2026-09-20): ROLLING PACK CONSUMPTION -- the input to the UI's "range at the speed
+# you are doing right now" figure. There is still NO broadcast signal for vehicle power on this truck
+# (ENERGY-RANGE-SIGNALS.md §3 ruled out all eight candidates over 13 minutes of real driving), so it
+# is differenced out of the pack SoC, which IS verified. Two measurements made that viable on
+# 2026-09-20, both read over UDS and neither re-derived here:
+#
+#   0x224848 Energy  (HVB Energy to Empty) = 59.350 kWh
+#   0x224801 HvbSoc  (true SoC)            = 47.120 %   ==  broadcast 0x24C BattTracSoc2_Pc_Actl
+#
+#   -> usable capacity = 59.350 / 0.4712 = 125.96 kWh, MEASURED. The derived capKwh below
+#      (RngPerChrgAvg x VehElEffAvg) read 127.26 kWh at the same moment -- 1.0 % off, so it is now a
+#      VALIDATED derivation rather than a guess, and it stays derived because it tracks the truck.
+#   -> the BROADCAST SoC is the true SoC, so remaining energy needs no UDS at all.
+#
+# ---- MOVING_MS: accumulate only while actually driving (driver's explicit spec, 2026-09-20) -------
+# Below this the truck draws accessories with no distance, which is not what a consumption figure
+# used to predict range at a speed means. 10 mph is also the floor below which `energy / grossKw x
+# speed` stops meaning anything: the window's average power was measured at road speed, and the truck
+# does not draw it at walking pace, so extrapolating from it would be arithmetic, not a prediction.
+MOVING_MPH = 10.0
+MOVING_MS = MOVING_MPH / 2.23694          # 4.470 m/s
+#
+# ---- MIN_DSOC_PCT: the noise floor, in the units the quantisation actually lives in ---------------
+# BattTracSoc2_Pc_Actl is 0.01 %/bit, so at the measured 125.96 kWh ONE LSB IS 12.6 Wh. Differencing
+# two quantised readings carries up to +/-1 LSB of quantisation error regardless of how far apart they
+# are, so the accumulated drop is what sets the accuracy:
+#
+#     accumulated drop | LSBs | worst-case quantisation error
+#          0.05 %      |   5  |  +/-20 %      <- a figure built on 2-3 LSBs is noise wearing a number
+#          0.10 %      |  10  |  +/-10 %
+#          0.20 %      |  20  |   +/-5 %      <- CHOSEN
+#          0.50 %      |  50  |   +/-2 %      <- would need ~2 min even at highway power
+#
+# 0.20 % = 0.252 kWh at 125.96 kWh. +/-5 % on the consumption is +/-5 % on the printed range, which is
+# smaller than the spread between the truck's own three range estimates. Below the floor the producer
+# publishes None -- NEVER a provisional value, because a provisional one is indistinguishable from a
+# settled one on the screen.
+MIN_DSOC_PCT = 0.20
+#
+# ---- WINDOW_MIN_S / WINDOW_MAX_S: long enough for the floor, short enough to still be "now" -------
+# Time to accumulate 0.252 kWh is 907 / P seconds:
+#
+#       P = 40 kW (~70 mph highway)   ->  23 s
+#       P = 20 kW (~45 mph arterial)  ->  45 s
+#       P = 10 kW (~25 mph city)      ->  91 s
+#       P =  6 kW (~12 mph crawl)     -> 151 s     (1.2 kW measured accessory load + traction)
+#
+# MAX 180 s covers the whole range down to ~5 kW, which is about the least this truck can draw while
+# moving above 10 mph. Past 3 minutes the average stops describing the road you are on, and it is
+# multiplied by the CURRENT speed, so a stale average is a wrong prediction rather than an old one.
+# The cap is on WALL-CLOCK age precisely so that a long stop ages the window out.
+#
+# MIN 60 s is NOT the floor restated -- the window is shortened toward it whenever the floor still
+# clears, so 60 s is what the figure settles to at normal road power. At 20 kW a 60 s window moves
+# 0.2646 % = 26 LSB = +/-3.8 % quantisation: inside the +/-5 % the floor promises, and short enough to
+# follow a change of road within a minute. Shortening further would peg the figure at the quantisation
+# limit and make the printed range visibly jitter; not shortening at all would leave it 3 minutes
+# behind reality at highway speed. Below ~15 kW the floor binds and the window grows past 60 s on its
+# own, up to the 180 s cap.
+WINDOW_MIN_S = 60.0
+WINDOW_MAX_S = 180.0
+#
+# ---- SAMPLE_GAP_MAX_S: consecutive samples are PUBLISH_S apart; 5x that tolerates dropped cycles --
+# but not a gap we did not watch (the module going quiet, a garbled-frame skip). An unwatched gap
+# would fold energy spent at an unknown speed into the window.
+SAMPLE_GAP_MAX_S = 1.0
+#
+# ---- NET_KW_MAX: the same plausibility discipline every other published field here gets ------------
+# The BECM's SoC estimate can STEP -- it is an estimate, not a coulomb counter. A 5 % step down injects
+# 6.3 kWh into the window and comes out as ~378 kW, which the UI would turn into a 9-mile range while
+# the truck is perfectly healthy. 250 kW is above anything this truck sustains for a whole minute
+# (peak output is ~430 kW, but that is a few-second burst; towing up a long grade at speed is ~100 kW),
+# so a rolling average above it is a stepped estimate, not a measurement. Reported as None and logged.
+NET_KW_MAX = 250.0
+
 
 def _usable(seen: bool, value: float, band: tuple[float, float], nd: int) -> float | None:
   """everdrive2pnw: the decoded value rounded to its OWN resolution, or None if the message was never
@@ -158,6 +234,15 @@ class EverDrive:
     self._truck_gap_logged = False
     self._last_log_mono = -LOG_EVERY_S
     self._err = 0
+    # everdrive2pnw: the rolling-consumption window. Cumulative snapshots (wall_mono, moving_s,
+    # drop_kWh) so the window sums are two subtractions rather than a scan; `maxlen` is a hard memory
+    # bound only -- samples arrive no faster than PUBLISH_S, so the wall-clock trim always bites first.
+    # NOTHING HERE SURVIVES AN IGNITION CYCLE: `card` is only_onroad, so CarState -- and this object --
+    # are rebuilt on every onroad transition, which is the ignition-change reset.
+    self._win: deque[tuple[float, float, float]] = deque(maxlen=int(WINDOW_MAX_S / PUBLISH_S) + 2)
+    self._cum_s = 0.0                  # seconds accumulated ABOVE MOVING_MS only
+    self._cum_kwh = 0.0                # pack energy DROP over those seconds (may go down: regen)
+    self._last_sample: tuple[float, float] | None = None   # (mono, socPct) of the previous sample
 
   def update(self, cp, v_ego: float) -> None:
     """Called once per CarState.update() (100 Hz) with the POWERTRAIN parser. Never raises."""
@@ -209,11 +294,11 @@ class EverDrive:
         return
 
       self._next_mono = now + PUBLISH_S
-      self._publish(cp, v_ego)
+      self._publish(cp, v_ego, now)
     except Exception:
       self._log_err()
 
-  def _publish(self, cp, v_ego: float) -> None:
+  def _publish(self, cp, v_ego: float, now: float) -> None:
     ac = cp.vl[AC_MSG]
     amps, volts = ac["EvrDrvAc_I_Actl"], ac["EvrDrvAc_U_Actl"]
 
@@ -245,6 +330,15 @@ class EverDrive:
     eff_wh_km = _usable(ts_eff != 0, cp.vl[EFF_MSG]["VehElEffAvg_No_Dsply"], EFF_WH_KM_BAND, 0)
     soc_pct = _usable(ts_soc != 0, cp.vl[SOC_MSG]["BattTracSoc2_Pc_Actl"], SOC_PCT_BAND, 2)
 
+    # everdrive2pnw (2026-09-20): the pack's usable capacity, and the energy actually left in it.
+    # See the CAP/MIN_DSOC block above for why the capacity is derived rather than hardcoded, and for
+    # the 2026-09-20 UDS measurement that validated it to 1.0 %.
+    cap_kwh = None if (rpc_km is None or eff_wh_km is None) else round(rpc_km * eff_wh_km / 1000.0, 2)
+    energy_kwh = None if (soc_pct is None or cap_kwh is None) else round(soc_pct * cap_kwh / 100.0, 2)
+    # ORDER: the window must be stepped on EVERY publish, including the ones where it reports None,
+    # or it would only ever advance while it already had an answer.
+    gross_kw = self._gross_kw(now, soc_pct, cap_kwh, v_ego, kw)
+
     self._params.put_nonblocking(PARAM_KEY, {
       # Wall clock, for the UI's staleness check. Rule 2: this advances even if the DECODE is frozen,
       # so it is a heartbeat for "the publisher is running", NOT evidence the numbers are fresh. The
@@ -269,11 +363,22 @@ class EverDrive:
       # stated 131 kWh usable (3% apart). Deriving it means the figure follows if the truck revises
       # its own estimate, and it stays self-consistent with the range shown beside it.
       #
-      # !! UNVALIDATED, and the consumer must not present it as precise. Differencing SoC against the
-      # !! trip meter over the 2026-09-19 drive implies a usable capacity of 98-107 kWh instead -- a
-      # !! ~30% spread nobody has resolved. See ENERGY-RANGE-SIGNALS.md "kWh per % of SoC". One 20+
-      # !! mile drive with trip 1 reset settles it.
-      "capKwh": None if (rpc_km is None or eff_wh_km is None) else round(rpc_km * eff_wh_km / 1000.0, 2),
+      # VALIDATED 2026-09-20 to 1.0 % against a UDS read of 0x224848 Energy / 0x224801 HvbSoc
+      # (59.350 kWh at 47.120 % => 125.96 kWh usable, against 127.26 kWh derived at the same moment).
+      # It is still a 10 Wh/km-quantised product -- see test_one_lsb_of_efficiency_spans_fords_stated
+      # _capacity -- so a 126-vs-131 "gap" is quantisation, not a degraded pack.
+      "capKwh": cap_kwh,
+      # everdrive2pnw (2026-09-20): energy actually left in the pack, kWh. The broadcast SoC IS the
+      # true SoC (0x24C read 47.12 % against UDS HvbSoc 47.120 % on 2026-09-20), so this needs no UDS.
+      # None whenever socPct or capKwh is None -- never a 0.0-as-a-guess.
+      "energyKwh": energy_kwh,
+      # everdrive2pnw (2026-09-20): rolling pack consumption with the EverDrive input ADDED BACK, kW.
+      # GROSS, not net, and that is load-bearing: a SoC-derived figure is already net of whatever the
+      # charger is feeding in, so handing the UI a net figure and then letting it apply its
+      # `range * P/(P - acKw)` projection would count the charger TWICE. Gross is "what the truck
+      # would be drawing with no EverDrive fitted", which is what that projection has always meant.
+      # None until the window clears its floor -- see _gross_kw and the MIN_DSOC_PCT block.
+      "grossKw": gross_kw,
       "vMs": round(float(v_ego), 2),
     })
 
@@ -297,6 +402,102 @@ class EverDrive:
                    "(rangeKm=%s ts=%d, effWhKm=%s ts=%d, socPct=%s ts=%d, rngPerChrgKm=%s ts=%d; " +
                    "ts 0 = NEVER RECEIVED, non-zero ts with a None value = sentinel or floor)",
                    range_km, ts_range, eff_wh_km, ts_eff, soc_pct, ts_soc, rpc_km, ts_rpc)
+
+  def _gross_kw(self, now: float, soc_pct: float | None, cap_kwh: float | None,
+                v_ego: float, ac_kw: float) -> float | None:
+    """everdrive2pnw: rolling pack consumption in kW, GROSS of the EverDrive input, or None.
+
+    Stepped on every publish (~5 Hz). Returns a number only when the truck is moving above MOVING_MS
+    AND the window has accumulated a credible drop; otherwise None, which the UI reads as "fall back
+    to the truck's own range". None is never a provisional value: a half-built window would print a
+    number indistinguishable from a settled one.
+
+    THE INCREMENT IS BUILT FROM dSoC x capacity, NOT from d(SoC x capacity). That is not a rearranged
+    formula, it is the difference between a measurement and a fabricated spike: capKwh is a quantised
+    product, and ONE LSB of VehElEffAvg (10 Wh/km) moves it by ~4 kWh. Differencing the product would
+    turn a routine revision of the truck's own efficiency average into ~2 kWh of "consumption" in a
+    single 0.2 s step -- about 100 kW of pure artifact, inside NET_KW_MAX and therefore published as
+    fact. Differencing the SoC alone means a capacity revision changes only the SCALE of subsequent
+    increments, which is what it actually is.
+    """
+    if soc_pct is None or cap_kwh is None:
+      # Rule 2: a window whose inputs went away is not a current window. Drop it rather than let it
+      # be reported later as though it had been measured continuously.
+      self._win.clear()
+      self._cum_s = self._cum_kwh = 0.0
+      self._last_sample = None
+      return None
+
+    moving = v_ego >= MOVING_MS
+    if moving:
+      if self._last_sample is not None:
+        dt = now - self._last_sample[0]
+        if 0.0 < dt <= SAMPLE_GAP_MAX_S:
+          # SoC RISES under regen on a long descent, and while an EverDrive is charging a moving
+          # truck. That is a genuine negative increment and it belongs in the average -- it is only
+          # the WINDOW TOTAL that must stay positive, which the floor check below enforces. Letting a
+          # negative total through would put a negative kW into the UI's division.
+          self._cum_s += dt
+          self._cum_kwh += (self._last_sample[1] - soc_pct) / 100.0 * cap_kwh
+          self._win.append((now, self._cum_s, self._cum_kwh))
+      else:
+        self._win.append((now, self._cum_s, self._cum_kwh))   # baseline for the next increment
+      self._last_sample = (now, soc_pct)
+    else:
+      # Below MOVING_MS we stop sampling entirely, so the stopped interval contributes neither time
+      # nor energy. Clearing _last_sample is what makes the resumption start a fresh increment
+      # instead of one that silently spans the stop.
+      self._last_sample = None
+
+    # Hard cap on WALL-CLOCK age: this is also what ages the whole window out over a long stop.
+    while self._win and (now - self._win[0][0]) > WINDOW_MAX_S:
+      self._win.popleft()
+
+    if not moving or not self._win:
+      return None
+    # Pick the NEWEST baseline that still clears both constraints -- i.e. the shortest window that is
+    # long enough -- WITHOUT discarding the older snapshots. Popping them instead (the obvious
+    # implementation, and the first one written here) makes the shortening IRREVERSIBLE: the window
+    # settles at the 60 s boundary, and the moment consumption dips the floor no longer clears and it
+    # cannot grow back into history it has thrown away. Replayed against route 000001b8--a46fe398b3
+    # that produced a figure appearing and vanishing in 10 blocks of median 14 s across 14 minutes,
+    # which on screen is the first number flickering between two different quantities. Keeping the
+    # history costs a bounded forward scan and settles it: 5 blocks of median 72 s, and coverage up
+    # from 23 % to 37 % of that route -- against a ceiling of 71 %, which is simply how much of a
+    # stop-and-go city drive was spent above 10 mph at all.
+    # Conservative where regen makes cum_kwh non-monotonic: the scan stops at the first baseline that
+    # fails, so it may use a longer window than strictly necessary. Longer is the safe direction.
+    #
+    # ⚠️ NOT COVERED BY A TEST, AND SAID SO RATHER THAN QUIETLY LEFT (mutation P14, 2026-09-20).
+    # Replacing this scan with `popleft()` leaves all 87 tests in test_everdrive_pnw.py green. The two
+    # forms are output-identical on every synthetic profile tried -- constant power, power steps,
+    # regen bursts, coasts, stop-and-go cycles, capacity revisions -- because popping only hurts once
+    # the discarded history is needed AGAIN, and on a clean profile the next samples always restore
+    # the margin first. It separates only on the real, noisy article. Instrumented at the first
+    # divergence on route 000001b8--a46fe398b3 (t = 195.2 s):
+    #     baseline: 692 snapshots, oldest 180.0 s, window 137.6 s / 0.6812 kWh  -> 15.42 kW
+    #     popping : 303 snapshots, oldest  60.4 s, window  60.4 s / 0.2522 kWh  -> None (floor
+    #                                                                             0.2522, under by eps)
+    # i.e. popping pins the window EXACTLY on the floor and then has no margin for the next dip.
+    # Reproduce with the replay harness, not with pytest. If you are tempted to "simplify" this back
+    # to a popleft, run the route first.
+    floor_kwh = MIN_DSOC_PCT / 100.0 * cap_kwh
+    i = 0
+    while (i + 1 < len(self._win) and (self._cum_s - self._win[i + 1][1]) >= WINDOW_MIN_S
+           and (self._cum_kwh - self._win[i + 1][2]) >= floor_kwh):
+      i += 1
+    win_s = self._cum_s - self._win[i][1]
+    win_kwh = self._cum_kwh - self._win[i][2]
+    if win_s < WINDOW_MIN_S or win_kwh < floor_kwh:
+      return None                      # includes the SoC-went-UP case: win_kwh <= 0 < floor_kwh
+
+    net_kw = win_kwh * 3600.0 / win_s
+    if net_kw > NET_KW_MAX:
+      self._log(("everdrive2pnw: rolling consumption %.0f kW over %.0f s exceeds the %.0f kW " +
+                 "plausibility ceiling -- the pack SoC estimate stepped; no consumption reported")
+                % (net_kw, win_s, NET_KW_MAX))
+      return None
+    return round(net_kw + ac_kw, 2)
 
   def _open_params(self) -> bool:
     """everdrive2pnw: build the /dev/shm handle ON FIRST PRESENCE, not at construction, so a truck
