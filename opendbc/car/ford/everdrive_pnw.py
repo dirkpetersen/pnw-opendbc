@@ -333,7 +333,12 @@ class EverDrive:
     # everdrive2pnw (2026-09-20): the pack's usable capacity, and the energy actually left in it.
     # See the CAP/MIN_DSOC block above for why the capacity is derived rather than hardcoded, and for
     # the 2026-09-20 UDS measurement that validated it to 1.0 %.
+    # A capacity that rounds to 0.00 (the band floors multiply out to 0.1 km x 10 Wh/km) would make
+    # floor_kwh 0, and `win_kwh >= 0` then reports acKw itself as "consumption" -- a plausible wrong
+    # number. Treat it as no answer rather than publishing it (Rule 2).
     cap_kwh = None if (rpc_km is None or eff_wh_km is None) else round(rpc_km * eff_wh_km / 1000.0, 2)
+    if cap_kwh is not None and cap_kwh <= 0.0:
+      cap_kwh = None
     energy_kwh = None if (soc_pct is None or cap_kwh is None) else round(soc_pct * cap_kwh / 100.0, 2)
     # ORDER: the window must be stepped on EVERY publish, including the ones where it reports None,
     # or it would only ever advance while it already had an answer.

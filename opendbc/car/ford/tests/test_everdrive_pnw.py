@@ -896,6 +896,17 @@ class TestDbcStartValuesAreRejected:
     last = self._pub(monkeypatch, range_km=156.1, eff_wh_km=320.0, soc_pct=43.85, rpc_km=0.0)
     assert last["capKwh"] is None
 
+  def test_a_capacity_that_rounds_to_zero_is_None_not_a_zero_capacity(self, monkeypatch, carlogs):
+    """Fable review 2026-09-20. Both inputs can sit AT their band floors and still be 'usable':
+    0.1 km x 10 Wh/km = 0.001 kWh, which round(.., 2) takes to 0.00. That is in-band, so the
+    rpc_km == 0.0 guard above does not catch it. A zero capacity makes floor_kwh zero, and the
+    `win_kwh >= floor_kwh` test in _gross_kw then passes on ANY window -- publishing acKw itself
+    as 'consumption', a plausible wrong number rather than no answer (Rule 2)."""
+    last = self._pub(monkeypatch, range_km=156.1, eff_wh_km=10.0, soc_pct=43.85, rpc_km=0.1)
+    assert last["capKwh"] is None, "0.1 km x 10 Wh/km rounds to 0.00 kWh -- must be None"
+    assert last["energyKwh"] is None, "energy derives from capacity; it cannot survive it"
+    assert last["grossKw"] is None, "a zero floor must not let the window report"
+
 
 # ---------------------------------------------------------------- T12
 def synth_drive(dev, *, kw, mph, seconds, cap=126.0, soc=50.0, ac_kw=0.0, t0=0.0,
