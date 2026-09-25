@@ -228,6 +228,20 @@ class CarState(CarStateBase):
     ret.brake = 0
     ret.brakePressed = cp_chassis.vl["BrakeMessage"]["driverBrakeStatus"] == 2
 
+    # teslayaw2pnw: yaw rate (rad/s, positive = LEFT / counter-clockwise, the Ford convention controlsd's
+    # kActl = yawRate / vEgo expects). Without this carState.yawRate stayed at the capnp default 0.0, so every
+    # yaw-derived steering number on the Raven (kActl, achLat, peakAchLat, kErr) was a confident zero.
+    # Same frame the brake bit above rides on (0x20a on the chassis bus, 50 Hz): bits 32..43 LE, raw 2000 = 0.
+    # The upper nibble of byte 5 is a separate 4-bit counter (steps by 1 on every frame), so the field is exactly
+    # 12 bits. Verified on 7 Raven rlogs (2026-08-31 .. 09-07) against livePose.angularVelocityDevice.z (NEGATED:
+    # the device frame is z-down) and the steering-angle sign -- see the teslayaw2pnw commit message.
+    # HW3 only: that is the only platform it was measured on. Every other Tesla keeps the default, and the
+    # pnw capability view (PnwVehicle.yaw_rate_source) tells telemetry that 0.0 there is no reading.
+    # A missing BrakeMessage is not hidden here: the parser alive-checks it (brakePressed already reads it), so
+    # its loss surfaces as a CAN error rather than as a frozen yaw rate.
+    if self.CP.carFingerprint == CAR.TESLA_MODEL_S_HW3:
+      ret.yawRate = cp_chassis.vl["BrakeMessage"]["ESP_yawRate"]
+
     # Steering wheel
     if self.CP.carFingerprint == CAR.TESLA_MODEL_S_HW3:
       epas_status = cp_party.vl["EPAS_sysStatus"]

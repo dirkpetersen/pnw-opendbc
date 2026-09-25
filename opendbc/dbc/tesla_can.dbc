@@ -666,6 +666,7 @@ BO_ 1064 UI_telemetryControl: 8 GTW
 
 BO_ 522 BrakeMessage: 8 XXX
  SG_ driverBrakeStatus : 2|2@1+ (1,0) [0|3] "" XXX
+ SG_ ESP_yawRate : 32|12@1+ (0.001,-2) [-2|2.095] "rad/s" XXX
 
 BO_ 529 RCM_status: 8 RCM
  SG_ RCM_driverOrientationInitStatus : 2|3@0+ (1,0) [0|7] "" GTW,OCS
