@@ -253,10 +253,25 @@ struct CarState {
     # or disagree. It does NOT change `speed`; it tells a consumer what `speed` was decoded from.
     speedClusterUnit @7 :SpeedUnit;
 
+    # pnw fordtsr2pnw: the car's own traffic-sign speed limit (Ford CAN FD: 0x3CD Traffic_RecognitnData
+    # TsrVLim1MsgTxt_D_Rq, from the camera). The NUMBER ON THE SIGN, in the sign's own unit -- NOT converted:
+    # the module's unit flag follows the cluster's display unit, not the sign (a US 35 mph sign reads 35 with
+    # the flag at "Kph" on a km/h cluster). The consumer decides the unit (speedadjust: mph, US roads).
+    # 0 unless speedLimitSignStatus is `valid`.
+    speedLimitSign @8 :Float32;
+    speedLimitSignStatus @9 :SpeedLimitSignStatus;
+
     enum SpeedUnit {
       unknown @0;
       mph @1;
       kph @2;
+    }
+
+    enum SpeedLimitSignStatus {
+      unavailable @0;  # this car does not decode it (every car but a Ford CAN FD whose DBC carries 0x3CD)
+      valid @1;        # a fresh frame with 0 < value < 251
+      noLimit @2;      # a fresh frame without a usable limit (255 "NoLimit", 251 "LimitCancelled", 0 ...)
+      stale @3;        # no frame within 2 s (including never received)
     }
   }
 

@@ -21,6 +21,10 @@ GEAR_MISSING_LOG_S = 10.0
 # otherwise logs a change at most once per this many seconds (Cluster_Info1_FD1 arrives at ~10 Hz, so a flapping
 # bit must not become 10 lines a second).
 UNIT_LOG_S = 10.0
+# fordtsr2pnw: Traffic_RecognitnData (0x3CD) is sent at 1 Hz plus one frame on every change
+# (drives/2026-09-24/ford-tsr-measure). A value older than this is not the current sign.
+SIGN_STALE_S = 2.0
+SignStatus = structs.CarState.CruiseState.SpeedLimitSignStatus
 
 
 class CarState(CarStateBase):
@@ -80,6 +84,12 @@ class CarState(CarStateBase):
     self._unit_log_nanos: int | None = None
     self._unit_err = 0
 
+    # fordtsr2pnw: Rule 2 bookkeeping for the traffic-sign speed limit decode (see _sign_speed_limit).
+    self._sign_start_nanos: int | None = None
+    self._sign_logged = None               # last LOGGED (status, value); None = nothing logged yet
+    self._sign_log_nanos: int | None = None
+    self._sign_err = 0
+
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
     cp_cam = can_parsers[Bus.cam]
@@ -126,6 +136,8 @@ class CarState(CarStateBase):
       unit = self._cluster_unit(cp, cp_cam)
       ret.cruiseState.speedClusterUnit = unit
       is_metric = unit == SpeedUnit.kph
+      # fordtsr2pnw: the camera's traffic-sign speed limit, read-only (see _sign_speed_limit)
+      ret.cruiseState.speedLimitSign, ret.cruiseState.speedLimitSignStatus = self._sign_speed_limit(cp_cam)
     ret.cruiseState.speed = cp.vl["EngBrakeData"]["Veh_V_DsplyCcSet"] * (CV.KPH_TO_MS if is_metric else CV.MPH_TO_MS)
     ret.cruiseState.enabled = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (4, 5)
     ret.cruiseState.available = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (3, 4, 5)
@@ -326,6 +338,70 @@ class CarState(CarStateBase):
     else:
       carlog.warning(line)
 
+  def _sign_speed_limit(self, cp_cam) -> tuple[float, int]:
+    """fordtsr2pnw: (the number on the sign, status) from the camera's Traffic_RecognitnData (0x3CD) TsrVLim1MsgTxt_D_Rq.
+
+    MEASURED (drives/2026-09-24/ford-tsr-measure, 4.5 h / 416 km of 2026-09-24 Lightning rlogs): the frame originates on
+    bus 2 (camera) at 1 Hz plus one on every change, and is relayed onto bus 0 as src 128 -- so only the CAMERA parser
+    sees it. It held a limit 99.5 % of driving time; the only other value seen was 255 "NoLimit". The module is fused
+    with Ford's nav map (TsrStatMsgTxt_D_Rq "Available_FusionMode" in 100 % of frames), so it is not pure vision.
+
+    THE UNIT TRAP: TsrVlUnitMsgTxt_D_Rq is NOT the sign's unit. On 2026-09-13/14, with the cluster in km/h, it read 1
+    "Kph" in every frame while the number stayed the mph sign value (25/30/35 exactly where mapd said 25/30/35 mph). It
+    follows the cluster's display unit. So the number is returned AS IS -- never multiplied by a unit the flag names
+    (FrogPilot's decode would read a US 35 mph sign as 21.7 mph on a km/h cluster). The flag is logged, never used.
+
+    Status: `valid` for a frame at most SIGN_STALE_S old with 0 < value < 251 (DBC: 251 LimitCancelled .. 255 NoLimit);
+    `noLimit` for a fresh frame with any other value; `stale` when there is no frame that fresh, including never
+    received (ts_nanos stays 0 until a frame parses -- see _read_pro_power). The age is on the parser's own clock
+    (_last_update_nanos, see _publish_car_gps). The value is 0.0 unless valid.
+
+    Registered ignore_alive (nan frequency) in get_can_parsers, CAN FD only, DBC-probed; indexed only after the `in`
+    check, which never lazily registers (see _publish_car_gps), so a silent camera can never make canValid false. A car
+    that does not register it reports `unavailable`, the enum default. Never raises into card: a decode failure
+    reports `stale` and logs."""
+    if "Traffic_RecognitnData" not in cp_cam.vl:
+      return 0.0, SignStatus.unavailable
+    value, status, unit, age = 0.0, SignStatus.stale, None, None
+    try:
+      ts = int(cp_cam.ts_nanos["Traffic_RecognitnData"]["TsrVLim1MsgTxt_D_Rq"])
+      if ts != 0:
+        age = (cp_cam._last_update_nanos - ts) / 1e9
+        unit = int(cp_cam.vl["Traffic_RecognitnData"]["TsrVlUnitMsgTxt_D_Rq"])
+        if age <= SIGN_STALE_S:
+          raw = float(cp_cam.vl["Traffic_RecognitnData"]["TsrVLim1MsgTxt_D_Rq"])
+          if 0.0 < raw < 251.0:
+            value, status = raw, SignStatus.valid
+          else:
+            status = SignStatus.noLimit
+      self._log_sign(cp_cam, status, value, unit, age)
+    except Exception:
+      self._sign_err += 1
+      if self._sign_err == 1 or self._sign_err % 6000 == 0:
+        carlog.exception("fordtsr2pnw: sign speed limit decode failed (%d so far); reporting stale", self._sign_err)
+      value, status = 0.0, SignStatus.stale
+    return value, status
+
+  def _log_sign(self, cp_cam, status, value, unit, age) -> None:
+    """Rule 2: log the sign limit's status and value on every change, at most one line per UNIT_LOG_S (a boundary
+    wobble must not become a line a second), carrying the raw unit flag and the frame age. A never-received frame is
+    only a finding UNIT_LOG_S after carState started."""
+    now = cp_cam._last_update_nanos
+    if self._sign_start_nanos is None:
+      self._sign_start_nanos = now
+    key = (int(status), value)
+    if key == self._sign_logged:
+      return
+    if self._sign_logged is None and status == SignStatus.stale and (now - self._sign_start_nanos) / 1e9 < UNIT_LOG_S:
+      return                        # the first frame has not arrived yet: not a finding
+    if self._sign_log_nanos is not None and (now - self._sign_log_nanos) / 1e9 < UNIT_LOG_S:
+      return
+    self._sign_logged, self._sign_log_nanos = key, now
+    name = {SignStatus.valid: "valid", SignStatus.noLimit: "noLimit", SignStatus.stale: "stale"}.get(status, str(status))
+    carlog.warning(f"fordtsr2pnw: sign speed limit {name} {value:.0f} (Traffic_RecognitnData.TsrVlUnitMsgTxt_D_Rq={unit}, " +
+                   "NOT used: it follows the cluster, not the sign; " +
+                   ("frame never received" if age is None else f"frame age {age:.1f} s") + ")")
+
   def _read_pro_power(self, cp) -> None:
     """lightning-extra2pnw: latch the Pro Power Onboard state from the two messages that carry it.
 
@@ -480,7 +556,9 @@ class CarState(CarStateBase):
   # is relayed onto bus 0 with the TX flag (src 128; measured 1,000 frames per 60 s on src 2 and src 128), so only the
   # CAMERA parser can see it. nan frequency for the same reason as GPS_MSGS: a missing message must not make the car
   # undriveable. Registered on CAN FD only, where the decode runs.
-  UNIT_CAM_MSGS = ("IPMA_Data2",)
+  # fordtsr2pnw: Traffic_RecognitnData (0x3CD), the camera's traffic-sign speed limit. Same bus story as IPMA_Data2
+  # (measured on src 2, relayed as src 128) and the same nan registration: a car without it must stay driveable.
+  UNIT_CAM_MSGS = ("IPMA_Data2", "Traffic_RecognitnData")
 
   @staticmethod
   def get_can_parsers(CP):
