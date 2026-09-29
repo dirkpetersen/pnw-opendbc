@@ -200,3 +200,64 @@ def test_the_stalk_frame_is_alive_checked_on_the_raven(canbus):
   """Rule 2: a lost 0x45 must surface as a CAN error, not as a silently dead "off" button. Reading vl["STW_ACTN_RQ"] in
   update_legacy registers the message (alive-checked) on the first update, so no explicit subscription is needed."""
   assert 0x45 in Car(CAR.TESLA_MODEL_S_HW3).CI.can_parsers["chassis"].addresses
+
+
+# --- teslastalk2b F3: SpdCtrlLvrStat_Inv ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("code", [FWD, RWD])
+def test_a_set_inv_bit_reads_as_no_button(canbus, code):
+  """Bit 7 of byte 0 (SpdCtrlLvrStat_Inv) set = the lever value is not valid: it must not become a press."""
+  car = Car(CAR.TESLA_MODEL_S_HW3)
+  car.tick(stalk_frame(IDLE))
+  assert presses(car.tick(stalk_frame(code, inv=1))) == []
+  assert presses(car.tick(stalk_frame(code))) == [(ButtonType.mainCruise if code == FWD else ButtonType.resumeCruise, True)]
+
+
+def test_inv_arriving_while_pressed_releases_the_button(canbus):
+  car = Car(CAR.TESLA_MODEL_S_HW3)
+  car.tick(stalk_frame(FWD))
+  assert presses(car.tick(stalk_frame(FWD, inv=1))) == [(ButtonType.mainCruise, False)]
+
+
+# --- teslastalk2b F1: the log hold-off (the verdict is unchanged) --------------------------------------------
+
+def _flap(car, cycles, refuse_frames=EPS_REFUSAL_FRAMES, gap=1):
+  """The wheel-touched shape: refused for one frame, then lateral-only dropped (counter reset) for `gap` frames."""
+  cs = None
+  for _ in range(cycles):
+    _feed(car, refuse_frames, eac=1)
+    cs = _feed(car, gap, eac=1, commanded=False)
+  return cs
+
+
+def test_a_flapping_verdict_logs_once_per_holdoff_and_counts_the_rest(canbus, monkeypatch):
+  from opendbc.car.tesla import carstate
+  lines = []
+  monkeypatch.setattr(carstate.carlog, "error", lines.append)
+  car = Car(CAR.TESLA_MODEL_S_HW3)
+  _flap(car, 12)                                          # 12 * 51 frames ~ 6 s of 0.51 s flapping
+  refusal = [x for x in lines if "EPS" in x]
+  assert 1 <= len(refusal) <= 6, refusal                  # was ~24 lines (every flip)
+  assert "REFUSAL --" in refusal[0] and "suppressed" not in refusal[0]     # the FIRST onset is logged at once
+  assert any("flips suppressed" in x for x in refusal[1:])                 # and the held-off flips are counted
+
+
+def test_the_final_clear_is_always_logged(canbus, monkeypatch):
+  from opendbc.car.tesla import carstate
+  lines = []
+  monkeypatch.setattr(carstate.carlog, "error", lines.append)
+  car = Car(CAR.TESLA_MODEL_S_HW3)
+  _flap(car, 4)
+  _feed(car, 1, eac=2, commanded=False)
+  _feed(car, carstate.EPS_LOG_HOLDOFF_FRAMES + 5, eac=2, commanded=False)
+  assert "cleared" in lines[-1] and not car.CI.CS.eps_refused
+
+
+def test_the_holdoff_does_not_change_the_verdict(canbus, monkeypatch):
+  from opendbc.car.tesla import carstate
+  monkeypatch.setattr(carstate.carlog, "error", lambda *_: None)
+  car = Car(CAR.TESLA_MODEL_S_HW3)
+  for _ in range(6):
+    cs = _feed(car, EPS_REFUSAL_FRAMES, eac=1)
+    assert cs.steerFaultTemporary and car.CI.CS.eps_refused       # every re-fire still raises the alert
+    _feed(car, 1, eac=1, commanded=False)

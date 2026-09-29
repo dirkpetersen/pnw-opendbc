@@ -2,6 +2,7 @@ import copy
 from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, structs, create_button_events
 from opendbc.car.carlog import carlog
+from opendbc.car.holdoff_pnw import HoldOffGate
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
 from opendbc.car.pnw_vehicle import PnwVehicle
@@ -96,6 +97,7 @@ def stalk_button_code(raw: int) -> int:
 # counting from the latActive edge. 50 frames (0.5 s) is > 3x the longest observed run. CAVEAT: every one of those
 # runs is an engage handover or a driver override -- steering-only steady state has never been recorded.
 EPS_REFUSAL_FRAMES = 50
+EPS_LOG_HOLDOFF_FRAMES = 200   # teslastalk2b: 2 s at 100 Hz -- the log-line hold-off for a flapping verdict
 
 
 def next_eps_refusal(count: int, lateral_only_commanded: bool, eac_active: bool) -> tuple[bool, int]:
@@ -143,6 +145,8 @@ class CarState(CarStateBase):
     self.stalk_prev = 0          # teslastalk2pnw: previous FWD/RWD/0 stalk code
     self.eps_refusal_cnt = 0     # teslastalk2pnw: consecutive lateral-only-commanded && !EAC_ACTIVE frames
     self.eps_refused = False     # teslastalk2pnw: the detector's verdict (card.py logs it)
+    self.eps_log_gate = HoldOffGate(EPS_LOG_HOLDOFF_FRAMES, initial=False)  # teslastalk2b: log hold-off (not the verdict)
+    self.eps_log_frame = 0
     self.eac_status_raw = None   # teslastalk2pnw: EPAS_eacStatus / eacErrorCode as last read, for the log record
     self.eac_error_raw = None
     # teslastalk2pnw: written by CarController.update every frame ("openpilot is commanding lateral WITHOUT being
@@ -334,10 +338,18 @@ class CarState(CarStateBase):
       self.eac_status_raw, self.eac_error_raw = int(epas_status["EPAS_eacStatus"]), int(epas_status["EPAS_eacErrorCode"])
       refused, self.eps_refusal_cnt = next_eps_refusal(self.eps_refusal_cnt, self.lat_only_commanded,
                                                        eac_status == "EAC_ACTIVE")
-      if refused and not self.eps_refused:
-        carlog.error(f"teslastalk2pnw: EPS REFUSAL -- lateral-only commanded {EPS_REFUSAL_FRAMES} frames, eacStatus={eac_status} errorCode={eac_error_code}")
-      elif self.eps_refused and not refused:
-        carlog.error("teslastalk2pnw: EPS refusal cleared")
+      # teslastalk2b: the verdict can flip every ~0.51 s (wheel touched -> steerTempUnavailableSilent re-fires); the log
+      # line is held off to once per EPS_LOG_HOLDOFF_FRAMES with the suppressed flips counted. The verdict is untouched.
+      self.eps_log_frame += 1
+      out = self.eps_log_gate.step(refused, self.eps_log_frame)
+      if out is not None:
+        n = f" ({out[1]} flips suppressed)" if out[1] else ""
+        if refused and out[1] == 0:
+          carlog.error(f"teslastalk2pnw: EPS REFUSAL -- lateral-only commanded {EPS_REFUSAL_FRAMES} frames, eacStatus={eac_status} errorCode={eac_error_code}")
+        elif refused:
+          carlog.error(f"teslastalk2pnw: EPS REFUSAL{n} -- now refused, eacStatus={eac_status} errorCode={eac_error_code}")
+        else:
+          carlog.error(f"teslastalk2pnw: EPS refusal cleared{n}")
       self.eps_refused = refused
       ret.steerFaultTemporary = ret.steerFaultTemporary or refused
 
@@ -409,7 +421,10 @@ class CarState(CarStateBase):
     # STALK_* notes above for what the logs prove. selfdrived turns a mainCruise press while steering-only into
     # "everything off"; a resumeCruise press cancels a pending off-request (the pull re-engages).
     if self.pnw.stalk_cruise_buttons:
-      stalk = stalk_button_code(cp_chassis.vl["STW_ACTN_RQ"]["SpdCtrlLvr_Stat"])
+      # F3 (Fable): a set Inv bit (bit 7, "SpdCtrlLvrStat_Inv") means the lever value is not valid -> no button.
+      # Never set in 95,479 logged frames; this only makes the decode honour the flag.
+      inv = cp_chassis.vl["STW_ACTN_RQ"]["SpdCtrlLvrStat_Inv"]
+      stalk = 0 if inv else stalk_button_code(cp_chassis.vl["STW_ACTN_RQ"]["SpdCtrlLvr_Stat"])
       ret.buttonEvents = create_button_events(stalk, self.stalk_prev, STALK_BUTTONS)
       self.stalk_prev = stalk
 
