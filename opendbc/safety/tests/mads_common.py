@@ -431,3 +431,56 @@ class MadsLateralOnBrakeTestBase(abc.ABC):
     self.assertFalse(self.safety.get_controls_allowed_lateral(),
                      "a fault inside the window must veto the late-brake re-latch")
     self.assertFalse(self._mads_lateral_tx())
+
+class MadsBitsRefusedTestBase:
+  """teslamads2pnw: every safety config EXCEPT the Ford and the Raven's internal HW3 panda (teslaLegacy
+  FLAG_HW3 without FLAG_EXTERNAL_PANDA) must still REFUSE the MADS alternative_experience bits
+  (set_safety_hooks, safety.h). Push the bits the way a buggy or
+  compromised host would, then re-init: the state machine must stay off and lateral authority can never
+  latch. Panda safety does not depend on openpilot's PnwVehicle gate being right.
+
+  Needs from the car test: _pcm_status_msg(enable), _user_brake_msg(brake)."""
+
+  def _mads_push_bits_and_reinit(self):
+    self.safety.set_mads_params(True, False, False)
+    self.safety.set_safety_hooks(self.safety.get_current_safety_mode(), self.safety.get_current_safety_param())
+
+  def test_mads_bits_refused(self):
+    self._mads_push_bits_and_reinit()
+    self.assertFalse(self.safety.get_mads_system_enabled())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    for _ in range(5):
+      self._rx(self._pcm_status_msg(False))
+      self._rx(self._pcm_status_msg(True))
+      self._rx(self._user_brake_msg(True))
+      self._rx(self._user_brake_msg(False))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_mads_brake_still_takes_everything(self):
+    """With the bits pushed anyway: the brake clears controls_allowed and no lateral latch exists."""
+    self._mads_push_bits_and_reinit()
+    self._rx(self._pcm_status_msg(False))
+    self._rx(self._pcm_status_msg(True))
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._rx(self._user_brake_msg(True))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_mads_heartbeat_watchdog_cannot_affect_refused_config(self):
+    """madsheartbeat2pnw: the 1 Hz lateral watchdog runs on EVERY config (panda main.c calls it
+    unconditionally). Where the bits are refused the latch is always down, so it must never revoke,
+    grant, or touch controls_allowed -- heartbeat flag in both states."""
+    self._mads_push_bits_and_reinit()
+    for heartbeat in (False, True):
+      with self.subTest(heartbeat_engaged_mads=heartbeat):
+        self._rx(self._pcm_status_msg(False))
+        self._rx(self._pcm_status_msg(True))
+        self.assertTrue(self.safety.get_controls_allowed())
+        self.safety.set_heartbeat_engaged_mads(heartbeat)
+        for _ in range(50):
+          self.safety.mads_heartbeat_engaged_check()
+        self.assertTrue(self.safety.get_controls_allowed(), "longitudinal authority untouched")
+        self.assertFalse(self.safety.get_controls_allowed_lateral())
+        self._rx(self._user_brake_msg(True))
+        self.assertFalse(self.safety.get_controls_allowed())
+        self._rx(self._user_brake_msg(False))

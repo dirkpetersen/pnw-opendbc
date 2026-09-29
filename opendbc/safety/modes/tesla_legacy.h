@@ -11,6 +11,11 @@ static int chassis_bus = 0U;
 static int das_control_msg = 0x2bfU;
 static int di_torque1_msg = 0x106U;
 
+// safety param flags (opendbc/car/tesla/values.py TeslaSafetyFlags). File scope, not local to
+// tesla_legacy_init, because safety.h's MADS mode gate reads them before the hooks init runs.
+static const uint16_t TESLA_FLAG_EXTERNAL_PANDA = 4U;
+static const uint16_t TESLA_FLAG_HW3 = 32U;
+
 static bool tesla_legacy_stock_aeb = false;
 
 // Only rising edges while controls are not allowed are considered for these systems:
@@ -62,6 +67,13 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
                             (cruise_state == 6) ||  // PRE_FAULT
                             (cruise_state == 7);    // PRE_CANCEL
       vehicle_moving = cruise_state != 3; // STANDSTILL
+      // teslamads2pnw: ACC "main" = the cruise system is on, engaged or not. STANDBY(1) is main ON:
+      // measured on the Raven (drives/2026-09-28/tesla-brake-census), a brake press AND a stalk
+      // cancel both drop ENABLED -> STANDBY, never to OFF(0) (OFF only appears at power-up), so
+      // neither can revoke lateral through this path. OFF(0) and FAULT(5) are main OFF. This is
+      // REVOKE-ONLY: the MADS ACC-main rising edge is not an engage source (pnw/mads.h), and with
+      // MADS off (every config but the internal HW3 panda, see safety.h) nothing reads it.
+      acc_main_on = (cruise_state != 0) && (cruise_state != 5);
       pcm_cruise_check(cruise_engaged);
    }
 
@@ -194,12 +206,9 @@ static bool tesla_legacy_fwd_hook(int bus_num, int addr) {
 }
 
 static safety_config tesla_legacy_init(uint16_t param) {
-  const int TESLA_FLAG_EXTERNAL_PANDA = 4;
+  // Extract flags (EXTERNAL_PANDA and HW3 are file scope, above)
   const int TESLA_FLAG_HW1 = 8;
   const int TESLA_FLAG_HW2 = 16;
-  const int TESLA_FLAG_HW3 = 32;
-
-  // Extract flags
   tesla_external_panda = GET_FLAG(param, TESLA_FLAG_EXTERNAL_PANDA);
   tesla_hw1 = GET_FLAG(param, TESLA_FLAG_HW1);
   tesla_hw2 = GET_FLAG(param, TESLA_FLAG_HW2);

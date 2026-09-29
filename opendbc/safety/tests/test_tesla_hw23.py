@@ -10,6 +10,7 @@ from opendbc.can import CANDefine
 from opendbc.safety.tests.libsafety import libsafety_py
 import opendbc.safety.tests.common as common
 from opendbc.safety.tests.common import CANPackerSafety, away_round, round_speed
+from opendbc.safety.tests.mads_common import MadsLateralOnBrakeTestBase, MadsBitsRefusedTestBase, MadsSteeringModeOnBrake
 
 MSG_DAS_steeringControl = 0x488
 MSG_APS_eacMonitor = 0x27d
@@ -97,60 +98,6 @@ class TeslaLegacyLateralBase(common.CarSafetyTest, common.AngleSteeringSafetyTes
   def _pcm_status_msg(self, enable):
     values = {"DI_cruiseState": 2 if enable else 0, "DI_speedUnits": 1}  # 1 = KPH
     return self.packer_chassis.make_can_msg_safety("DI_state", self.chassis_bus, values)
-
-  # mads2pnw: the Raven must be entirely unaffected. openpilot only ever sets the MADS
-  # alternative_experience bits for the F-150 Lightning (opendbc/car/pnw_vehicle.py ->
-  # selfdrive/car/card.py), so on this car the MADS state machine is never enabled and the
-  # lateral gates behave exactly as they did before mads2pnw. Also: on the Raven the EPS
-  # inhibits itself (EAC_INHIBITED) on a brake press, so MADS could not help here anyway.
-  def test_mads_never_enabled_on_tesla(self):
-    # Push the bits the way a buggy/compromised host would, then re-init: set_safety_hooks must
-    # REFUSE them outside SAFETY_FORD. This is the defense-in-depth check -- panda safety does not
-    # depend on openpilot's PnwVehicle gate being right.
-    self.safety.set_mads_params(True, False, False)
-    self.safety.set_safety_hooks(self.safety.get_current_safety_mode(), self.safety.get_current_safety_param())
-    self.assertFalse(self.safety.get_mads_system_enabled())
-    self.assertFalse(self.safety.get_controls_allowed_lateral())
-    for _ in range(5):
-      self._rx(self._pcm_status_msg(False))
-      self._rx(self._pcm_status_msg(True))
-      self._rx(self._user_brake_msg(True))
-      self._rx(self._user_brake_msg(False))
-    self.assertFalse(self.safety.get_controls_allowed_lateral())
-
-  def test_mads_tesla_lateral_still_dies_on_brake(self):
-    self._rx(self._pcm_status_msg(False))
-    self._rx(self._pcm_status_msg(True))
-    self.assertTrue(self.safety.get_controls_allowed())
-    self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
-    self._rx(self._user_brake_msg(True))
-    self.assertFalse(self.safety.get_controls_allowed())
-    self.assertFalse(self.safety.get_controls_allowed_lateral())
-    self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
-
-  def test_mads_heartbeat_watchdog_cannot_affect_tesla(self):
-    """madsheartbeat2pnw: the new 1 Hz lateral watchdog runs on EVERY car (panda's main.c calls it
-    unconditionally). On the Raven the MADS state machine is never enabled, so the latch is always
-    down and the watchdog takes its else branch forever -- it must never revoke, grant, or touch
-    controls_allowed. Run it with the heartbeat flag in both states, engaged and disengaged."""
-    self.safety.set_mads_params(True, False, False)  # a buggy host pushing the bits anyway
-    self.safety.set_safety_hooks(self.safety.get_current_safety_mode(), self.safety.get_current_safety_param())
-    for heartbeat in (False, True):
-      with self.subTest(heartbeat_engaged_mads=heartbeat):
-        self._rx(self._pcm_status_msg(False))
-        self._rx(self._pcm_status_msg(True))
-        self.assertTrue(self.safety.get_controls_allowed())
-        self.safety.set_heartbeat_engaged_mads(heartbeat)
-        for _ in range(50):
-          self.safety.mads_heartbeat_engaged_check()
-        self.assertTrue(self.safety.get_controls_allowed(), "Tesla longitudinal authority untouched")
-        self.assertFalse(self.safety.get_controls_allowed_lateral())
-        self.assertTrue(self._tx(self._angle_cmd_msg(0, True)), "Tesla steering untouched")
-        # ... and the brake still takes everything, exactly as before
-        self._rx(self._user_brake_msg(True))
-        self.assertFalse(self.safety.get_controls_allowed())
-        self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
-        self._rx(self._user_brake_msg(False))
 
   def test_rx_hook(self):
     # Test angle command reception
@@ -385,8 +332,18 @@ class TeslaLegacyLongitudinalBase(common.CarSafetyTest, common.LongitudinalAccel
 
 
 # Lateral control tests (HW2 and HW3 non-external panda)
-class TestTeslaHW2Safety(TeslaLegacyLateralBase):
+class TestTeslaHW2Safety(TeslaLegacyLateralBase, MadsBitsRefusedTestBase):
   chassis_bus = 0
+
+  def test_mads_hw2_lateral_still_dies_on_brake(self):
+    """The pre-teslamads2pnw behaviour, pinned for the config that still refuses the bits."""
+    self._mads_push_bits_and_reinit()
+    self._rx(self._pcm_status_msg(False))
+    self._rx(self._pcm_status_msg(True))
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
+    self._rx(self._user_brake_msg(True))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
 
   def setUp(self):
     super().setUp()
@@ -399,7 +356,10 @@ class TestTeslaHW2Safety(TeslaLegacyLateralBase):
     self.safety.init_tests()
 
 
-class TestTeslaHW3Safety(TeslaLegacyLateralBase):
+class TestTeslaHW3Safety(TeslaLegacyLateralBase, MadsLateralOnBrakeTestBase):
+  """The Raven's INTERNAL panda: the one teslaLegacy config that accepts the MADS bits
+  (teslamads2pnw). The generic lateral-survives-brake claims come from MadsLateralOnBrakeTestBase; the
+  Tesla-specific wiring (DI_cruiseState -> acc_main_on, steering_disengage, real frame order) is below."""
   chassis_bus = 1  # HW3 uses bus 1 for chassis
 
   def setUp(self):
@@ -414,8 +374,160 @@ class TestTeslaHW3Safety(TeslaLegacyLateralBase):
 
     self.packer = CANPackerSafety("tesla_raven_party")
 
+  # --- MadsLateralOnBrakeTestBase hooks ------------------------------------
+
+  def _mads_lateral_tx(self) -> bool:
+    # a neutral angle command: inside every limit, so only the lateral authority gate can block it
+    return self._tx(self._angle_cmd_msg(0, True))
+
+  def _mads_engage(self) -> None:
+    self._rx(self._pcm_status_msg(False))
+    self._rx(self._pcm_status_msg(True))
+
+  def _mads_brake(self, pressed: bool) -> None:
+    # BrakeMessage alone. On the Raven a brake press drops DI_cruiseState ENABLED -> STANDBY (never OFF),
+    # which is a separate 0x368 frame; the tests that care send it explicitly (_di_state).
+    self._rx(self._user_brake_msg(pressed))
+
+  def _mads_disengage_no_brake(self) -> None:
+    # stalk cancel / any non-brake cruise drop: ENABLED -> STANDBY, main still on
+    self._rx(self._di_state(1))
+
+  def _di_state(self, cruise_state: int):
+    values = {"DI_cruiseState": cruise_state, "DI_speedUnits": 1}
+    return self.packer_chassis.make_can_msg_safety("DI_state", self.chassis_bus, values)
+
+  # --- Tesla-specific --------------------------------------------------------
+
+  def test_mads_bits_accepted_on_internal_hw3(self):
+    self._mads_apply(True)
+    self.assertTrue(self.safety.get_mads_system_enabled())
+
+  def test_mads_tesla_measured_frame_order_survives_brake(self):
+    """The order measured on the Raven (drives/2026-09-28/tesla-brake-census): the brake frame is logged
+    19-51 ms BEFORE the DI_state frame that drops cruise to STANDBY. The brake is already `braking` when
+    controls_allowed falls, so the plain survive-a-braked-falling-edge path holds it -- no re-latch window."""
+    self._mads_apply(True)
+    self._mads_engage()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self._rx(self._user_brake_msg(True))
+    self._rx(self._di_state(1))                 # ENABLED -> STANDBY, ~40 ms later
+    for _ in range(20):                          # ... and the stream continues, brake held then released
+      self._rx(self._di_state(1))
+    self._rx(self._user_brake_msg(False))
+    for _ in range(20):
+      self._rx(self._di_state(1))
+      self.assertFalse(self.safety.get_controls_allowed(), "brake takes longitudinal authority for good")
+      self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.assertTrue(self._mads_lateral_tx())
+
+  def test_mads_tesla_standby_is_main_on_off_and_fault_revoke(self):
+    """acc_main_on from DI_cruiseState: STANDBY(1) is main ON (a brake or a stalk cancel lands there and must
+    not revoke); OFF(0) and FAULT(5) are main OFF and revoke latched lateral."""
+    for state, revoked in ((1, False), (0, True), (5, True)):
+      with self.subTest(di_cruise_state=state):
+        self._mads_apply(True)
+        self._mads_engage()
+        self._rx(self._user_brake_msg(True))
+        self.assertTrue(self.safety.get_controls_allowed_lateral())
+        self._rx(self._di_state(state))
+        self.assertEqual(state != 0 and state != 5, self.safety.get_acc_main_on())
+        self.assertEqual(not revoked, self.safety.get_controls_allowed_lateral())
+        self.assertEqual(not revoked, self._mads_lateral_tx())
+
+  def test_mads_tesla_stalk_cancel_without_brake_drops_lateral(self):
+    """A cancel with the brake up (stalk push -> STANDBY) is an OP_DISENGAGE, not a brake: lateral ends."""
+    self._mads_apply(True)
+    self._mads_engage()
+    self._rx(self._di_state(1))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self._mads_lateral_tx())
+
+  def test_mads_tesla_stalk_cancel_while_lateral_only_changes_nothing(self):
+    """KNOWN LIMIT, pinned on purpose: after a brake the cruise state is already STANDBY, so a stalk cancel
+    there is STANDBY -> STANDBY (no edge) and does NOT end lateral. The driver's exits are a firm steer, the
+    heartbeat, main OFF/FAULT, and openpilot's own events. If this test starts failing, the behaviour changed."""
+    self._mads_apply(True)
+    self._mads_engage()
+    self._rx(self._user_brake_msg(True))
+    self._rx(self._di_state(1))
+    self._rx(self._user_brake_msg(False))
+    for _ in range(5):
+      self._rx(self._di_state(1))
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_mads_tesla_firm_steer_kills_lateral(self):
+    """steering_disengage (handsOnLevel >= 3, or EAC not-ok with error 9) revokes lateral, both while fully
+    engaged and while lateral-only, and the tx dies with it."""
+    for hands_on, eac_status, eac_err in ((3, 1, 0), (0, 0, 9)):
+      for lateral_only in (False, True):
+        with self.subTest(hands_on=hands_on, eac_err=eac_err, lateral_only=lateral_only):
+          self._mads_apply(True)
+          self._mads_engage()
+          if lateral_only:
+            self._rx(self._user_brake_msg(True))
+            self._rx(self._di_state(1))
+          self.assertTrue(self.safety.get_controls_allowed_lateral())
+          self._rx(self._angle_meas_msg(0, hands_on_level=hands_on, eac_status=eac_status, eac_error_code=eac_err))
+          self.assertFalse(self.safety.get_controls_allowed_lateral())
+          self.assertFalse(self.safety.get_controls_allowed())
+          self.assertFalse(self._mads_lateral_tx())
+          # releasing the wheel does not bring it back
+          self._rx(self._angle_meas_msg(0, hands_on_level=0, eac_status=1, eac_error_code=0))
+          self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_mads_tesla_light_hands_on_does_not_revoke(self):
+    """handsOnLevel 1-2 is the coop-steer band; it is NOT steering_disengage and must not end lateral."""
+    self._mads_apply(True)
+    self._mads_engage()
+    self._rx(self._user_brake_msg(True))
+    self._rx(self._di_state(1))
+    for level in (1, 2):
+      self._rx(self._angle_meas_msg(0, hands_on_level=level))
+      self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_mads_tesla_limits_still_enforced_after_brake(self):
+    """Authority, not amnesty: with lateral latched through a brake the angle rate / lateral-accel limits
+    still apply. A 100 deg step from 0 must be refused."""
+    self._mads_apply(True)
+    self._mads_engage()
+    self._rx(self._user_brake_msg(True))
+    self._rx(self._di_state(1))
+    self._reset_speed_measurement(30)    # m/s: the lateral-accel angle bound is a few degrees here
+    self.safety.set_desired_angle_last(0)
+    self.assertTrue(self._mads_lateral_tx())
+    self.assertFalse(self._tx(self._angle_cmd_msg(100, True)))
+
+  def test_mads_tesla_no_longitudinal_authority_on_brake(self):
+    """Lateral survives; controls_allowed (longitudinal, gas, everything else) does not, and cannot come
+    back without cruise engaging again."""
+    self._mads_apply(True)
+    self._mads_engage()
+    self._rx(self._user_brake_msg(True))
+    self._rx(self._di_state(1))
+    self._rx(self._user_brake_msg(False))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self._rx(self._di_state(2))          # cruise re-engaged by the stalk pull: full authority returns
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_mads_tesla_heartbeat_watchdog_revokes_lateral_only(self):
+    """The watchdog runs on the Raven's internal panda now: with openpilot not asking it revokes latched
+    lateral after 3 ticks, and never touches controls_allowed."""
+    self._mads_apply(True)
+    self._mads_engage()
+    self._rx(self._user_brake_msg(True))
+    self._rx(self._di_state(1))
+    self.safety.set_heartbeat_engaged_mads(False)
+    for _ in range(3):
+      self.assertTrue(self.safety.get_controls_allowed_lateral())
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.assertEqual(MadsSteeringModeOnBrake.REMAIN_ACTIVE, 0)  # (import used by the generic mixin too)
+
 # Longitudinal control tests (external panda configurations)
-class TestTeslaHW2ExternalPandaSafety(TeslaLegacyLongitudinalBase):
+class TestTeslaHW2ExternalPandaSafety(TeslaLegacyLongitudinalBase, MadsBitsRefusedTestBase):
   def setUp(self):
     super().setUp()
     self.RELAY_MALFUNCTION_ADDRS = {0: (MSG_DAS_Control_HW23,)}
@@ -428,7 +540,7 @@ class TestTeslaHW2ExternalPandaSafety(TeslaLegacyLongitudinalBase):
     self.safety.init_tests()
 
 
-class TestTeslaHW3ExternalPandaSafety(TeslaLegacyLongitudinalBase):
+class TestTeslaHW3ExternalPandaSafety(TeslaLegacyLongitudinalBase, MadsBitsRefusedTestBase):
   def setUp(self):
     super().setUp()
     self.RELAY_MALFUNCTION_ADDRS = {0: (MSG_DAS_Control_HW23,)}

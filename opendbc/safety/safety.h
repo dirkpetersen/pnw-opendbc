@@ -473,9 +473,17 @@ int set_safety_hooks(uint16_t mode, uint16_t param) {
   // DEFENSE IN DEPTH (Gemini + Fable review, 2026-09-05): the C state machine is generic, but the
   // ONLY car this fork intends MADS for is the Ford. Refuse the bits outright in every other
   // safety mode rather than trusting openpilot's Python capability gate as the sole guard --
-  // panda safety must not depend on the host being correct. In particular the Tesla Raven can
-  // then never latch lateral authority even if the bit reached the panda by mistake.
-  if (mode == SAFETY_FORD) {
+  // panda safety must not depend on the host being correct.
+  //
+  // teslamads2pnw: the Tesla Raven's INTERNAL panda (FLAG_HW3, not FLAG_EXTERNAL_PANDA) is the second
+  // car allowed the bits. That is the panda that carries all lateral authority (0x488 steering); its
+  // tx gate is already (controls_allowed || controls_allowed_lateral). Every other teslaLegacy config
+  // (external/longitudinal panda, HW1, HW2) still refuses them, so the Raven's DAS_control path can
+  // never see a lateral latch. Brake/cruise ordering measured on the Raven: drives/2026-09-28/tesla-brake-census.
+  const bool mads_capable_config = (mode == SAFETY_FORD) ||
+                                   ((mode == SAFETY_TESLA_LEGACY) && GET_FLAG(param, TESLA_FLAG_HW3) &&
+                                    !GET_FLAG(param, TESLA_FLAG_EXTERNAL_PANDA));
+  if (mads_capable_config) {
     mads_set_alternative_experience(&alternative_experience);
   } else {
     mads_set_system_state(false, false, false);

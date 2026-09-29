@@ -218,7 +218,7 @@ inline void m_update_control_state(void) {
  * which can only clear. Nothing in this function can set controls_allowed_lateral, and the
  * counter only advances while the latch is ALREADY up -- so with MADS off (the latch can never
  * be set: m_update_control_state gates on system_enabled, and set_safety_hooks refuses the MADS
- * bits outside SAFETY_FORD) this function is a no-op that just holds the counter at zero.
+ * bits outside the Ford and Raven-internal configs, safety.h) this function is a no-op that just holds the counter at zero.
  */
 inline void mads_heartbeat_engaged_check(void) {
   if (controls_allowed_lateral && !heartbeat_engaged_mads) {

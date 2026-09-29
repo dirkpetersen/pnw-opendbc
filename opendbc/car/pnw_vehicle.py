@@ -46,7 +46,12 @@ class PnwVehicle:
     # selfdrive/controls/lib/pnw_vehicle.py `mads_resume`; the fingerprint check lives HERE ONLY.
     # The brain (selfdrive/controls/lib/madsresume_pnw.py) additionally refuses to publish at all
     # unless madsState.available is true, i.e. unless the flashed panda actually carries MADS.
-    self.mads_lateral: bool = fp == "FORD_F_150_LIGHTNING_MK1"
+    #
+    # teslamads2pnw: the Raven (internal HW3 panda) joins. Its brake press drops DI_cruiseState to STANDBY
+    # while the EPS keeps accepting lateral (EAC goes AVAILABLE, not INHIBITED; drives/2026-09-28/
+    # tesla-brake-census -- brake is ~55% of Raven disengages). mads_resume stays False for it:
+    # button_management needs stock_acc_buttons, which the Raven does not have.
+    self.mads_lateral: bool = fp in ("FORD_F_150_LIGHTNING_MK1", "TESLA_MODEL_S_HW3")
     self.mads_resume: bool = self.button_management and self.mads_lateral
 
     # predicted-curvature blend (fordlat2pnw): Ford curvature-only lateral cars where the
