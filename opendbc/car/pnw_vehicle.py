@@ -54,6 +54,12 @@ class PnwVehicle:
     self.mads_lateral: bool = fp in ("FORD_F_150_LIGHTNING_MK1", "TESLA_MODEL_S_HW3")
     self.mads_resume: bool = self.button_management and self.mads_lateral
 
+    # teslastalk2pnw: the Raven's speed-control stalk (STW_ACTN_RQ 0x45, chassis bus) is read into ButtonEvents
+    # (FWD push -> mainCruise, RWD pull -> resumeCruise) so a stalk cancel can end steering-only. Read-only.
+    self.stalk_cruise_buttons: bool = fp == "TESLA_MODEL_S_HW3"
+    # teslastalk2pnw: alert when the EPS does not follow a lateral-only command (Rule 2 for teslamads2pnw).
+    self.eps_refusal_alert: bool = fp == "TESLA_MODEL_S_HW3"
+
     # predicted-curvature blend (fordlat2pnw): Ford curvature-only lateral cars where the
     # BluePilot-derived turn-exit blend is validated
     self.pc_blend: bool = fp == "FORD_F_150_LIGHTNING_MK1"

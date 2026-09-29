@@ -44,6 +44,9 @@ class CarController(CarControllerBase):
     # When enabling in a tight curve, we wait until user reduces steering force to start steering.
     # Canceling is done on rising edge and is handled generically with CC.cruiseControl.cancel
     lat_active = CC.latActive and CS.hands_on_level < 3
+    # teslastalk2pnw: tell carstate whether we are commanding lateral WITHOUT full engagement (steering-only), for
+    # the EPS-refusal detector. Uses the effective lat_active so a driver override (hands_on_level >= 3) is not judged.
+    CS.lat_only_commanded = bool(lat_active and not CC.enabled)
 
     if self.frame % 2 == 0:
       # Angular rate limit based on speed

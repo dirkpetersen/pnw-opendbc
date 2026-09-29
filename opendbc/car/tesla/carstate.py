@@ -1,9 +1,10 @@
 import copy
 from opendbc.can import CANDefine, CANParser
-from opendbc.car import Bus, structs
+from opendbc.car import Bus, structs, create_button_events
 from opendbc.car.carlog import carlog
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
+from opendbc.car.pnw_vehicle import PnwVehicle
 from opendbc.car.tesla.teslacan import get_steer_ctrl_type
 from opendbc.car.tesla.values import DBC, CANBUS, GEAR_MAP, STEER_THRESHOLD, TeslaFlags, TeslaLegacyParams, CAR, LEGACY_CARS
 
@@ -51,6 +52,60 @@ def next_steer_fault_temporary(count: int, inhibited: bool, err_idle: bool) -> t
   return count >= EAC_IDLE_REPORT, count
 
 
+# teslastalk2pnw: the speed-control stalk (STW_ACTN_RQ 0x45, chassis bus) as a driver-reachable "off".
+#
+# After teslamads2pnw a brake leaves the Raven steering with TACC in STANDBY, and a stalk CANCEL leaves
+# DI_cruiseState in STANDBY too -- so from the steering-only state a cancel produces NO state change and the
+# only exits were a firm steer or pull-then-push. The lever itself is readable and passive (read-only, no TX,
+# no panda change: 0x45 already reaches carstate, TurnIndLvr_Stat is read from it on the Model X).
+#
+# WHAT THE LOGS PROVE (166 rlogs, 2026-08-31 .. 09-27; drives/2026-09-28/tesla-stalk-decode/DRIVE_REPORT.md):
+#   SpdCtrlLvr_Stat raw value -> lever position -> observed effect on DI_cruiseState (0x368):
+#     2  RWD     pull toward driver   STANDBY -> ENABLED (engage/resume) in 29 of 32 presses from STANDBY (the 3 others: 1 FAULT, 2 at 41 m/s)
+#     1  FWD     push away            ENABLED -> STANDBY 10 ms after the frame, no brake, openpilot disabled 15 ms
+#                                     after -- ONE press in the whole corpus, so "cancel" is proven for the ENGAGED
+#                                     state by n=1; its effect from STANDBY is NOT observed (inferred: the lever
+#                                     position is the sensor, independent of DI state).
+#     4/8   UP_2ND/DN_2ND, 16/32 UP_1ST/DN_1ST   speed +/-: no state change while ENABLED.
+#   The DBC's UP_1ST/DN_1ST are the speed-adjust detents, NOT cancel/engage as the feasibility doc guessed.
+# Only FWD and RWD are emitted; every other value (speed detents, idle, SNA) reads as "no button".
+# Byte 0 was 0x40 (idle) / 0x41 / 0x42 ... in every frame: the Inv bit (7) was never set, VSL_Enbl_Rq (6) always.
+STALK_FWD = 1
+STALK_RWD = 2
+STALK_BUTTONS = {STALK_FWD: ButtonType.mainCruise, STALK_RWD: ButtonType.resumeCruise}
+
+
+def stalk_button_code(raw: int) -> int:
+  """The stalk value that becomes a ButtonEvent: FWD (1), RWD (2) or 0 for anything else."""
+  raw = int(raw)
+  return raw if raw in STALK_BUTTONS else 0
+
+
+# teslastalk2pnw: the EPS refusal detector (Fable finding 2, CLAUDE.md Rule 2).
+#
+# Steering-only (MADS lateral through a brake) commands angle while DI_cruiseState is STANDBY. Whether the EPS
+# ACCEPTS those commands in that state has never been observed on this car. If it does not, eacStatus stays
+# AVAILABLE, nothing steers, and LatControlAngle's saturation uses steer_limited_by_safety on Tesla, so no alert
+# ever fired. This turns "openpilot is commanding lateral alone and the EPS is not ACTIVE" into steerFaultTemporary
+# (SOFT_DISABLE: with hands off >= 1.5 s it ends lateral-only, chime but no text; with the wheel touched it is
+# steerTempUnavailableSilent and re-fires every 51 frames. The angle command stops within one frame either way).
+#
+# THRESHOLD, from the logs (166 rlogs, 482,584 frames with latActive, EPAS_sysStatus 0x370 at 100 Hz on bus 0):
+# 31 latActive rising edges; eacStatus reached ACTIVE in 25-204 ms (median 43 ms, p99 159 ms); the longest run of
+# consecutive latActive frames with eacStatus != ACTIVE anywhere in the corpus was 15 frames (0.15 s), 21 frames
+# counting from the latActive edge. 50 frames (0.5 s) is > 3x the longest observed run. CAVEAT: every one of those
+# runs is an engage handover or a driver override -- steering-only steady state has never been recorded.
+EPS_REFUSAL_FRAMES = 50
+
+
+def next_eps_refusal(count: int, lateral_only_commanded: bool, eac_active: bool) -> tuple[bool, int]:
+  """(refused, new_count). Consecutive frames of "lateral-only commanded and eacStatus != ACTIVE"."""
+  if not lateral_only_commanded or eac_active:
+    return False, 0
+  count = min(count + 1, EPS_REFUSAL_FRAMES)
+  return count >= EPS_REFUSAL_FRAMES, count
+
+
 class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
@@ -84,6 +139,16 @@ class CarState(CarStateBase):
 
     self.hands_on_level = 0
     self.eac_idle_cnt = 0        # steerdebounce2pnw: leaky counter for UNCODED inhibits only
+    self.pnw = PnwVehicle(CP)    # teslastalk2pnw: capability view (no fingerprint checks in the feature code)
+    self.stalk_prev = 0          # teslastalk2pnw: previous FWD/RWD/0 stalk code
+    self.eps_refusal_cnt = 0     # teslastalk2pnw: consecutive lateral-only-commanded && !EAC_ACTIVE frames
+    self.eps_refused = False     # teslastalk2pnw: the detector's verdict (card.py logs it)
+    self.eac_status_raw = None   # teslastalk2pnw: EPAS_eacStatus / eacErrorCode as last read, for the log record
+    self.eac_error_raw = None
+    # teslastalk2pnw: written by CarController.update every frame ("openpilot is commanding lateral WITHOUT being
+    # fully engaged"); the carstate side cannot see carControl, and the detector needs to know it is the
+    # steering-only state (not a normal engage, not a driver override) that is being judged.
+    self.lat_only_commanded = False
     self.das_control = None
 
   def update_autopark_state(self, autopark_state: str, cruise_enabled: bool):
@@ -264,6 +329,17 @@ class CarState(CarStateBase):
     # rack fault, the second is the panda-mirrored hard override. Neither may be delayed.
     ret.steerFaultTemporary, self.eac_idle_cnt = next_steer_fault_temporary(
       self.eac_idle_cnt, eac_status == "EAC_INHIBITED", eac_error_code == "EAC_ERROR_IDLE")
+    # teslastalk2pnw: EPS not following a lateral-only command -> the same steerFaultTemporary path.
+    if self.pnw.eps_refusal_alert:
+      self.eac_status_raw, self.eac_error_raw = int(epas_status["EPAS_eacStatus"]), int(epas_status["EPAS_eacErrorCode"])
+      refused, self.eps_refusal_cnt = next_eps_refusal(self.eps_refusal_cnt, self.lat_only_commanded,
+                                                       eac_status == "EAC_ACTIVE")
+      if refused and not self.eps_refused:
+        carlog.error(f"teslastalk2pnw: EPS REFUSAL -- lateral-only commanded {EPS_REFUSAL_FRAMES} frames, eacStatus={eac_status} errorCode={eac_error_code}")
+      elif self.eps_refused and not refused:
+        carlog.error("teslastalk2pnw: EPS refusal cleared")
+      self.eps_refused = refused
+      ret.steerFaultTemporary = ret.steerFaultTemporary or refused
 
     # FSD disengages using union of handsOnLevel (slow overrides) and high angle rate faults (fast overrides, high speed)
     ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
@@ -329,6 +405,13 @@ class CarState(CarStateBase):
     # ret.invalidLkasSetting = cp_ap_party.vl["DAS_settings"]["DAS_autosteerEnabled"] != 0
 
     # Buttons # ToDo: add Gap adjust button
+    # teslastalk2pnw: the speed-control stalk. FWD (push) -> mainCruise, RWD (pull) -> resumeCruise; see the
+    # STALK_* notes above for what the logs prove. selfdrived turns a mainCruise press while steering-only into
+    # "everything off"; a resumeCruise press cancels a pending off-request (the pull re-engages).
+    if self.pnw.stalk_cruise_buttons:
+      stalk = stalk_button_code(cp_chassis.vl["STW_ACTN_RQ"]["SpdCtrlLvr_Stat"])
+      ret.buttonEvents = create_button_events(stalk, self.stalk_prev, STALK_BUTTONS)
+      self.stalk_prev = stalk
 
     # Messages needed by carcontroller
     self.das_control = copy.copy(cp_ap_pt.vl["DAS_control"])
