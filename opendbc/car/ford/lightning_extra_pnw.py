@@ -91,8 +91,8 @@ THE ENVELOPE, and why each bound exists
 
     Consequence, stated plainly because it is a real loss: THE DRIVER CAN NO LONGER TURN THIS OFF
     AND HAVE IT STAY OFF while driving. Switch it off and it comes back within 15 minutes. There is
-    currently no opt-out short of the whole feature. If that becomes annoying the answer is a
-    settings toggle, not a shorter timer.
+    toggles2pnw: that settings toggle now exists ("Disable Ford Convenience Features",
+    DisableFordConvenience; see ConvenienceGate at the end of this file). ON stops the re-arm entirely.
 
     Why it is nonetheless right here: the thing being fought is not the driver, it is the TRUCK.
     Measured 2026-09-09 (see PPO_REARM_S), a request-OFF press arrived from the truck side 19.6 s
@@ -149,7 +149,7 @@ class PpoInputs:
   parked: bool         # gearShifter == park
   state_valid: bool    # both state signals have been seen this drive
   ppo_on: bool         # the latched state: True = Pro Power is armed for engine-off
-  enabled: bool        # feature master (currently always True; a place for a future opt-out)
+  enabled: bool        # feature master (always True from the carcontroller: the opt-out is ConvenienceGate, which drops the armer)
   # CS.out.canValid -- see the outer gate. Deliberately has NO default: a caller that has not
   # thought about bus liveness should not compile.
   can_valid: bool
@@ -324,8 +324,9 @@ CONVENIENCE_ERR_LOG_S = 60.0
 class ConvenienceGate:
   """True from disabled() while the driver has switched Ford convenience TX off.
 
-  Reads the param at most every CONVENIENCE_READ_S. FAIL-OPEN, and loudly: a failed read keeps the SHIPPED behaviour (the
-  features run) and is logged (first failure, then at most once per minute). Each change of state is logged once. `get_bool` is
+  Reads the param at most every CONVENIENCE_READ_S. A failed read is logged (first failure, then at most once per minute) and:
+  BEFORE any successful read it fails OPEN (the shipped behaviour, the features run); AFTER a successful read it KEEPS THE LAST
+  GOOD VALUE, so a transient read error cannot re-enable CAN writes while the driver is troubleshooting. Each change of state is logged once. `get_bool` is
   the param read (Params().get_bool); `log` / `log_err` take a message string."""
 
   def __init__(self, get_bool, clock, log, log_err):
@@ -337,6 +338,7 @@ class ConvenienceGate:
     self._read_at = None
     self._err_at = None
     self._err_n = 0
+    self._good = False         # has the param ever been read successfully?
 
   def disabled(self) -> bool:
     now = self._clock()
@@ -349,11 +351,13 @@ class ConvenienceGate:
       self._err_n += 1
       if self._err_at is None or now - self._err_at >= CONVENIENCE_ERR_LOG_S:
         self._err_at = now
-        self._log_err(f"toggles2pnw: {CONVENIENCE_PARAM} unreadable ({type(e).__name__}: {e}) -- convenience features keep " +
-                      f"RUNNING (the default) ({self._err_n} failed read(s) since the last log)")
+        keep = ("convenience features stay DISABLED (last good value kept)" if self._good and self._off
+                else "convenience features keep RUNNING" if self._good else "convenience features keep RUNNING (never read yet: fail-open)")
+        self._log_err(f"toggles2pnw: {CONVENIENCE_PARAM} unreadable ({type(e).__name__}: {e}) -- {keep} " +
+                      f"({self._err_n} failed read(s) since the last log)")
         self._err_n = 0
-      self._off = False                              # fail-open: the shipped behaviour, even if a stale ON was showing
-      return False
+      return self._off     # False until a read has succeeded (fail-open); afterwards the last good value
+    self._good = True
     if off != self._off:
       if off:
         self._log(f"toggles2pnw: {CONVENIENCE_PARAM}=1 -- Ford convenience features are DISABLED: Pro Power re-arm will " +

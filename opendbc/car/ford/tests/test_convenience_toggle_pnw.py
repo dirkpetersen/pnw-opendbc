@@ -87,11 +87,26 @@ def test_unreadable_param_fails_open_and_is_logged_not_spammed():
   assert len(errs) == 2, "and says so again after a minute"
 
 
-def test_stale_on_is_dropped_when_the_param_becomes_unreadable():
+def test_after_a_good_read_a_failed_read_keeps_the_last_value_not_fail_open():
+  """A transient read error must not re-enable CAN writes while the driver is troubleshooting (ON stays ON)."""
   v = {"v": True}
   g, clk, _, errs = make_gate(v)
   assert g.disabled() is True
   v["v"] = RuntimeError("store gone")
+  for _ in range(5):
+    clk.t += 2
+    assert g.disabled() is True, "last good value kept"
+  assert errs and "stay DISABLED" in errs[0], errs
+  v["v"] = False                                  # the store recovers: the new value is honoured
+  clk.t += 2
+  assert g.disabled() is False
+
+
+def test_after_a_good_off_read_a_failed_read_stays_running():
+  v = {"v": False}
+  g, clk, _, errs = make_gate(v)
+  assert g.disabled() is False
+  v["v"] = RuntimeError("x")
   clk.t += 2
   assert g.disabled() is False and errs
 
@@ -215,6 +230,57 @@ def test_a_gate_that_cannot_be_built_keeps_the_feature_running_and_logs(monkeypa
   ci = CarInterface(cp.as_reader())
   assert ci.CC._conv_gate is None and ci.CC._ppo_armer is not None
   assert any("convenience gate could not be built" in m for m in errs), errs
+
+
+def test_a_gate_that_raises_at_startup_or_every_frame_never_kills_card_and_logs_throttled(monkeypatch):
+  if not HAVE_CEREAL:
+    pytest.skip("cereal/openpilot not importable")
+  import openpilot.common.params as params_mod
+  from opendbc.car.carlog import carlog
+  FakeParams.store, FakeParams.fail = {}, None
+  monkeypatch.setattr(params_mod, "Params", FakeParams)
+  calls = []
+
+  def bad(self):
+    raise ValueError("boom")
+  monkeypatch.setattr(lx.ConvenienceGate, "disabled", bad)
+  monkeypatch.setattr(carlog, "exception", lambda m, *a, **k: calls.append(m))
+  CarInterface = interfaces[FORD.FORD_F_150_LIGHTNING_MK1]
+  cp = CarInterface.get_params(FORD.FORD_F_150_LIGHTNING_MK1, {b: {} for b in range(7)}, [], alpha_long=False,
+                               is_release=False, docs=False)
+  ci = CarInterface(cp.as_reader())                 # B1: construction survives a gate that raises
+  assert ci.CC._ppo_armer is not None, "fail-open"
+  ci.update([])
+  cc = structs.CarControl().as_reader()
+  for i in range(2500):
+    ci.apply(cc, i * 10_000_000)
+  assert 1 <= len(calls) <= 5, f"B2: the fallback must be throttled, got {len(calls)} log lines for 2500 frames"
+
+
+def test_a_broken_logger_in_the_fallback_does_not_escape(monkeypatch):
+  if not HAVE_CEREAL:
+    pytest.skip("cereal/openpilot not importable")
+  import openpilot.common.params as params_mod
+  from opendbc.car.carlog import carlog
+  FakeParams.store, FakeParams.fail = {}, None
+  monkeypatch.setattr(params_mod, "Params", FakeParams)
+  monkeypatch.setattr(lx.ConvenienceGate, "disabled", lambda self: (_ for _ in ()).throw(ValueError("boom")))
+
+  def nolog(*a, **k):
+    raise RuntimeError("logger broke")
+  monkeypatch.setattr(carlog, "exception", nolog)
+  CarInterface = interfaces[FORD.FORD_F_150_LIGHTNING_MK1]
+  cp = CarInterface.get_params(FORD.FORD_F_150_LIGHTNING_MK1, {b: {} for b in range(7)}, [], alpha_long=False,
+                               is_release=False, docs=False)
+  CarInterface(cp.as_reader())
+
+
+def test_read_failure_after_on_keeps_pro_power_off_in_the_real_controller(monkeypatch):
+  r = Rig(monkeypatch, disabled=True)
+  r.run(2.0)
+  FakeParams.fail = RuntimeError("store gone")
+  r.run(SETTLE)
+  assert r.tx == [] and r.ci.CC._ppo_armer is None, "ON, then a failing read: still transmitting nothing"
 
 
 def test_driving_tx_is_not_behind_the_convenience_gate():

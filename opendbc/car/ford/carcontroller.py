@@ -301,6 +301,7 @@ class CarController(CarControllerBase):
     self._ppo_capable = veh.pro_power_onboard
     self._ppo_build_failed = False
     self._conv_gate = None
+    self._conv_fail = 0
     if veh.pro_power_onboard:
       try:
         from time import monotonic as _mono
@@ -310,7 +311,7 @@ class CarController(CarControllerBase):
       except Exception:
         carlog.exception("toggles2pnw: convenience gate could not be built -- Ford convenience features keep RUNNING " +
                          "and cannot be disabled from the settings toggle")
-      if self._conv_gate is None or not self._conv_gate.disabled():
+      if not self._conv_disabled():
         self._ppo_armer = self._make_ppo_armer()
     self._resume_enabled = veh.mads_resume and self._icbm_params is not None
     if veh.mads_resume and self._icbm_params is None:
@@ -450,6 +451,23 @@ class CarController(CarControllerBase):
     intent = self._icbm_guard.filter(intent, stock_set, now, restoring, ceiling, dec_owns_bus, step)
     return self._icbm_governor.update(self.frame, intent)
 
+  def _conv_disabled(self) -> bool:
+    """True when the convenience switch is ON. Never raises: no gate, or a gate that fails, means the features run (fail-open,
+    logged; the gate itself keeps the last good value after a successful read -- see ConvenienceGate). This fallback logs the
+    first failure and then every 1000th, never per frame."""
+    if self._conv_gate is None:
+      return False
+    try:
+      return self._conv_gate.disabled()
+    except Exception:
+      self._conv_fail += 1
+      if self._conv_fail == 1 or self._conv_fail % 1000 == 0:
+        try:
+          carlog.exception("toggles2pnw: convenience gate FAILED (%d) -- convenience features keep RUNNING", self._conv_fail)
+        except Exception:
+          pass   # rule2-ok: a broken logger must not kill card; the counter above still advances and the next call retries
+      return False
+
   def _make_ppo_armer(self):
     try:
       from opendbc.car.ford.lightning_extra_pnw import ProPowerArmer
@@ -485,12 +503,7 @@ class CarController(CarControllerBase):
     # toggles2pnw: the convenience switch decides first. ON -> drop the armer (nothing constructed, nothing sent); OFF again ->
     # a fresh armer. The gate never raises (it fails open and logs); the guard below is for the call itself.
     if self._conv_gate is not None:
-      try:
-        conv_off = self._conv_gate.disabled()
-      except Exception:
-        carlog.exception("toggles2pnw: convenience gate FAILED -- convenience features keep RUNNING")
-        conv_off = False
-      if conv_off:
+      if self._conv_disabled():
         self._ppo_armer = None
       elif self._ppo_armer is None and self._ppo_capable and not self._ppo_build_failed:
         self._ppo_armer = self._make_ppo_armer()
