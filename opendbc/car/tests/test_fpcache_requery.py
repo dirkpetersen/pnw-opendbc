@@ -10,7 +10,7 @@ from opendbc.car.structs import CarParams
 from opendbc.car.vin import VIN_UNKNOWN
 
 LIGHTNING = "FORD_F_150_LIGHTNING_MK1"
-LIVE_VIN = "1FT6W3L78SWG05094"
+LIVE_VIN = "1FT6W3L78SWG0XXXX"
 
 
 def _cached_params(fw_count=10, vin=LIVE_VIN, brand="ford"):

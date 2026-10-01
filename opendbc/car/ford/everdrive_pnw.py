@@ -8,7 +8,7 @@ actually broadcasting.
 WHY IT IS A SEPARATE FILE: carstate.py gets exactly three added lines (construct, call, register).
 All of the logic, the constants and the Rule-2 bookkeeping live here.
 
-SOURCES (all measured on VIN 1FT6W3L78SWG05094, 2026-09-19 -- see
+SOURCES (all measured on VIN 1FT6W3L78SWG0XXXX, 2026-09-19 -- see
 CANbus/ford/f-150/lightning/2024-25/ENERGY-RANGE-SIGNALS.md):
   0x2A7 EverDrive_AC_Meter_FD1  AFTERMARKET, added to ford_lincoln_base_pt.dbc by this branch. 1 Hz.
   0x442 VehElRnge_L_Dsply       the DASH range, driver-confirmed 180.2 km = 112 mi. Already in the DBC.

@@ -14,7 +14,7 @@ DISPLAY feature in the car port has exactly two ways to hurt somebody, and both 
 Every frame here goes through the real DBC, the real CANPacker/CANParser and (where it matters) the
 real Ford CarInterface.update -- the same path `card` runs.
 
-Measured ground truth (VIN 1FT6W3L78SWG05094, 2026-09-19, see
+Measured ground truth (VIN 1FT6W3L78SWG0XXXX, 2026-09-19, see
 CANbus/ford/f-150/lightning/2024-25/ENERGY-RANGE-SIGNALS.md):
   0x2A7 payload 07 D0 00 00 03 68 00 00 while charging = 12.50 A / 109.0 V = 1.3625 kW
   0x2A7 payload 00 00 00 00 00 00 00 00 x 865 consecutive frames while unplugged = a REAL zero

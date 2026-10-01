@@ -21,7 +21,7 @@ LIGHTNING = "FORD_F_150_LIGHTNING_MK1"
 
 # The actual reference truck (CLAUDE.md / design doc §3.4): 2025 F-150 Lightning Flash, ER 131 kWh,
 # built at Dearborn/Rouge EV Center. wmi=1FT, pos8='7' (ER 131kWh NMC), pos10='S' (2025).
-REFERENCE_VIN = "1FT6W3L78SWG05094"
+REFERENCE_VIN = "1FT6W3L78SWG0XXXX"
 
 
 def _vin(wmi='1FT', series='W3L', pos8='7', pos10='S', filler='A'):
@@ -145,8 +145,8 @@ class TestLightningRegistryRow:
 
   def test_invalid_vin_never_matches(self):
     # Validity gate (design doc §5 step 1): too short / bad charset -> skip the whole layer.
-    assert decode_vin_platform("1FT6W3L78SWG0509") is None  # 16 chars
-    assert decode_vin_platform("1FT6W3L78SWG050I4") is None  # 18 chars, contains 'I'
+    assert decode_vin_platform("1FT6W3L78SWG0XXX") is None  # 16 chars
+    assert decode_vin_platform("1FT6W3L78SWG0XXI4") is None  # 18 chars, contains 'I'
 
 
 class TestGenericMatcherMechanics:
