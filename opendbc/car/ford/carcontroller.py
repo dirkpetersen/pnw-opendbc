@@ -293,12 +293,25 @@ class CarController(CarControllerBase):
     # CAPABILITY, never a fingerprint test in feature code (pnw/CLAUDE.md). The gate is load-bearing:
     # 0x455 is `eCall_Info` in ford_cgea1_2_ptcan_2011.dbc, so on some other Ford this ID is an
     # EMERGENCY-CALL frame, and every Ford shares ford_lincoln_base_pt (Fable review 2026-09-07).
+    #
+    # toggles2pnw: "Disable Ford Convenience Features" (persistent param DisableFordConvenience, default 0) gates EVERY
+    # non-driving CAN write the comma makes on the Ford -- today only this re-arm. ON = the armer is not constructed (or is
+    # dropped within ~1 s if it exists) and nothing is transmitted. A failed read keeps today's behaviour and is logged
+    # (lightning_extra_pnw.ConvenienceGate). Any future convenience TX must ask the same gate.
+    self._ppo_capable = veh.pro_power_onboard
+    self._ppo_build_failed = False
+    self._conv_gate = None
     if veh.pro_power_onboard:
       try:
-        from opendbc.car.ford.lightning_extra_pnw import ProPowerArmer
-        self._ppo_armer = ProPowerArmer()
+        from time import monotonic as _mono
+        from openpilot.common.params import Params
+        from opendbc.car.ford.lightning_extra_pnw import ConvenienceGate
+        self._conv_gate = ConvenienceGate(Params().get_bool, _mono, carlog.warning, carlog.error)
       except Exception:
-        carlog.exception("lightning-extra2pnw: ProPowerArmer construction FAILED -- feature INERT")
+        carlog.exception("toggles2pnw: convenience gate could not be built -- Ford convenience features keep RUNNING " +
+                         "and cannot be disabled from the settings toggle")
+      if self._conv_gate is None or not self._conv_gate.disabled():
+        self._ppo_armer = self._make_ppo_armer()
     self._resume_enabled = veh.mads_resume and self._icbm_params is not None
     if veh.mads_resume and self._icbm_params is None:
       # Fable S1: this car HAS the capability but the mem-param store never came up, so the executor
@@ -437,6 +450,15 @@ class CarController(CarControllerBase):
     intent = self._icbm_guard.filter(intent, stock_set, now, restoring, ceiling, dec_owns_bus, step)
     return self._icbm_governor.update(self.frame, intent)
 
+  def _make_ppo_armer(self):
+    try:
+      from opendbc.car.ford.lightning_extra_pnw import ProPowerArmer
+      return ProPowerArmer()
+    except Exception:
+      self._ppo_build_failed = True    # do not retry every second; the feature stays inert, loudly
+      carlog.exception("lightning-extra2pnw: ProPowerArmer construction FAILED -- feature INERT")
+      return None
+
   def update(self, CC, CS, now_nanos):
     can_sends = []
 
@@ -460,6 +482,18 @@ class CarController(CarControllerBase):
     # cannot skip it. Every bound lives in ProPowerArmer; this only transmits what it returns.
     #
     # NOT A CONTROL PATH. The worst case is a body-comfort setting not being re-armed.
+    # toggles2pnw: the convenience switch decides first. ON -> drop the armer (nothing constructed, nothing sent); OFF again ->
+    # a fresh armer. The gate never raises (it fails open and logs); the guard below is for the call itself.
+    if self._conv_gate is not None:
+      try:
+        conv_off = self._conv_gate.disabled()
+      except Exception:
+        carlog.exception("toggles2pnw: convenience gate FAILED -- convenience features keep RUNNING")
+        conv_off = False
+      if conv_off:
+        self._ppo_armer = None
+      elif self._ppo_armer is None and self._ppo_capable and not self._ppo_build_failed:
+        self._ppo_armer = self._make_ppo_armer()
     if self._ppo_armer is not None:
       try:
         # Match the frame's own 10 Hz cadence rather than spraying at the 100 Hz control rate --

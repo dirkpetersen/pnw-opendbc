@@ -310,3 +310,55 @@ class ProPowerArmer:
     where = "in Park" if i.parked else "at a standstill, NOT in Park"
     self._say(f"pressing to arm Pro Power {where} (attempt {self.attempts})")
     return PPO_PRESS_ON
+
+
+# toggles2pnw: "Disable Ford Convenience Features" -- a troubleshooting switch for EVERYTHING the comma WRITES to the Ford over
+# CAN that is not driving control. Today that is exactly one thing: the Pro Power Onboard re-arm above (0x455). ANY future
+# convenience TX (a chime, a tailgate or body-comfort write, ...) MUST be gated by this same switch. Driving CAN (steering,
+# ACC, lateral/longitudinal, buttons, MADS, the HUD/alt-experience frames) is NOT behind it and must never be.
+CONVENIENCE_PARAM = "DisableFordConvenience"   # persistent BOOL, default 0 (features run); ON = transmit nothing
+CONVENIENCE_READ_S = 1.0                       # re-read at ~1 Hz: a flip takes effect within a second, no restart
+CONVENIENCE_ERR_LOG_S = 60.0
+
+
+class ConvenienceGate:
+  """True from disabled() while the driver has switched Ford convenience TX off.
+
+  Reads the param at most every CONVENIENCE_READ_S. FAIL-OPEN, and loudly: a failed read keeps the SHIPPED behaviour (the
+  features run) and is logged (first failure, then at most once per minute). Each change of state is logged once. `get_bool` is
+  the param read (Params().get_bool); `log` / `log_err` take a message string."""
+
+  def __init__(self, get_bool, clock, log, log_err):
+    self._get_bool = get_bool
+    self._clock = clock
+    self._log = log
+    self._log_err = log_err
+    self._off = False
+    self._read_at = None
+    self._err_at = None
+    self._err_n = 0
+
+  def disabled(self) -> bool:
+    now = self._clock()
+    if self._read_at is not None and now - self._read_at < CONVENIENCE_READ_S:
+      return self._off
+    self._read_at = now
+    try:
+      off = bool(self._get_bool(CONVENIENCE_PARAM))
+    except Exception as e:   # UnknownKeyName on a params_pyx/params_keys mismatch, an unreadable store, ...
+      self._err_n += 1
+      if self._err_at is None or now - self._err_at >= CONVENIENCE_ERR_LOG_S:
+        self._err_at = now
+        self._log_err(f"toggles2pnw: {CONVENIENCE_PARAM} unreadable ({type(e).__name__}: {e}) -- convenience features keep " +
+                      f"RUNNING (the default) ({self._err_n} failed read(s) since the last log)")
+        self._err_n = 0
+      self._off = False                              # fail-open: the shipped behaviour, even if a stale ON was showing
+      return False
+    if off != self._off:
+      if off:
+        self._log(f"toggles2pnw: {CONVENIENCE_PARAM}=1 -- Ford convenience features are DISABLED: Pro Power re-arm will " +
+                  "transmit nothing")
+      else:
+        self._log(f"toggles2pnw: {CONVENIENCE_PARAM}=0 -- Ford convenience features are ENABLED again")
+    self._off = off
+    return off
