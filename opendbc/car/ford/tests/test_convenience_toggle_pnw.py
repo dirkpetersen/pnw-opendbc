@@ -291,3 +291,36 @@ def test_driving_tx_is_not_behind_the_convenience_gate():
   assert src.count("_conv_gate") == src.count("self._conv_gate"), "one object, referenced as an attribute only"
   head, _, tail = src.partition("### acc buttons ###")
   assert "_conv_gate" in head and "_conv_gate" not in tail, "the gate is consulted only before the driving/acc section"
+
+
+# ---- convtesla2pnw: DisableFordConvenience=1 persisted BEFORE the first Lightning start -------------------------------
+def test_preset_on_first_read_is_synchronous_at_construction_and_no_armer_is_ever_built(monkeypatch):
+  """The owner's use case: set the toggle on the Tesla, then the very first start in the truck must send NO 0x455.
+  ConvenienceGate._read_at starts None, so the FIRST disabled() call (CarController.__init__) reads the param synchronously --
+  there is no 1 s window in which the armer exists before the first read. Proven by: no ProPowerArmer is ever constructed,
+  and zero 0x455 frames from update() cycle 0 through well past the armer's own settle delay + a full re-arm window."""
+  built = []
+  real = lx.ProPowerArmer
+
+  class Spy(real):
+    def __init__(self, *a, **k):
+      built.append(1)
+      super().__init__(*a, **k)
+  monkeypatch.setattr(lx, "ProPowerArmer", Spy)
+  r = Rig(monkeypatch, disabled=True)
+  assert r.ci.CC._conv_gate._good is True, "the first read already completed inside CarController.__init__"
+  assert built == [] and r.ci.CC._ppo_armer is None
+  for _ in range(int((lx.PPO_SETTLE_S + lx.PPO_REARM_S) / DT_CTRL) // 100):   # cycle-by-cycle, in 1 s chunks
+    r.run(1.0)
+    assert r.tx == [], f"a 0x455 frame went out at t={r.now}"
+  assert built == [], "the armer was never constructed on any cycle"
+
+
+def test_param_off_first_frame_is_not_before_the_armer_settle_delay(monkeypatch):
+  """Quantifies the margin: even with the toggle OFF the first 0x455 frame is >= PPO_SETTLE_S after the first update(), so a
+  read that completed anywhere in that window could still gate it."""
+  r = Rig(monkeypatch, disabled=False)
+  t0 = r.now
+  r.run(SETTLE)
+  assert r.tx, "toggle OFF: the press goes out"
+  assert r.tx[0][0] - t0 >= lx.PPO_SETTLE_S - 1e-6, r.tx[0][0] - t0
