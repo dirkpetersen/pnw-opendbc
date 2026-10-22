@@ -37,6 +37,7 @@ class _Out:
   def __init__(self):
     self.vEgo = 25.0
     self.vEgoRaw = 25.0
+    self.aEgo = 0.0
     self.yawRate = 0.0
     self.steeringPressed = False
     self.steeringAngleDeg = 0.0
