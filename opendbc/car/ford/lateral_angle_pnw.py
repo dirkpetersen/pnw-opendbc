@@ -191,6 +191,23 @@ _PANDA_SHADOW_MIN_SPEED = 10.0   # m/s, ford.h FORD_LIMITS .angle_error_min_spee
 _CLIP_SPEED_MARGIN = 0.5         # m/s
 _SHADOW_AGE_S = 0.15             # s; one 50 ms steer step + LKA latch + CAN latency, with margin
 
+# curveexit2pnw fix 3, SHADOW ONLY -- computed and logged, never applied to the command. Idea: on a curve exit at low
+# speed, lead the PSCM's slow unwind by commanding the plan's own value _UNW_LEAD_S further ahead. Bounds: only toward
+# centre, never past the plan's future value, never past zero (no sign reversal), |lead| <= _UNW_LEAD_MAX, slewed
+# <= _UNW_LEAD_STEP per frame, off when pressed or >= _UNW_V_MAX. Not actuated because the offline replay (2026-10-22,
+# rlog 00000322--40000d276d seg 31 and 27) showed: (a) at 22:39 it moves the command by at most 0.04 rad and does not
+# move the 10 %/zero points of the unwind at all -- the lag is wheel-behind-command (PSCM), which a plan-bounded lead
+# cannot reach; (b) unbounded at zero it pulled LEFT after the plan crossed to the right; (c) on a normal 65 deg left
+# turn (seg 27, 22:35:39-42) the wheel followed the unwind within ~0.2 s, so a general lead would over-steer normal
+# exits. One carlog line per episode records what it would have done, to size a future actuated version.
+_UNW_LEAD_S = 0.4      # s beyond the strategy's own curvature_lookup_time
+_UNW_V_MAX = 15.0      # m/s
+_UNW_V_MIN = 3.0       # m/s; below this orientationRate / v is noise (replay: an episode every few frames at a stop)
+_UNW_LOG_MIN = 0.002   # 1/m; smaller episodes are counted into the next logged line, not logged one by one
+_UNW_LEAD_MAX = 0.010  # 1/m
+_UNW_LEAD_STEP = 0.001  # 1/m per 20 Hz frame
+_UNW_MIN = 0.001       # 1/m; the plan's future must be this much nearer centre than desired
+
 # angle2pnw-faithful2: how often (in units of this strategy's own 20Hz update() calls) to re-poll
 # the JSON tuning overlay, mirroring his own params-read cadence (he re-reads Params every
 # carcontroller frame) without adding a file-stat to every 20Hz control tick. ~5s at 20Hz.
@@ -318,6 +335,10 @@ class LateralAngleExt:
     self.exit_episode_s = 0.0
     self.clip_relaxed_frames = 0      # curveexit2pnw fix 2: frames the relaxed clip gate let through (logged per stretch)
     self.clip_relaxed_max = 0.0
+    self.unwind_lead_shadow = 0.0     # curveexit2pnw fix 3: the lead it WOULD add (1/m); never applied
+    self.unwind_lead_frames = 0
+    self.unwind_lead_peak = 0.0
+    self.unwind_lead_small = 0
 
     # Previous-frame path_angle / apply_curvature state (his ``self.path_angle_last`` /
     # ``self.apply_curvature_last``, initialized lazily via the CC.latActive==False branch in his
@@ -357,6 +378,32 @@ class LateralAngleExt:
   def deviation_clip_active(v_ego: float, a_ego: float) -> bool:
     """curveexit2pnw fix 2: True when the deviation clip must bind, i.e. the panda may judge this frame's shadow."""
     return v_ego + max(0.0, a_ego) * _SHADOW_AGE_S > _PANDA_SHADOW_MIN_SPEED - _CLIP_SPEED_MARGIN
+
+  def _update_unwind_lead_shadow(self, v_ego, desired, kappa_future, pressed):
+    """curveexit2pnw fix 3, SHADOW ONLY: track the bounded unwind lead (see _UNW_LEAD_S) without applying it."""
+    target = 0.0
+    if kappa_future is not None and _UNW_V_MIN < v_ego < _UNW_V_MAX and not pressed and desired != 0.0:
+      d = kappa_future - desired
+      if d * np.sign(desired) < -_UNW_MIN:                       # the plan's future is nearer centre: unwind side
+        target = float(clip(d, -min(_UNW_LEAD_MAX, abs(desired)), min(_UNW_LEAD_MAX, abs(desired))))
+    self.unwind_lead_shadow += float(clip(target - self.unwind_lead_shadow, -_UNW_LEAD_STEP, _UNW_LEAD_STEP))
+    # The slew can lag a fast-moving plan: re-apply the hard bounds (toward centre only, never past zero).
+    if self.unwind_lead_shadow * desired > 0.0 or desired == 0.0:
+      self.unwind_lead_shadow = 0.0
+    self.unwind_lead_shadow = float(clip(self.unwind_lead_shadow, -abs(desired), abs(desired)))
+    if self.unwind_lead_shadow != 0.0:
+      self.unwind_lead_frames += 1
+      self.unwind_lead_peak = max(self.unwind_lead_peak, abs(self.unwind_lead_shadow))
+    elif self.unwind_lead_frames > 0:
+      if self.unwind_lead_peak >= _UNW_LOG_MIN:
+        carlog.info(f"curveexit2pnw: unwind-lead SHADOW (not applied) for {self.unwind_lead_frames * _STEER_DT:.2f} s, " +
+                    f"peak {self.unwind_lead_peak:.4f} 1/m, about {self.unwind_lead_peak * v_ego:.3f} rad of path angle " +
+                    f"at {v_ego:.1f} m/s; {self.unwind_lead_small} smaller episodes since the last line")
+        self.unwind_lead_small = 0
+      else:
+        self.unwind_lead_small += 1
+      self.unwind_lead_frames = 0
+      self.unwind_lead_peak = 0.0
 
   def _end_exit_episode(self, why: str):
     """curveexit2pnw fix 1: close an exit episode; say so when it actually kept a stall blip from firing."""
@@ -571,11 +618,14 @@ class LateralAngleExt:
     self.bp_curvature_lookup_time = curvature_lookup_time
 
     predicted_curvature = 0.0
+    kappa_future = None
     if self.model is not None and len(self.model.orientationRate.z) >= 17:
       curvatures = np.array(self.model.orientationRate.z) / max(0.01, v_ego)
       predicted_curvature = float(
         interp(curvature_lookup_time, ModelConstants.T_IDXS, curvatures)
       )
+      kappa_future = float(interp(curvature_lookup_time + _UNW_LEAD_S, ModelConstants.T_IDXS, curvatures))
+    self._update_unwind_lead_shadow(v_ego, desired_curvature, kappa_future, CS.out.steeringPressed)
 
     b = float(self.path_angle_blend_ratio)
     b = float(clip(b, 0.0, 1.0))

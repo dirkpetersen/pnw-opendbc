@@ -151,3 +151,80 @@ def test_2239_exit_command_follows_the_plan():
     assert not ext.bp_curvature_deviation_limited
     assert ext.bp_kappa_cmd == pytest.approx(des)
     assert res.path_angle > 0.0, f"v={v}: path angle {res.path_angle} is LEFT while the plan asks RIGHT"
+
+
+# --- fix 3: unwind lead, SHADOW ONLY ------------------------------------------------------------------------------
+
+from types import SimpleNamespace as _NS
+
+
+def _model(kappa_now, kappa_far, v):
+  """A modelV2 stub whose curvature goes linearly from kappa_now (t=0) to kappa_far (t=1 s), then holds."""
+  from opendbc.car.ford.lateral_angle_pnw import ModelConstants
+  k = np.interp(ModelConstants.T_IDXS, [0.0, 1.0], [kappa_now, kappa_far])
+  return _NS(orientationRate=_NS(z=list(k * v)), meta=_NS(laneChangeState=0, laneChangeDirection=0))
+
+
+def _unwind(ext, CP, v, frames=40, pressed=False, start=-0.03, end=0.002):
+  """A left curve unwinding: desired falls from `start` toward `end` while the plan's future is further along."""
+  leads, pas = [], []
+  for i in range(frames):
+    des = start + (end - start) * i / frames
+    ext.model = _model(des, des + (end - start) * 0.5, v)
+    cs = _CS(v, 0.0, -des * v)
+    cs.out.steeringPressed = pressed
+    res = ext.update(_CC(), cs, _Act(des), CP)
+    leads.append((des, ext.unwind_lead_shadow))
+    pas.append(res.path_angle)
+  return leads, pas
+
+
+def test_unwind_lead_shadow_bounds():
+  ext, CP = _ext()
+  leads, _ = _unwind(ext, CP, 8.0)
+  assert max(abs(lead) for _, lead in leads) > 0.003, "the shadow never engaged on a plain unwind -- fixture is wrong"
+  prev = 0.0
+  for des, lead in leads:
+    assert lead * des <= 0.0, "lead must point toward centre"
+    assert abs(lead) <= min(abs(des), 0.010) + 1e-12, "lead past zero or past its cap"
+    assert abs(lead - prev) <= 0.001 + 1e-12, "lead not slewed"
+    prev = lead
+
+
+@pytest.mark.parametrize("v,pressed", [(16.0, False), (8.0, True), (2.0, False)])
+def test_unwind_lead_shadow_off(v, pressed):
+  ext, CP = _ext()
+  leads, _ = _unwind(ext, CP, v, pressed=pressed)
+  assert all(lead == 0.0 for _, lead in leads)
+
+
+def test_unwind_lead_is_never_applied(monkeypatch):
+  """The same unwind with the shadow computation stubbed out must put the identical path angle on the wire."""
+  from opendbc.car.ford.lateral_angle_pnw import LateralAngleExt
+  ext, CP = _ext()
+  leads, with_shadow = _unwind(ext, CP, 8.0)
+  assert max(abs(lead) for _, lead in leads) > 0.003
+  monkeypatch.setattr(LateralAngleExt, "_update_unwind_lead_shadow", lambda *a, **k: None)
+  ext, CP = _ext()
+  _, without = _unwind(ext, CP, 8.0)
+  assert with_shadow == without
+
+
+def test_unwind_lead_shadow_bounds_under_a_fast_plan():
+  """The slew lags a plan that moves fast. The hard bounds must still hold on every frame: cap, never past zero,
+  and zero once the plan has crossed to the other side."""
+  ext, CP = _ext()
+  v = 8.0
+
+  def step(des, fut):
+    ext.model = _model(des, des + 2 * (fut - des), v)   # the model's value at now + ~0.6 s is about `fut`
+    ext.update(_CC(), _CS(v, 0.0, -des * v), _Act(des), CP)
+    return ext.unwind_lead_shadow
+
+  for _ in range(20):
+    lead = step(-0.025, 0.0)                            # big unwind gap: the cap binds
+  assert lead == pytest.approx(0.010)
+  lead = step(-0.002, -0.002)                           # plan snaps near straight in one frame
+  assert 0.0 <= lead <= 0.002 + 1e-12
+  lead = step(+0.003, +0.003)                           # plan crossed to the right
+  assert lead == 0.0
