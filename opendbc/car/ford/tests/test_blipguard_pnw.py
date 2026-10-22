@@ -179,3 +179,96 @@ def test_guard_threshold_is_the_upstream_value():
   from opendbc.car.ford.lateral_angle_pnw import _BLIP_MAX_PATH_ANGLE, FORD_DBC_PATH_ANGLE_MAX
   assert _BLIP_MAX_PATH_ANGLE == 0.10
   assert 0.0 < _BLIP_MAX_PATH_ANGLE < 0.25 * FORD_DBC_PATH_ANGLE_MAX
+
+
+# --- curveexit2pnw fix 1: no stall blip in a curve-exit correction --------------------------------
+
+# The real 2026-10-21 22:39 PT exit (drives/2026-10-21/seattle-left-curve-overshoot, rlog seg 31), one row per 20 Hz
+# steer frame: (vEgoRaw m/s, yawRate rad/s, actuators.curvature 1/m). The plan asks RIGHT (+) from 20.34 while the
+# truck still yaws LEFT (yaw +, measured curvature -). Without fix 1 the stall blip fired at 22:39:22.09; with only a
+# "truck crossed to the plan's side" end rule it re-armed at 22.84 in an open-loop replay.
+_EXIT_2239 = [
+  (8.186, +0.1206, +0.000682), (8.264, +0.1188, +0.002286), (8.186, +0.1132, +0.002382), (8.233, +0.1070, +0.002613),
+  (8.294, +0.0990, +0.001571), (8.375, +0.0924, +0.002391), (8.328, +0.0910, +0.003024), (8.717, +0.0892, +0.003580),
+  (8.531, +0.0842, +0.004079), (8.389, +0.0770, +0.004358), (8.500, +0.0736, +0.003537), (8.561, +0.0756, +0.004600),
+  (8.639, +0.0792, +0.002436), (8.733, +0.0778, +0.004050), (8.858, +0.0744, +0.003204), (8.764, +0.0670, +0.003758),
+  (8.781, +0.0602, +0.002971), (8.828, +0.0534, +0.004085), (8.875, +0.0478, +0.003801), (8.919, +0.0418, +0.004060),
+  (8.967, +0.0382, +0.004578), (9.014, +0.0390, +0.004498), (9.078, +0.0402, +0.003430), (9.078, +0.0390, +0.003538),
+  (9.156, +0.0358, +0.003617), (9.217, +0.0328, +0.003992), (9.264, +0.0282, +0.005156), (9.281, +0.0266, +0.005829),
+  (9.342, +0.0196, +0.006000), (9.358, +0.0150, +0.006937), (9.406, +0.0090, +0.007413), (9.419, +0.0030, +0.007783),
+  (9.419, +0.0016, +0.008007), (9.467, +0.0016, +0.007711), (9.531, +0.0024, +0.007488), (9.625, +0.0048, +0.008201),
+  (9.639, +0.0034, +0.007970), (9.686, +0.0016, +0.007685), (9.686, +0.0008, +0.007930), (9.686, +0.0002, +0.008274),
+  (9.764, -0.0048, +0.008501), (9.703, -0.0126, +0.008750), (9.733, -0.0262, +0.008745),
+  # 22:39:22.44-23.04: the truck now curves right, but weakly; the plan asks for much more (no driver press yet)
+  (9.781, -0.0288, +0.007938), (9.828, -0.0260, +0.008574), (9.842, -0.0200, +0.007886), (9.889, -0.0108, +0.008027),
+  (9.794, -0.0090, +0.008583), (9.781, -0.0116, +0.009360), (9.811, -0.0128, +0.009310), (9.953, -0.0148, +0.009889),
+  (9.906, -0.0150, +0.009469), (9.889, -0.0174, +0.009608), (9.875, -0.0184, +0.009944), (9.889, -0.0156, +0.010228),
+  (9.875, -0.0152, +0.010629),
+]
+
+
+def _feed(ext, CP, cs, rows, v_override=None):
+  """Feed (v, yaw, desired) rows; return the indices of frames on which a stall blip was armed or active."""
+  blips = []
+  for i, (v, yaw, des) in enumerate(rows):
+    v = v_override if v_override is not None else v
+    cs.out.vEgo = cs.out.vEgoRaw = v
+    cs.out.yawRate = yaw if v_override is None else yaw * v_override / rows[i][0]   # keep the measured curvature
+    ext.update(_CC(), cs, _Actuators(des), CP)
+    if ext.stall_blip_frames_left > 0 or ext.angle_stall_blip_active:
+      blips.append(i)
+  return blips
+
+
+def test_no_stall_blip_in_the_2239_exit():
+  ext, CP, cs = _ext(8.2, -0.0147)
+  _drive(ext, CP, cs, -0.0147, 20)       # in the curve, tracking
+  assert _feed(ext, CP, cs, _EXIT_2239) == []
+  assert ext.exit_episode is True, "the truck never tracked the plan in this window; the episode must still be open"
+
+
+def test_no_stall_blip_in_the_2239_exit_above_the_panda_gate():
+  """The same measured curvature and plan at 10.5 m/s, so the deviation clip binds on every frame whatever the
+  clip's speed gate is (fix 2 moves it). Pins fix 1 on its own."""
+  ext, CP, cs = _ext(10.5, -0.0147)
+  _drive(ext, CP, cs, -0.0147, 20)
+  assert _feed(ext, CP, cs, _EXIT_2239, v_override=10.5) == []
+
+
+@pytest.mark.parametrize("measured", [0.0, 0.0003, -0.0003, 0.001])
+def test_real_stall_still_blips(measured):
+  """Straight (measured inside the noise floor, either sign) or a gentle curve the plan's way: the blip still fires."""
+  ext, CP, cs = _ext(10.0, measured)
+  _drive(ext, CP, cs, measured, 40)
+  assert ext.stall_blip_count == 0
+  _drive(ext, CP, cs, 0.006, 15)
+  assert ext.stall_blip_count == 1
+
+
+def test_real_stall_after_an_exit_still_blips():
+  """The exit episode ends once the truck tracks the plan; a stall after that is a real stall."""
+  ext, CP, cs = _ext(10.5, -0.0147)
+  _drive(ext, CP, cs, -0.0147, 20)
+  assert _feed(ext, CP, cs, _EXIT_2239, v_override=10.5) == []
+  cs.out.yawRate = -0.007 * 10.5          # truck reaches the plan: +0.007 measured, +0.007 desired
+  _drive(ext, CP, cs, 0.007, 1)
+  assert ext.exit_episode is False
+  cs.out.yawRate = -0.001 * 10.5          # then stalls well short of a plan that asks for more
+  _drive(ext, CP, cs, 0.007, 15)
+  assert ext.stall_blip_count == 1
+
+
+def test_episode_time_limit_lets_a_late_real_stall_blip():
+  """A truck that never tracks the plan after an exit: no blip inside _EXIT_EPISODE_MAX_S, the blip after it."""
+  from opendbc.car.ford.lateral_angle_pnw import _EXIT_EPISODE_MAX_S, _STALL_HOLD_S, _STEER_DT
+  ext, CP, cs = _ext(10.5, -0.0147)
+  _drive(ext, CP, cs, -0.0147, 20)
+  cs.out.yawRate = 0.004 * 10.5           # truck still curves left (-0.004) ...
+  _drive(ext, CP, cs, 0.003, 1)           # ... while the plan asks right: the episode starts
+  assert ext.exit_episode is True
+  cs.out.yawRate = -0.001 * 10.5          # truck curves right weakly, plan wants much more, for good
+  inside = int(round((_EXIT_EPISODE_MAX_S - 2 * _STEER_DT) / _STEER_DT))
+  _drive(ext, CP, cs, 0.007, inside)
+  assert ext.stall_blip_count == 0, "blip fired inside the exit episode"
+  _drive(ext, CP, cs, 0.007, int(round(_STALL_HOLD_S / _STEER_DT)) + 4)
+  assert ext.stall_blip_count == 1, "a stall that outlasts the episode must still get its blip"

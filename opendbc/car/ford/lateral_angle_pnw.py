@@ -165,6 +165,19 @@ _PRESS_BLIP_MIN_S = 0.5      # press must last this long before its release earn
 # as an open option rather than taken unilaterally.
 _BLIP_MAX_PATH_ANGLE = 0.10  # rad
 
+# curveexit2pnw fix 1 (drives/2026-10-21/seattle-left-curve-overshoot): the stall blip is for a wheel that is stuck
+# SHORT of the plan in the plan's own direction. On a curve exit the plan asks for the other side while the truck
+# still yaws the old way (PSCM unwinding late), which the stall test above also reads as "desired leads measured";
+# on 2026-10-21 22:39:22.09 it released steering for 300 ms in the middle of that correction. An exit episode starts
+# when measured curvature has the opposite sign to desired and is above the yaw noise floor. It ends when the truck
+# tracks the plan again (the stall detector's own "tracking" test, |gap| < 0.5 * _STALL_GAP_MIN), or after
+# _EXIT_EPISODE_MAX_S, so a real stall late in a long correction still gets its blip. No blip accumulates or fires
+# inside an episode. The replay of 22:39 showed why "truck crossed to the plan's side" is not enough to end it: from
+# 22:39:22.39 the truck curved weakly right while the plan asked for much more, and the blip re-armed at 22.84.
+# A stall on a straight (measured inside the floor, either sign) or in a curve the plan's way starts no episode.
+_EXIT_MEAS_FLOOR = 0.0005    # 1/m; about 0.005 rad/s of yaw at 10 m/s, above the yaw-rate jitter on a straight
+_EXIT_EPISODE_MAX_S = 3.0    # s; 22:39's whole exit correction (plan crosses sign to driver takeover) was 2.8 s
+
 # angle2pnw-faithful2: how often (in units of this strategy's own 20Hz update() calls) to re-poll
 # the JSON tuning overlay, mirroring his own params-read cadence (he re-reads Params every
 # carcontroller frame) without adding a file-stat to every 20Hz control tick. ~5s at 20Hz.
@@ -287,6 +300,9 @@ class LateralAngleExt:
     self.stall_blip_count = 0         # pulses fired this stall episode
     self.angle_stall_blip_active = False
     self.press_timer_s = 0.0          # continuous steeringPressed time, for the hand-off blip
+    self.exit_episode = False         # curveexit2pnw fix 1: plan and truck curve opposite ways (see _EXIT_MEAS_FLOOR)
+    self.exit_blip_held_frames = 0    # stall frames this episode that the exit rule kept from the blip
+    self.exit_episode_s = 0.0
 
     # Previous-frame path_angle / apply_curvature state (his ``self.path_angle_last`` /
     # ``self.apply_curvature_last``, initialized lazily via the CC.latActive==False branch in his
@@ -321,6 +337,15 @@ class LateralAngleExt:
       carlog.warning(f"angle_tuning_pnw: {log_prefix} reload failed ({e}) — keeping bp-7.0 defaults")
       self._tuning = self._tuning_defaults
     self._tuning_reload_calls_left = _TUNING_RELOAD_CALLS
+
+  def _end_exit_episode(self, why: str):
+    """curveexit2pnw fix 1: close an exit episode; say so when it actually kept a stall blip from firing."""
+    if self.exit_blip_held_frames > 0:
+      carlog.info(f"curveexit2pnw: stall blip held off for {self.exit_blip_held_frames * _STEER_DT:.2f} s of a curve-exit " +
+                  f"correction (plan and truck curving opposite ways at its start); episode ended: {why}")
+    self.exit_episode = False
+    self.exit_blip_held_frames = 0
+    self.exit_episode_s = 0.0
 
   def update_angle_params(self, params=None):
     """Deviation (e): his ``update_angle_params(self, params)`` reads four BluePilot-only openpilot
@@ -398,6 +423,7 @@ class LateralAngleExt:
       self.stall_blip_count = 0
       self.angle_stall_blip_active = False
       self.press_timer_s = 0.0
+      self._end_exit_episode("lateral inactive")
       self.precision_type = 1
       return LateralResult(
         apply_curvature=0.0,
@@ -441,6 +467,7 @@ class LateralAngleExt:
       self.stall_blip_count = 0
       self.angle_stall_blip_active = False
       self.press_timer_s = 0.0
+      self._end_exit_episode("driver turning the wheel (human-turn override)")
       self.precision_type = 1
       return LateralResult(
         apply_curvature=0.0,
@@ -699,6 +726,18 @@ class LateralAngleExt:
     _stalled = (not CS.out.steeringPressed and not self.lane_change and v_ego > 9.0
                 and abs(_stall_gap) > _STALL_GAP_MIN
                 and abs(desired_curvature) > abs(current_curvature))
+    # curveexit2pnw fix 1: exit-episode latch (see _EXIT_MEAS_FLOOR).
+    if not self.exit_episode and abs(current_curvature) > _EXIT_MEAS_FLOOR and desired_curvature * current_curvature < 0.0:
+      self.exit_episode = True
+    elif self.exit_episode:
+      self.exit_episode_s += _STEER_DT
+      if abs(_stall_gap) < 0.5 * _STALL_GAP_MIN:
+        self._end_exit_episode("the truck tracks the plan again")
+      elif self.exit_episode_s >= _EXIT_EPISODE_MAX_S:
+        self._end_exit_episode(f"{_EXIT_EPISODE_MAX_S:.0f} s limit")
+    if _stalled and self.exit_episode:
+      _stalled = False
+      self.exit_blip_held_frames += 1
     if _stalled:
       if self.bp_curvature_deviation_limited and self.stall_blip_cooldown_s <= 0.0:
         self.stall_blip_hold_s += _STEER_DT
