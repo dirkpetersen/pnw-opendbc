@@ -1,10 +1,10 @@
 """
 curveexit2pnw -- angle-mode curve-exit fixes (drives/2026-10-21/seattle-left-curve-overshoot).
 
-Fix 2: the deviation clip's speed gate now follows what the PANDA enforces (ford.h ford_shadow_curvature_error_check,
-active only above FORD_LIMITS .angle_error_min_speed = 10.0 m/s, tolerance 0.002 1/m) instead of bp-7.0's 9 m/s.
-These tests pin the constants to ford.h's text and run the gate's decisions through the real libsafety: every shadow
-the relaxed gate lets through unclipped must pass the panda even when the panda's speed sample is newer and higher.
+Fix 2 (after the Gemini 4 Argon review): the deviation clip's speed gate STAYS at bp-7.0's 9 m/s. ford.h checks the
+shadow curvature only above 10.0 m/s, but the shadow it judges is the one computed one steer frame earlier, and
+Veh_V_ActlBrk carries single-sample spikes of up to 0.53 m/s. These tests pin the panda numbers to ford.h, pin the
+shadow age to the real CarController's send order, and run the worst observed case through the real libsafety.
 
 Run: pytest opendbc/car/ford/tests/test_curveexit_pnw.py -q   (needs cereal -- pnw-pilot venv)
 """
@@ -33,23 +33,63 @@ def _ford_limits_field(name: str) -> float:
   return float(m.group(1))
 
 
+# Worst case the gate must cover, measured on route 00000322--40000d276d (rlog seg 27/31/32 at 100 Hz, qlogs of all 36
+# segments) and derived from carcontroller's send order (test_lmc2_is_judged_against_the_previous_steer_frames_shadow).
+SHADOW_AGE_S = 0.15         # 50 ms (one steer step) + up to 20 ms speed-sample staleness + host/USB latency, with margin
+SPEED_SPIKE = 0.53          # m/s, largest single-sample step of Veh_V_ActlBrk seen near 7-13 m/s
+A_MAX_OBSERVED = 2.6        # m/s2, largest aEgo seen near the gate in those logs (4 m/s2 would need a gate of 8.87)
+
+
 def test_gate_constants_match_ford_h():
-  from opendbc.car.ford.lateral_angle_pnw import _PANDA_SHADOW_MIN_SPEED, _CLIP_SPEED_MARGIN
+  from opendbc.car.ford.lateral_angle_pnw import _PANDA_SHADOW_MIN_SPEED, _CLIP_MIN_SPEED
   assert _ford_limits_field("angle_error_min_speed") == _PANDA_SHADOW_MIN_SPEED
   # the tolerance is NOT widened: CURVATURE_ERROR already equals the panda's max_angle_error
   assert _ford_limits_field("max_angle_error") / _ford_limits_field("angle_deg_to_can") == CarControllerParams.CURVATURE_ERROR
-  assert 0.0 < _CLIP_SPEED_MARGIN < _PANDA_SHADOW_MIN_SPEED - 9.0 + 1e-9  # never looser than the panda, never below bp-7.0
+  # the gate may never be higher than what the observed worst case allows
+  assert _CLIP_MIN_SPEED <= _PANDA_SHADOW_MIN_SPEED - (SPEED_SPIKE + A_MAX_OBSERVED * SHADOW_AGE_S)
 
 
 def test_gate_decisions():
   from opendbc.car.ford.lateral_angle_pnw import LateralAngleExt
   gate = LateralAngleExt.deviation_clip_active
-  assert not gate(9.0, 0.0)          # bp-7.0 clipped here; the panda does not check
-  assert not gate(9.3, 0.0)          # 2026-10-21 22:39:21.34-21.64 PT
-  assert gate(9.6, 0.0)
-  assert gate(10.0, 0.0) and gate(12.0, 0.0)
-  assert gate(9.1, 4.0)              # hard acceleration toward the panda gate: clip early
-  assert not gate(9.3, -3.0)         # braking does not move the gate
+  assert not gate(9.0)
+  assert gate(9.01) and gate(9.3) and gate(10.0)
+
+
+def test_lmc2_is_judged_against_the_previous_steer_frames_shadow():
+  """Pins SHADOW_AGE_S's 50 ms term to the real CarController: replay its can_sends in order through the panda's latch
+  rule (Lane_Assist_Data1 bytes 5-6 latch the shadow; LateralMotionControl2 is judged against the latch) and check that
+  every LMC2 is judged against the shadow computed exactly one steer step (5 frames) earlier, never older."""
+  from opendbc.car import DT_CTRL, structs
+  from opendbc.car.ford.lateral_angle_pnw import LateralAngleExt
+  CI = interfaces[FORD.FORD_F_150_LIGHTNING_MK1]
+  ci = CI(CI.get_params(FORD.FORD_F_150_LIGHTNING_MK1, {b: {} for b in range(7)}, [], alpha_long=False,
+                        is_release=False, docs=False).as_reader())
+  ci.update([])
+  ci.CC._latext = None
+  ci.CC._latext_angle = LateralAngleExt(ci.CP)
+  ci.CS.out.vEgo = ci.CS.out.vEgoRaw = 5.0          # below the clip: the shadow is the plan, distinct every steer frame
+  shadow_frame = {}                                  # wire raw value -> control frame that computed it
+  latched = None
+  ages = []
+  now = 0
+  for i in range(120):
+    cc = structs.CarControl()
+    cc.enabled = cc.latActive = True
+    cc.actuators.curvature = 0.0001 * (1 + i // CarControllerParams.STEER_STEP)
+    frame = ci.CC.frame
+    _, sends = ci.apply(cc.as_reader(), now)
+    now += int(DT_CTRL * 1e9)
+    if frame % CarControllerParams.STEER_STEP == 0:
+      shadow_frame.setdefault(int(round(-ci.CC._latext_angle.bp_kappa_cmd / 1e-6)), frame)
+    for addr, dat, _bus in sends:
+      if addr == 0x3CA:                              # Lane_Assist_Data1: the panda latches the shadow here
+        raw = (dat[5] << 8) | dat[6]
+        latched = raw - 0x10000 if raw & 0x8000 else raw
+      elif addr == 0x3D6 and latched is not None and latched in shadow_frame:
+        ages.append(frame - shadow_frame[latched])
+  assert len(ages) > 15, ages
+  assert max(ages) == CarControllerParams.STEER_STEP, ages
 
 
 def _ext():
@@ -112,45 +152,26 @@ def test_harness_has_teeth(panda):
   assert _panda_accepts(panda, 9.9, 0.0, 0.005)
 
 
-def test_every_unclipped_command_passes_the_panda(panda):
-  """Every frame the relaxed gate leaves unclipped is sent to the panda with a speed sample 0.10 s newer at the same
-  acceleration (one stale steer step + LKA latch + CAN latency) plus 0.3 m/s of extra jitter. All must pass. Clipped
-  frames are checked at the same speed sample: the clip itself must sit inside the panda band (unchanged tolerance)."""
+def test_every_unclipped_shadow_passes_the_panda_at_worst_timing(panda):
+  """Every shadow the gate leaves unclipped is judged by the real libsafety with the panda's speed sample SHADOW_AGE_S
+  newer, the truck accelerating at A_MAX_OBSERVED, plus a SPEED_SPIKE up-spike on that sample. All must pass. Clipped
+  shadows are judged at the same speed sample: the clip itself sits inside the panda band (tolerance unchanged)."""
   ext, CP = _ext()
   n_free = n_clip = 0
-  for v in np.arange(8.5, 11.51, 0.1):
-    for a in (-2.0, 0.0, 1.0, 3.0, 5.0):
-      for meas in (-0.025, -0.004, 0.0, 0.004, 0.025):
-        for des in (-0.025, -0.008, 0.0, 0.008, 0.025):
-          yaw = -meas * v
-          ext.update(_CC(), _CS(v, a, yaw), _Act(des), CP)
-          shadow_wire = -ext.bp_kappa_cmd              # carcontroller negates onto the wire
-          if ext.deviation_clip_active(v, a):
-            n_clip += 1
-            ok = _panda_accepts(panda, v, yaw, shadow_wire)
-          else:
-            n_free += 1
-            ok = _panda_accepts(panda, v + max(a, 0.0) * 0.10 + 0.3, yaw, shadow_wire)
-          assert ok, f"panda blocked: v={v:.2f} a={a} meas={meas} des={des} kappa={ext.bp_kappa_cmd:.5f}"
-  assert n_free > 500 and n_clip > 500, (n_free, n_clip)
-
-
-# 2026-10-21 22:39:21.34-21.64 PT, rlog seg 31: (vEgoRaw, aEgo, yawRate, actuators.curvature). The plan asks RIGHT (+),
-# the truck still yaws LEFT. bp-7.0's 9 m/s clip sent a LEFT path angle (-0.013 to -0.028 rad) on every one of these.
-_LEFT_WHILE_PLAN_RIGHT = [
-  (9.014, 0.78, 0.0390, 0.004498), (9.078, 0.93, 0.0402, 0.003430), (9.078, 0.92, 0.0390, 0.003538),
-  (9.156, 0.90, 0.0358, 0.003617), (9.217, 1.16, 0.0328, 0.003992), (9.264, 1.16, 0.0282, 0.005156),
-  (9.281, 0.87, 0.0266, 0.005829),
-]
-
-
-def test_2239_exit_command_follows_the_plan():
-  ext, CP = _ext()
-  for v, a, yaw, des in _LEFT_WHILE_PLAN_RIGHT:
-    res = ext.update(_CC(), _CS(v, a, yaw), _Act(des), CP)
-    assert not ext.bp_curvature_deviation_limited
-    assert ext.bp_kappa_cmd == pytest.approx(des)
-    assert res.path_angle > 0.0, f"v={v}: path angle {res.path_angle} is LEFT while the plan asks RIGHT"
+  for v in np.arange(8.0, 11.51, 0.05):
+    for meas in (-0.025, -0.004, 0.0, 0.004, 0.025):
+      for des in (-0.025, -0.008, 0.0, 0.008, 0.025):
+        yaw = -meas * v
+        ext.update(_CC(), _CS(v, 0.0, yaw), _Act(des), CP)
+        shadow_wire = -ext.bp_kappa_cmd              # carcontroller negates onto the wire
+        if ext.deviation_clip_active(v):
+          n_clip += 1
+          ok = _panda_accepts(panda, v, yaw, shadow_wire)
+        else:
+          n_free += 1
+          ok = _panda_accepts(panda, v + A_MAX_OBSERVED * SHADOW_AGE_S + SPEED_SPIKE, yaw, shadow_wire)
+        assert ok, f"panda blocked: v={v:.2f} meas={meas} des={des} kappa={ext.bp_kappa_cmd:.5f}"
+  assert n_free > 400 and n_clip > 400, (n_free, n_clip)
 
 
 # --- fix 3: unwind lead, SHADOW ONLY ------------------------------------------------------------------------------
@@ -228,3 +249,23 @@ def test_unwind_lead_shadow_bounds_under_a_fast_plan():
   assert 0.0 <= lead <= 0.002 + 1e-12
   lead = step(+0.003, +0.003)                           # plan crossed to the right
   assert lead == 0.0
+
+
+@pytest.mark.parametrize("end", ["inactive", "human_turn"])
+def test_unwind_episode_is_logged_when_lateral_ends_mid_episode(monkeypatch, end):
+  """Gemini review finding 2: a disengage or a human-turn override in the middle of an unwind must still log the
+  episode, at the speed of its peak, and leave nothing to leak into the next engagement."""
+  import opendbc.car.ford.lateral_angle_pnw as lap
+  lines = []
+  monkeypatch.setattr(lap.carlog, "info", lambda msg, *a, **k: lines.append(msg))
+  ext, CP = _ext()
+  _unwind(ext, CP, 8.0, end=-0.01)                    # stops mid-unwind, lead still non-zero
+  assert ext.unwind_lead_shadow != 0.0 and ext.unwind_lead_peak >= 0.002
+  lines.clear()
+  if end == "inactive":
+    ext.update(_NS(latActive=False), _CS(20.0, 0.0, 0.0), _Act(0.0), CP)
+  else:
+    ext._end_unwind_episode("driver turning the wheel (human-turn override)")   # the exact call that path makes
+  shadow_lines = [m for m in lines if "unwind-lead SHADOW" in m]
+  assert len(shadow_lines) == 1 and "at 8.0 m/s" in shadow_lines[0], lines
+  assert ext.unwind_lead_frames == 0 and ext.unwind_lead_peak == 0.0 and ext.unwind_lead_shadow == 0.0

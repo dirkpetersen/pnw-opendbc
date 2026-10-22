@@ -178,18 +178,21 @@ _BLIP_MAX_PATH_ANGLE = 0.10  # rad
 _EXIT_MEAS_FLOOR = 0.0005    # 1/m; about 0.005 rad/s of yaw at 10 m/s, above the yaw-rate jitter on a straight
 _EXIT_EPISODE_MAX_S = 3.0    # s; 22:39's whole exit correction (plan crosses sign to driver takeover) was 2.8 s
 
-# curveexit2pnw fix 2: speed gate of the deviation clip below, set from what the PANDA enforces, not from bp-7.0's 9 m/s.
-# ford.h ford_shadow_curvature_error_check judges the shadow (bp_kappa_cmd) only while the panda's latest ABS speed
-# sample (Veh_V_ActlBrk, the signal vEgoRaw is also decoded from) is ABOVE FORD_LIMITS .angle_error_min_speed = 10.0
-# m/s, against measured curvature (Yaw_Data_FD1 yaw / that speed) +- max_angle_error 100 CAN units = 0.002 1/m, the
-# same tolerance as CURVATURE_ERROR, so the tolerance is NOT widened here. Between 9 and 10 m/s the clip held the
-# command at measured +- 0.002 for nothing: on 2026-10-21 22:39:21.34-21.64 PT (9.0-9.3 m/s) it sent LEFT while the
-# plan asked RIGHT. The panda checks each LMC2 frame against the shadow from the previous steer frame (LKA latches it
-# at 33 Hz), so allow 0.15 s of speed gain at the current acceleration plus a 0.5 m/s margin.
-# test_curveexit_pnw.py runs every gate decision through the real libsafety and pins these numbers to ford.h.
+# curveexit2pnw fix 2 (after the Gemini 4 Argon review, 2026-10-22): the deviation clip's speed gate stays at bp-7.0's
+# 9 m/s, because a higher gate cannot be shown to keep the panda from dropping LMC2 frames.
+# What the panda checks: ford.h ford_shadow_curvature_error_check judges the shadow (bp_kappa_cmd) only while its
+# latest Veh_V_ActlBrk sample (the signal vEgoRaw is decoded from) is ABOVE FORD_LIMITS .angle_error_min_speed = 10.0
+# m/s, against measured curvature +- max_angle_error 100 CAN units = 0.002 1/m (= CURVATURE_ERROR, so the tolerance
+# is not widened). Which shadow it judges: carcontroller appends LMC2 BEFORE Lane_Assist_Data1, and LKA (every 3rd
+# frame) always falls in the 5 frames since the previous steer frame, so LMC2 at frame F is judged against the shadow
+# computed at frame F-5: 50 ms old, plus up to 20 ms of 50 Hz speed-sample staleness and host/USB latency. With
+# _SHADOW_AGE_S = 0.15 s, the largest single-sample spike of Veh_V_ActlBrk in our logs (0.53 m/s, route
+# 00000322--40000d276d) and a truck acceleration of 4 m/s2, the gate would have to be 10.0 - (0.53 + 4 * 0.15) = 8.87
+# m/s. At the largest acceleration seen in those logs (2.6 m/s2) it is 9.08. Neither allows un-clipping the 9.0-9.5
+# band, so the gate stays at 9.0 (2026-10-21 22:39:21.34-21.64 PT keeps its wrong-way clip; fix 1 still removes the
+# blip). test_curveexit_pnw.py pins these numbers to ford.h and runs the worst case through the real libsafety.
 _PANDA_SHADOW_MIN_SPEED = 10.0   # m/s, ford.h FORD_LIMITS .angle_error_min_speed
-_CLIP_SPEED_MARGIN = 0.5         # m/s
-_SHADOW_AGE_S = 0.15             # s; one 50 ms steer step + LKA latch + CAN latency, with margin
+_CLIP_MIN_SPEED = 9.0            # m/s, bp-7.0's gate, unchanged
 
 # curveexit2pnw fix 3, SHADOW ONLY -- computed and logged, never applied to the command. Idea: on a curve exit at low
 # speed, lead the PSCM's slow unwind by commanding the plan's own value _UNW_LEAD_S further ahead. Bounds: only toward
@@ -333,11 +336,10 @@ class LateralAngleExt:
     self.exit_episode = False         # curveexit2pnw fix 1: plan and truck curve opposite ways (see _EXIT_MEAS_FLOOR)
     self.exit_blip_held_frames = 0    # stall frames this episode that the exit rule kept from the blip
     self.exit_episode_s = 0.0
-    self.clip_relaxed_frames = 0      # curveexit2pnw fix 2: frames the relaxed clip gate let through (logged per stretch)
-    self.clip_relaxed_max = 0.0
     self.unwind_lead_shadow = 0.0     # curveexit2pnw fix 3: the lead it WOULD add (1/m); never applied
     self.unwind_lead_frames = 0
     self.unwind_lead_peak = 0.0
+    self.unwind_lead_peak_v = 0.0
     self.unwind_lead_small = 0
 
     # Previous-frame path_angle / apply_curvature state (his ``self.path_angle_last`` /
@@ -375,9 +377,9 @@ class LateralAngleExt:
     self._tuning_reload_calls_left = _TUNING_RELOAD_CALLS
 
   @staticmethod
-  def deviation_clip_active(v_ego: float, a_ego: float) -> bool:
-    """curveexit2pnw fix 2: True when the deviation clip must bind, i.e. the panda may judge this frame's shadow."""
-    return v_ego + max(0.0, a_ego) * _SHADOW_AGE_S > _PANDA_SHADOW_MIN_SPEED - _CLIP_SPEED_MARGIN
+  def deviation_clip_active(v_ego: float) -> bool:
+    """True when the deviation clip must bind (see _CLIP_MIN_SPEED)."""
+    return v_ego > _CLIP_MIN_SPEED
 
   def _update_unwind_lead_shadow(self, v_ego, desired, kappa_future, pressed):
     """curveexit2pnw fix 3, SHADOW ONLY: track the bounded unwind lead (see _UNW_LEAD_S) without applying it."""
@@ -393,17 +395,27 @@ class LateralAngleExt:
     self.unwind_lead_shadow = float(clip(self.unwind_lead_shadow, -abs(desired), abs(desired)))
     if self.unwind_lead_shadow != 0.0:
       self.unwind_lead_frames += 1
-      self.unwind_lead_peak = max(self.unwind_lead_peak, abs(self.unwind_lead_shadow))
-    elif self.unwind_lead_frames > 0:
-      if self.unwind_lead_peak >= _UNW_LOG_MIN:
-        carlog.info(f"curveexit2pnw: unwind-lead SHADOW (not applied) for {self.unwind_lead_frames * _STEER_DT:.2f} s, " +
-                    f"peak {self.unwind_lead_peak:.4f} 1/m, about {self.unwind_lead_peak * v_ego:.3f} rad of path angle " +
-                    f"at {v_ego:.1f} m/s; {self.unwind_lead_small} smaller episodes since the last line")
-        self.unwind_lead_small = 0
-      else:
-        self.unwind_lead_small += 1
-      self.unwind_lead_frames = 0
-      self.unwind_lead_peak = 0.0
+      if abs(self.unwind_lead_shadow) > self.unwind_lead_peak:
+        self.unwind_lead_peak, self.unwind_lead_peak_v = abs(self.unwind_lead_shadow), v_ego
+    else:
+      self._end_unwind_episode("lead back to 0")
+
+  def _end_unwind_episode(self, why: str):
+    """curveexit2pnw fix 3: close a shadow unwind-lead episode and log it (also on lateral inactive / human turn)."""
+    self.unwind_lead_shadow = 0.0
+    if self.unwind_lead_frames == 0:
+      return
+    if self.unwind_lead_peak >= _UNW_LOG_MIN:
+      carlog.info(f"curveexit2pnw: unwind-lead SHADOW (not applied) for {self.unwind_lead_frames * _STEER_DT:.2f} s, " +
+                  f"peak {self.unwind_lead_peak:.4f} 1/m, about {self.unwind_lead_peak * self.unwind_lead_peak_v:.3f} rad of " +
+                  f"path angle at {self.unwind_lead_peak_v:.1f} m/s; ended: {why}; {self.unwind_lead_small} smaller episodes " +
+                  "since the last line")
+      self.unwind_lead_small = 0
+    else:
+      self.unwind_lead_small += 1
+    self.unwind_lead_frames = 0
+    self.unwind_lead_peak = 0.0
+    self.unwind_lead_peak_v = 0.0
 
   def _end_exit_episode(self, why: str):
     """curveexit2pnw fix 1: close an exit episode; say so when it actually kept a stall blip from firing."""
@@ -491,6 +503,7 @@ class LateralAngleExt:
       self.angle_stall_blip_active = False
       self.press_timer_s = 0.0
       self._end_exit_episode("lateral inactive")
+      self._end_unwind_episode("lateral inactive")
       self.precision_type = 1
       return LateralResult(
         apply_curvature=0.0,
@@ -535,6 +548,7 @@ class LateralAngleExt:
       self.angle_stall_blip_active = False
       self.press_timer_s = 0.0
       self._end_exit_episode("driver turning the wheel (human-turn override)")
+      self._end_unwind_episode("driver turning the wheel (human-turn override)")
       self.precision_type = 1
       return LateralResult(
         apply_curvature=0.0,
@@ -695,21 +709,9 @@ class LateralAngleExt:
     # routinely, not just on genuine pothole/override divergence. Curvature mode has always clipped
     # here; this brings angle mode's actual steering intent in line with that proven behavior rather
     # than only clipping the value reported to panda (which would make the check a no-op).
-    # curveexit2pnw fix 2: the gate is no longer bp-7.0's v_ego > 9; it follows ford.h (see _PANDA_SHADOW_MIN_SPEED).
     current_curvature = self.get_current_curvature(CS)
     self.bp_curvature_deviation_limited = False
-    _clip_on = self.deviation_clip_active(v_ego, float(CS.out.aEgo))
-    # Rule 2: one carlog line per stretch in which the relaxed gate (fix 2) let through a command bp-7.0's 9 m/s clip
-    # would have held back.
-    _old_band = (current_curvature - CarControllerParams.CURVATURE_ERROR, current_curvature + CarControllerParams.CURVATURE_ERROR)
-    if not _clip_on and v_ego > 9 and not (_old_band[0] <= kappa_cmd <= _old_band[1]):
-      self.clip_relaxed_frames += 1
-      self.clip_relaxed_max = max(self.clip_relaxed_max, abs(kappa_cmd - current_curvature))
-    elif self.clip_relaxed_frames > 0:
-      carlog.info(f"curveexit2pnw: deviation clip relaxed for {self.clip_relaxed_frames * _STEER_DT:.2f} s between 9 m/s " +
-                  f"and the panda-derived gate; max command-vs-measured {self.clip_relaxed_max:.4f} 1/m (bp-7.0 clipped at 0.002)")
-      self.clip_relaxed_frames = 0
-      self.clip_relaxed_max = 0.0
+    _clip_on = self.deviation_clip_active(v_ego)
     if _clip_on:
       _kappa_cmd_pre_error_clip = kappa_cmd
       kappa_cmd = float(clip(kappa_cmd, current_curvature - CarControllerParams.CURVATURE_ERROR,
