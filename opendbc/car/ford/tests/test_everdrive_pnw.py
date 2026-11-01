@@ -1321,7 +1321,7 @@ class TestInstantPower:
     assert first["pNowKw"] == pytest.approx(1.62 * 100.0 * 355.0 / 1000.0 + 1.2, abs=0.01)
     assert first["grossKw"] is None, "positive control: the SoC window has NOT filled, yet pNowKw is there"
     assert first["kCal"] == 1.62 and first["kFits"] == 0
-    assert first["mileKwh"] is None and first["mileAcKwh"] is None
+    assert first["mileKwh"] is None and first["mileAcKwh"] is None and first["mileEst"] is None
 
   def test_regen_passes_through_as_negative_power(self, monkeypatch, carlogs, cal_path):
     """Negative current = regen. The sign is kept; the UI decides that the term falls back."""
@@ -1416,11 +1416,11 @@ class TestInstantPower:
 
 
 class TestLastMile:
-  def _drive(self, dev, seconds, mph, p_kw, ac_kw=0.0, t0=0.0):
+  def _drive(self, dev, seconds, mph, p_kw, ac_kw=0.0, t0=0.0, eff=None):
     out, t = [], t0
     while t < t0 + seconds - 1e-9:
       v = mph / 2.23694
-      out.append(dev._step_mile(t, v, v >= ed.MOVING_MS, p_kw, ac_kw))
+      out.append(dev._step_mile(t, v, v >= ed.MOVING_MS, p_kw, ac_kw, eff))
       t += ed.PUBLISH_S
     return out
 
@@ -1432,6 +1432,7 @@ class TestLastMile:
     assert got[-1] is not None
     # one mile at 60 mph is 60 s at 30 kW = 0.5 kWh
     assert got[-1][0] == pytest.approx(0.5, abs=0.01) and got[-1][1] == 0.0
+    assert got[-1][2] is False, "a fully measured mile is not an estimate"
 
   def test_the_ac_energy_is_over_the_same_mile(self):
     dev = ed.EverDrive()
@@ -1456,6 +1457,35 @@ class TestLastMile:
     dev = ed.EverDrive()
     got = self._drive(dev, 120.0, 60.0, None)
     assert set(got) == {None} and dev._mi_m == 0.0
+
+  def test_no_motor_signal_uses_the_speed_estimate_and_says_so(self):
+    """Owner 2026-11-01: 320 Wh/km at 60 mph = 30.9 kW + 1.2 kW; one mile at 60 mph = 0.535 kWh."""
+    dev = ed.EverDrive()
+    got = self._drive(dev, 61.0, 60.0, None, eff=320.0)
+    p_est = 320.0 / 1000.0 * (60.0 / 2.23694) * 3.6 + ed.P_ACC_KW
+    assert got[-1][0] == pytest.approx(p_est / 60.0, abs=0.01) and got[-1][2] is True
+
+  def test_end_to_end_a_mile_without_0x441_is_published_as_estimated(self, monkeypatch, carlogs, cal_path):
+    """The wiring: effWhKm must reach _step_mile, or a truck without 0x441 never gets a mile."""
+    truck = Truck(monkeypatch)
+    hz = 20
+    for i in range(hz * 70):                                  # 70 s at 100 km/h = 1.2 mi
+      slow = []
+      if i % hz == 0:
+        slow = truck.energy(**ENERGY) + [CanData(AC_ADDR, CHARGING, 0)]
+      truck.tick(truck.frame("BrakeSysFeatures", {"Veh_V_ActlBrk": 100.0}), *slow, dt=int(1e9 / hz))
+    last = truck.cap.blobs[-1]
+    assert last["pNowKw"] is None, "positive control: no 0x441 was sent"
+    assert last["mileEst"] is True and last["mileKwh"] is not None, last
+    assert last["mileKwh"] == pytest.approx((320.0 * 0.1 + ed.P_ACC_KW) / 62.137 * 1.0, rel=0.1)
+
+  def test_a_partly_estimated_mile_is_estimated_until_it_slides_out(self):
+    dev = ed.EverDrive()
+    self._drive(dev, 10.0, 60.0, None, eff=320.0)               # 10 s estimated
+    got = self._drive(dev, 55.0, 60.0, 30.0, t0=10.0, eff=320.0)
+    assert got[-1][2] is True, "the estimated 10 s are still inside the mile"
+    got = self._drive(dev, 20.0, 60.0, 30.0, t0=65.0, eff=320.0)
+    assert got[-1][2] is False, "once they slide out the mile is fully measured again"
 
 
 def cal_drive(dev, *, k_true, p_m2, seconds, cap=126.0, soc=80.0, ac_kw=0.0, t0=0.0, mph=60.0):

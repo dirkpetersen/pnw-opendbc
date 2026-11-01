@@ -311,9 +311,10 @@ class EverDrive:
     self._p_seed_ts: int | None = None  # 0x441 ts at the moving start; None = no re-seed pending
     self._mtr_ok_mono: float | None = None  # last publish with live 0x441 power (Rule 2 absence log)
     self._mtr_gap_logged = False
-    # Cumulative snapshots (m, batt kWh, ac kWh); maxlen is 2x the samples one mile takes at MOVING_MS.
-    self._mile: deque[tuple[float, float, float]] = deque(maxlen=2 * int(MILE_M / MOVING_MS / PUBLISH_S))
-    self._mi_m = self._mi_kwh = self._mi_ac = 0.0
+    # Cumulative snapshots (m, batt kWh, ac kWh, estimated m); maxlen is 2x the samples one mile takes
+    # at MOVING_MS.
+    self._mile: deque[tuple[float, float, float, float]] = deque(maxlen=2 * int(MILE_M / MOVING_MS / PUBLISH_S))
+    self._mi_m = self._mi_kwh = self._mi_ac = self._mi_est_m = 0.0
     self._mi_mono: float | None = None
     self._cal_kwh = self._cal_s = self._cal_m2 = 0.0
     self._cal_last: tuple[float, float] | None = None       # (mono, socPct)
@@ -454,7 +455,7 @@ class EverDrive:
     moving = v_ego >= MOVING_MS
     p_batt = None if p_m2 is None else self._k * p_m2 + P_ACC_KW
     self._step_p_now(now, p_batt, moving, ts_mtr)
-    mile = self._step_mile(now, v_ego, moving, p_batt, kw)
+    mile = self._step_mile(now, v_ego, moving, p_batt, kw, eff_wh_km)
     self._step_cal(now, moving, soc_pct, cap_kwh, p_m2, kw)
 
     self._params.put_nonblocking(PARAM_KEY, {
@@ -511,6 +512,8 @@ class EverDrive:
       # first full mile of this drive.
       "mileKwh": None if mile is None else round(mile[0], 3),
       "mileAcKwh": None if mile is None else round(mile[1], 3),
+      # True when any part of that mile had no live 0x441 and used the speed estimate (_step_mile).
+      "mileEst": None if mile is None else mile[2],
       # The scale factor in use, and how many calibration fits have been accepted in total.
       "kCal": round(self._k, 3),
       "kFits": self._k_fits,
@@ -658,24 +661,34 @@ class EverDrive:
     self._p_mono = now
 
   def _step_mile(self, now: float, v_ego: float, moving: bool, p_batt: float | None,
-                 ac_kw: float) -> tuple[float, float] | None:
-    """everdriveinstant2pnw: (load kWh, AC kWh) over the last MILE_M driven, or None until one full
-    mile has been driven. Same rules as _gross_kw: only consecutive moving samples count, so a stop
-    or an unwatched gap adds neither distance nor energy. O(1) amortised per call."""
+                 ac_kw: float, eff_wh_km: float | None = None) -> tuple[float, float, bool] | None:
+    """everdriveinstant2pnw: (load kWh, AC kWh, estimated) over the last MILE_M driven, or None until
+    one full mile has been driven. Same rules as _gross_kw: only consecutive moving samples count, so
+    a stop or an unwatched gap adds neither distance nor energy. O(1) amortised per call.
+
+    Owner 2026-11-01: with no live 0x441 the load is the SPEED ESTIMATE, effWhKm x km/h + P_ACC_KW
+    (the truck's own reference efficiency; the UI uses the same formula for its "?" figures), and
+    `estimated` is True while any of the mile came from it. No efficiency either: the chain breaks."""
+    est = p_batt is None and eff_wh_km is not None
+    if est:
+      p_batt = eff_wh_km / 1000.0 * v_ego * 3.6 + P_ACC_KW
     ok = moving and p_batt is not None
     if ok and self._mi_mono is not None and 0.0 < now - self._mi_mono <= SAMPLE_GAP_MAX_S:
       dt = now - self._mi_mono
       self._mi_m += v_ego * dt
       self._mi_kwh += p_batt * dt / 3600.0
       self._mi_ac += ac_kw * dt / 3600.0
+      if est:
+        self._mi_est_m += v_ego * dt
     if ok:
-      self._mile.append((self._mi_m, self._mi_kwh, self._mi_ac))
+      self._mile.append((self._mi_m, self._mi_kwh, self._mi_ac, self._mi_est_m))
     self._mi_mono = now if ok else None
     while len(self._mile) >= 2 and self._mi_m - self._mile[1][0] >= MILE_M:
       self._mile.popleft()
     if not self._mile or self._mi_m - self._mile[0][0] < MILE_M:
       return None
-    return self._mi_kwh - self._mile[0][1], self._mi_ac - self._mile[0][2]
+    m0 = self._mile[0]
+    return self._mi_kwh - m0[1], self._mi_ac - m0[2], self._mi_est_m - m0[3] > 0.0
 
   def _step_cal(self, now: float, moving: bool, soc_pct: float | None, cap_kwh: float | None,
                 p_m2: float | None, ac_kw: float) -> None:
