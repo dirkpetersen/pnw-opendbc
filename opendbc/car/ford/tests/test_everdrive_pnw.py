@@ -1352,6 +1352,28 @@ class TestInstantPower:
     dev._step_p_now(t + 0.6, 30.0, True, 602)
     assert 55.0 < dev._p_now < 62.0, "and from there it smooths again"
 
+  def test_the_reseed_is_never_armed_while_stopped(self):
+    """Review 2026-11-01: a moving start with no new 0x441 frame before the next stop must not
+    leave the parked load unsmoothed."""
+    dev = ed.EverDrive()
+    dev._step_p_now(0.0, 1.2, False, 1)
+    dev._step_p_now(0.2, 1.2, True, 1)                     # moving start, same frame
+    dev._step_p_now(0.4, 1.2, False, 1)                    # stops before a newer frame
+    dev._step_p_now(0.6, 11.2, False, 2)
+    assert 1.2 < dev._p_now < 2.0, "stopped: smoothed, not raw"
+
+  def test_a_missing_0x441_is_logged_while_the_everdrive_is_live(self, monkeypatch, carlogs, cal_path):
+    """Review 2026-11-01 (Rule 2): 0x2A7 live, 0x441 never sent -> one loud line, not silence."""
+    truck = Truck(monkeypatch)
+    truck.run(6.0, ac=CHARGING, energy=truck.energy(**ENERGY), speed_kph=100.0)
+    hits = [c for c in carlogs if "0x441" in c[1] and "never received" in c[2]]
+    assert len(hits) == 1, carlogs
+
+  def test_a_live_0x441_logs_no_absence(self, monkeypatch, carlogs, cal_path):
+    truck = Truck(monkeypatch)
+    truck.run(6.0, ac=CHARGING, energy=truck.energy(**ENERGY) + [motor(truck, 50.0)], speed_kph=100.0)
+    assert not [c for c in carlogs if "0x441" in c[1]], carlogs
+
   def test_no_live_motor_frame_at_the_moving_start_stays_None(self):
     """If 0x441 is not live at that moment the UI fallback is correct, and the next live frame
     is used raw."""
@@ -1510,8 +1532,34 @@ class TestCalibration:
     dev._load_cal()
     assert dev._k == 1.43 and dev._k_fits == 7
 
+  def test_a_missing_directory_is_created(self, carlogs, monkeypatch, tmp_path):
+    """Review 2026-11-01: a fresh /data without /data/pnw must not lose the calibration."""
+    path = tmp_path / "pnw" / "everdrive_cal.json"
+    monkeypatch.setattr(ed, "CAL_PATH", str(path))
+    dev = ed.EverDrive()
+    cal_drive(dev, k_true=1.4, p_m2=20.0, seconds=300.0)
+    assert json.loads(path.read_text())["fits"] == 1
+
+  def test_a_net_soc_rise_discards_the_stretch(self, carlogs, cal_path):
+    """Review 2026-11-01: regen first must not leave a hole that later driving has to fill."""
+    dev = ed.EverDrive()
+    dev._cal_kwh, dev._cal_s, dev._cal_m2 = 0.05, 10.0, 0.05
+    dev._cal_last = (0.0, 50.00)
+    dev._step_cal(0.2, True, 50.05, 126.0, -20.0, 0.0)         # SoC up 0.05 %: net -0.013 kWh
+    assert not [c for c in carlogs if "BMS revision" in c[1]], "a normal step, not the step guard"
+    assert dev._cal_kwh == 0.0 and dev._cal_s == 0.0 and dev._cal_m2 == 0.0
+
+  def test_a_bms_step_down_discards_the_stretch_and_says_so(self, carlogs, cal_path):
+    dev = ed.EverDrive()
+    dev._cal_kwh, dev._cal_s, dev._cal_m2 = 1.5, 180.0, 1.0
+    dev._cal_last = (0.0, 50.00)
+    dev._step_cal(0.2, True, 49.50, 126.0, 20.0, 0.0)          # one 0.5 % step = 0.63 kWh
+    assert dev._cal_kwh == 0.0 and dev._k_fits == 0, "a stepped estimate must not reach a fit"
+    assert [c for c in carlogs if "BMS revision" in c[1]]
+
   def test_a_failed_write_keeps_k_and_says_so(self, carlogs, monkeypatch, tmp_path):
-    monkeypatch.setattr(ed, "CAL_PATH", str(tmp_path / "no_such_dir" / "cal.json"))
+    (tmp_path / "afile").write_text("")
+    monkeypatch.setattr(ed, "CAL_PATH", str(tmp_path / "afile" / "cal.json"))
     dev = ed.EverDrive()
     cal_drive(dev, k_true=1.4, p_m2=20.0, seconds=300.0)
     assert dev._k_fits == 1 and dev._k != ed.K_DEFAULT

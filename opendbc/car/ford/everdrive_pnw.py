@@ -229,6 +229,9 @@ MILE_M = 1609.34
 # blend: k = (1 - K_EMA) k + K_EMA k_fit. Persisted only when k changes (minutes apart, never per
 # frame), via temp file + rename so a power cut cannot leave half a file.
 CAL_MIN_KWH = 2.0
+# A single SoC step larger than this (10 LSB, 0.126 kWh at 126 kWh) is a BMS estimate revision, not
+# consumption: at the 1 Hz SoC rate it would need ~450 kW. It discards the stretch, as a rise does.
+CAL_STEP_MAX_PCT = 0.10
 K_BAND = (1.0, 2.5)
 K_EMA = 0.2
 CAL_PATH = "/data/pnw/everdrive_cal.json"
@@ -299,6 +302,8 @@ class EverDrive:
     self._p_mono = 0.0
     self._p_was_moving = False
     self._p_seed_ts: int | None = None  # 0x441 ts at the moving start; None = no re-seed pending
+    self._mtr_ok_mono: float | None = None  # last publish with live 0x441 power (Rule 2 absence log)
+    self._mtr_gap_logged = False
     # Cumulative snapshots (m, batt kWh, ac kWh); maxlen is 2x the samples one mile takes at MOVING_MS.
     self._mile: deque[tuple[float, float, float]] = deque(maxlen=2 * int(MILE_M / MOVING_MS / PUBLISH_S))
     self._mi_m = self._mi_kwh = self._mi_ac = 0.0
@@ -417,6 +422,18 @@ class EverDrive:
       else:
         self._log("everdrive2pnw: 0x441 outside its band (%.1f A, %.0f V) -- no instant power this cycle"
                   % (amps2, volts2))
+    # Rule 2: 0x2A7 is live, so this is the Lightning and 0x441 must be there too. Absent or stale
+    # for longer than AC_QUIET_S (counted from the first live publish, so a 1 Hz frame that has not
+    # come yet is not reported) means pNowKw / mileKwh stay None and k never calibrates: say so.
+    # Once per gap, not through _log: that shares one 60 s budget and would swallow other lines.
+    if p_m2 is not None or self._mtr_ok_mono is None:
+      self._mtr_ok_mono = now
+      self._mtr_gap_logged = False
+    elif now - self._mtr_ok_mono > AC_QUIET_S and not self._mtr_gap_logged:
+      self._mtr_gap_logged = True
+      carlog.warning("everdrive2pnw: 0x441 %s for %.0f s while 0x2A7 is live -- no instant power, " +
+                     "the moving ranges fall back to the dash range and k does not calibrate",
+                     "never received" if ts_mtr == 0 else "stale or out of band", now - self._mtr_ok_mono)
     if not self._cal_loaded:
       self._load_cal()
     moving = v_ego >= MOVING_MS
@@ -608,6 +625,8 @@ class EverDrive:
     0x441 frame newer than the one at the transition (1 Hz) has been used, and smooths from there."""
     if moving and not self._p_was_moving:
       self._p_seed_ts = mtr_ts
+    elif not moving:
+      self._p_seed_ts = None           # never armed while stopped: the parked load is smoothed
     self._p_was_moving = moving
     if p_batt is None:
       self._p_now = None
@@ -648,9 +667,17 @@ class EverDrive:
     ok = moving and p_m2 is not None and soc_pct is not None and cap_kwh is not None and ac_kw <= AC_ZERO_KW
     if ok and self._cal_last is not None and 0.0 < now - self._cal_last[0] <= SAMPLE_GAP_MAX_S:
       dt = now - self._cal_last[0]
-      self._cal_kwh += (self._cal_last[1] - soc_pct) / 100.0 * cap_kwh
+      step_pct = self._cal_last[1] - soc_pct
+      self._cal_kwh += step_pct / 100.0 * cap_kwh
       self._cal_s += dt
       self._cal_m2 += p_m2 * dt / 3600.0
+      # A stretch whose SoC went net UP (regen, or a BMS step up), or that holds one implausible
+      # step, is not a clean measurement: kept, it would fit k over the wrong span. Start again.
+      if self._cal_kwh < 0.0 or abs(step_pct) > CAL_STEP_MAX_PCT:
+        if abs(step_pct) > CAL_STEP_MAX_PCT:
+          carlog.warning("everdrive2pnw: k stretch discarded: one SoC step of %.2f %% is a BMS revision",
+                         step_pct)
+        self._cal_kwh = self._cal_s = self._cal_m2 = 0.0
     self._cal_last = (now, soc_pct) if ok else None
     if self._cal_kwh < CAL_MIN_KWH:
       return
@@ -692,6 +719,7 @@ class EverDrive:
     """everdriveinstant2pnw: atomic write. A failure keeps k in memory for this session, logged."""
     tmp = CAL_PATH + ".tmp"
     try:
+      os.makedirs(os.path.dirname(CAL_PATH), exist_ok=True)
       with open(tmp, "w") as f:
         json.dump({"k": round(self._k, 4), "fits": self._k_fits}, f)
       os.replace(tmp, CAL_PATH)
