@@ -1335,6 +1335,45 @@ class TestInstantPower:
     dev._step_p_now(40.0, None)
     assert dev._p_now is None, "a lost signal is None, never a held value"
 
+  def test_a_moving_start_after_a_long_park_uses_the_raw_power_at_once(self):
+    """Owner 2026-10-31: no delay at the moving start. After 10 min parked at the idle load the
+    first moving publish must carry the RAW power, not an EMA still near 1.2 kW."""
+    dev = ed.EverDrive()
+    t = 0.0
+    for _ in range(3000):                                  # 10 min parked, 0x441 ts 1..600
+      dev._step_p_now(t, 1.2, False, int(t) + 1)
+      t += 0.2
+    dev._step_p_now(t, 58.7, True, 601)
+    assert dev._p_now == 58.7, "first moving publish: raw, not smoothed from the parked load"
+    dev._step_p_now(t + 0.2, 60.0, True, 601)
+    assert dev._p_now == 60.0, "still raw until a 0x441 frame newer than the one at the start"
+    dev._step_p_now(t + 0.4, 62.0, True, 602)
+    assert dev._p_now == 62.0, "the first newer frame seeds it"
+    dev._step_p_now(t + 0.6, 30.0, True, 602)
+    assert 55.0 < dev._p_now < 62.0, "and from there it smooths again"
+
+  def test_no_live_motor_frame_at_the_moving_start_stays_None(self):
+    """If 0x441 is not live at that moment the UI fallback is correct, and the next live frame
+    is used raw."""
+    dev = ed.EverDrive()
+    dev._step_p_now(0.0, 1.2, False, 1)
+    dev._step_p_now(0.2, None, True, 0)
+    assert dev._p_now is None
+    dev._step_p_now(0.4, 40.0, True, 5)
+    assert dev._p_now == 40.0
+
+  def test_end_to_end_the_first_moving_power_after_a_park_is_not_smoothed(self, monkeypatch, carlogs, cal_path):
+    """Through the real CarInterface: park with 0 A, then drive with 100 A. The first published
+    value above the idle load must be the raw 1.62 x 35.5 + 1.2 kW, not an EMA step toward it."""
+    truck = Truck(monkeypatch)
+    truck.run(30.0, ac=CHARGING, energy=truck.energy(**ENERGY) + [motor(truck, 0.0)], speed_kph=0.0)
+    n = len(truck.cap.blobs)
+    assert n and not truck.cap.blobs[-1]["moving"] and truck.cap.blobs[-1]["pNowKw"] == pytest.approx(1.2)
+    truck.run(6.0, ac=CHARGING, energy=truck.energy(**ENERGY) + [motor(truck, 100.0)], speed_kph=100.0)
+    moving = [b for b in truck.cap.blobs[n:] if b["moving"] and b["pNowKw"] > 2.0]
+    assert moving, "positive control: the truck moved with a live motor signal"
+    assert moving[0]["pNowKw"] == pytest.approx(1.62 * 35.5 + 1.2, abs=0.01)
+
 
 class TestLastMile:
   def _drive(self, dev, seconds, mph, p_kw, ac_kw=0.0, t0=0.0):

@@ -297,6 +297,8 @@ class EverDrive:
     self._cal_loaded = False
     self._p_now: float | None = None   # EMA of P_batt, kW
     self._p_mono = 0.0
+    self._p_was_moving = False
+    self._p_seed_ts: int | None = None  # 0x441 ts at the moving start; None = no re-seed pending
     # Cumulative snapshots (m, batt kWh, ac kWh); maxlen is 2x the samples one mile takes at MOVING_MS.
     self._mile: deque[tuple[float, float, float]] = deque(maxlen=2 * int(MILE_M / MOVING_MS / PUBLISH_S))
     self._mi_m = self._mi_kwh = self._mi_ac = 0.0
@@ -419,7 +421,7 @@ class EverDrive:
       self._load_cal()
     moving = v_ego >= MOVING_MS
     p_batt = None if p_m2 is None else self._k * p_m2 + P_ACC_KW
-    self._step_p_now(now, p_batt)
+    self._step_p_now(now, p_batt, moving, ts_mtr)
     mile = self._step_mile(now, v_ego, moving, p_batt, kw)
     self._step_cal(now, moving, soc_pct, cap_kwh, p_m2, kw)
 
@@ -596,15 +598,25 @@ class EverDrive:
       return None
     return round(net_kw + ac_kw, 2)
 
-  def _step_p_now(self, now: float, p_batt: float | None) -> None:
+  def _step_p_now(self, now: float, p_batt: float | None, moving: bool = False, mtr_ts: int = 0) -> None:
     """everdriveinstant2pnw: EMA of P_batt. Seeded with the first raw value, so the first moving
-    publish already has a number (no window wait). A lost signal drops it to None, never holds it."""
+    publish already has a number (no window wait). A lost signal drops it to None, never holds it.
+
+    RE-SEEDED AT EVERY MOVING START: after a park the EMA sits at the ~1.2 kW idle load, and 5 s of
+    lag from there puts the "@" range over the UI ceiling (dash-range fallback) for the first
+    seconds. So from the not-moving -> moving transition it follows the RAW value until the first
+    0x441 frame newer than the one at the transition (1 Hz) has been used, and smooths from there."""
+    if moving and not self._p_was_moving:
+      self._p_seed_ts = mtr_ts
+    self._p_was_moving = moving
     if p_batt is None:
       self._p_now = None
       return
     dt = now - self._p_mono
-    if self._p_now is None or not 0.0 < dt <= SAMPLE_GAP_MAX_S:
+    if self._p_now is None or not 0.0 < dt <= SAMPLE_GAP_MAX_S or self._p_seed_ts is not None:
       self._p_now = p_batt
+      if self._p_seed_ts is not None and mtr_ts != self._p_seed_ts:
+        self._p_seed_ts = None
     else:
       self._p_now += (p_batt - self._p_now) * dt / (P_TAU_S + dt)
     self._p_mono = now
