@@ -26,6 +26,8 @@ truck's own LONG-RUN average (unmoved off raw 42 across a drive and a full day).
 it is "range this supply buys at the truck's own long-run rate", which is the conservative direction.
 That document also records (§3) that NO broadcast signal gives real vehicle consumption.
 """
+import json
+import os
 import time
 from collections import deque
 
@@ -46,7 +48,10 @@ SOC_MSG = "Battery_Traction_4_FD1"
 # everdrive2pnw (2026-09-20): the truck's UNADJUSTED full-charge range. Paired with VehElEffAvg it
 # yields the pack's usable capacity without hardcoding one -- see CAP_* below.
 RPC_MSG = "Cluster_HEV_Data10_FD1"
-ENERGY_MSGS = (AC_MSG, RANGE_MSG, EFF_MSG, SOC_MSG, RPC_MSG)
+# everdriveinstant2pnw (2026-10-31): 0x441, motor 2 current and voltage, 1 Hz. The only live
+# traction-power signal on this bus -- see the INSTANT POWER block below.
+MTR_MSG = "MtrTracData_1_FD1"
+ENERGY_MSGS = (AC_MSG, RANGE_MSG, EFF_MSG, SOC_MSG, RPC_MSG, MTR_MSG)
 
 PARAM_KEY = "EverDriveStatus"
 
@@ -186,6 +191,48 @@ SAMPLE_GAP_MAX_S = 1.0
 # so a rolling average above it is a stepped estimate, not a measurement. Reported as None and logged.
 NET_KW_MAX = 250.0
 
+# everdriveinstant2pnw (owner 2026-10-31): INSTANT PACK POWER, so the moving range shows at once
+# instead of after the 60..180 s SoC window. The window above stays, but only as the CALIBRATION
+# source for k; the moving display no longer depends on grossKw.
+#
+#   P_batt = k x P_m2 + P_ACC_KW,   P_m2 = MtrTrac2_I_Actl x MtrTrac2_U_Actl
+#
+# The DBC names only motor 2's current (ENERGY-RANGE-SIGNALS.md §3, "The dual-motor problem"), so
+# P_m2 is part of the traction power, not all of it. SIGN: positive = motoring, negative = regen.
+# Evidence (not a wire-level proof): over the 2026-09-19 city drive the current read -57 .. +113 A
+# and the electrical integral was +0.760 kWh against +0.593 kWh mechanical (ratio 0.78, a sane
+# efficiency), which only holds if positive is discharge.
+#
+# K_DEFAULT 1.62 is the owner's start value. It is the WHEEL / MOTOR-2-MECHANICAL ratio from the
+# same drive, not an electrical ratio, so it is only a start: k is refined online (CAL_* below).
+# P_ACC_KW 1.2: the non-traction load, measured as 1.19 kW pack-vs-trip-meter over the 2026-09-19
+# drive (ENERGY-RANGE-SIGNALS.md §2, "the -22 % gap ... is accessory load").
+K_DEFAULT = 1.62
+P_ACC_KW = 1.2
+# Bands on the 0x441 decode. Current: raw 0 is the -1000 A encoding floor and raw 65535 "Faulty"
+# decodes to 5553.5 A, both excluded; 1000 A is above anything one motor draws. Voltage: raw 1023
+# is the DBC start value; the pack read 349.5 .. 360 V, and 200 .. 500 V is a physical band.
+MTR_I_BAND = (-999.0, 1000.0)
+MTR_U_BAND = (200.0, 500.0)
+# P_now is P_batt through this EMA, so it means "now" without the 1 Hz steps of the raw signal.
+P_TAU_S = 5.0
+# The charger counts as OFF at or below this, the same threshold the UI uses (_AC_ZERO_KW).
+AC_ZERO_KW = 0.05
+#
+# ---- LAST MILE: energy over the last MILE_M driven above MOVING_MS, distance from vEgo ------------
+MILE_M = 1609.34
+#
+# ---- CALIBRATION of k from the SoC energy drop ---------------------------------------------------
+# Only increments that are moving above MOVING_MS, with the EverDrive OFF and motor 2 live, count.
+# When the SoC energy drop over them reaches CAL_MIN_KWH (159 LSB at 126 kWh, so quantisation is
+# under 1 %), fit k = (dE_soc - P_ACC_KW x t) / integral(P_m2 dt). Accept only inside K_BAND, then
+# blend: k = (1 - K_EMA) k + K_EMA k_fit. Persisted only when k changes (minutes apart, never per
+# frame), via temp file + rename so a power cut cannot leave half a file.
+CAL_MIN_KWH = 2.0
+K_BAND = (1.0, 2.5)
+K_EMA = 0.2
+CAL_PATH = "/data/pnw/everdrive_cal.json"
+
 
 def _usable(seen: bool, value: float, band: tuple[float, float], nd: int) -> float | None:
   """everdrive2pnw: the decoded value rounded to its OWN resolution, or None if the message was never
@@ -243,6 +290,19 @@ class EverDrive:
     self._cum_s = 0.0                  # seconds accumulated ABOVE MOVING_MS only
     self._cum_kwh = 0.0                # pack energy DROP over those seconds (may go down: regen)
     self._last_sample: tuple[float, float] | None = None   # (mono, socPct) of the previous sample
+    # everdriveinstant2pnw: instant power, last-mile window and k calibration. k is loaded from
+    # CAL_PATH on first presence (never on a car without an EverDrive), see _load_cal.
+    self._k = K_DEFAULT
+    self._k_fits = 0
+    self._cal_loaded = False
+    self._p_now: float | None = None   # EMA of P_batt, kW
+    self._p_mono = 0.0
+    # Cumulative snapshots (m, batt kWh, ac kWh); maxlen is 2x the samples one mile takes at MOVING_MS.
+    self._mile: deque[tuple[float, float, float]] = deque(maxlen=2 * int(MILE_M / MOVING_MS / PUBLISH_S))
+    self._mi_m = self._mi_kwh = self._mi_ac = 0.0
+    self._mi_mono: float | None = None
+    self._cal_kwh = self._cal_s = self._cal_m2 = 0.0
+    self._cal_last: tuple[float, float] | None = None       # (mono, socPct)
 
   def update(self, cp, v_ego: float) -> None:
     """Called once per CarState.update() (100 Hz) with the POWERTRAIN parser. Never raises."""
@@ -323,6 +383,7 @@ class EverDrive:
     ts_rpc = cp.ts_nanos[RPC_MSG]["RngPerChrgAvg_L_Dsply"]
     ts_eff = cp.ts_nanos[EFF_MSG]["VehElEffAvg_No_Dsply"]
     ts_soc = cp.ts_nanos[SOC_MSG]["BattTracSoc2_Pc_Actl"]
+    ts_mtr = cp.ts_nanos[MTR_MSG]["MtrTrac2_I_Actl"]
 
     # rounded to each signal's own DBC resolution: 0.1 km/bit, 10 Wh/km, 0.01 %/bit
     range_km = _usable(ts_range != 0, cp.vl[RANGE_MSG]["VehElRnge_L_Dsply"], RANGE_KM_BAND, 1)
@@ -343,6 +404,24 @@ class EverDrive:
     # ORDER: the window must be stepped on EVERY publish, including the ones where it reports None,
     # or it would only ever advance while it already had an answer.
     gross_kw = self._gross_kw(now, soc_pct, cap_kwh, v_ego, kw)
+
+    # everdriveinstant2pnw: motor 2 power, None unless a 0x441 frame arrived within AC_QUIET_S and
+    # both values are inside their bands. Same liveness rule as 0x2A7: a frozen cp.vl is not power.
+    p_m2 = None
+    if ts_mtr != 0 and (cp._last_update_nanos - ts_mtr) <= AC_QUIET_NS:
+      amps2, volts2 = cp.vl[MTR_MSG]["MtrTrac2_I_Actl"], cp.vl[MTR_MSG]["MtrTrac2_U_Actl"]
+      if MTR_I_BAND[0] <= amps2 <= MTR_I_BAND[1] and MTR_U_BAND[0] <= volts2 <= MTR_U_BAND[1]:
+        p_m2 = amps2 * volts2 / 1000.0
+      else:
+        self._log("everdrive2pnw: 0x441 outside its band (%.1f A, %.0f V) -- no instant power this cycle"
+                  % (amps2, volts2))
+    if not self._cal_loaded:
+      self._load_cal()
+    moving = v_ego >= MOVING_MS
+    p_batt = None if p_m2 is None else self._k * p_m2 + P_ACC_KW
+    self._step_p_now(now, p_batt)
+    mile = self._step_mile(now, v_ego, moving, p_batt, kw)
+    self._step_cal(now, moving, soc_pct, cap_kwh, p_m2, kw)
 
     self._params.put_nonblocking(PARAM_KEY, {
       # Wall clock, for the UI's staleness check. Rule 2: this advances even if the DECODE is frozen,
@@ -385,6 +464,19 @@ class EverDrive:
       # None until the window clears its floor -- see _gross_kw and the MIN_DSOC_PCT block.
       "grossKw": gross_kw,
       "vMs": round(float(v_ego), 2),
+      # everdriveinstant2pnw (2026-10-31): the producer's own "moving" (v_ego >= MOVING_MS), so the UI
+      # and the windows here share one threshold.
+      "moving": moving,
+      # Instant pack load, kW: k x P_m2 + P_ACC_KW through the P_TAU_S EMA. GROSS of the EverDrive
+      # input (it is the load, not the SoC drop). None while 0x441 is not live or out of band.
+      "pNowKw": None if self._p_now is None else round(self._p_now, 2),
+      # Pack load energy and EverDrive AC energy over the last MILE_M driven, kWh. None until the
+      # first full mile of this drive.
+      "mileKwh": None if mile is None else round(mile[0], 3),
+      "mileAcKwh": None if mile is None else round(mile[1], 3),
+      # The scale factor in use, and how many calibration fits have been accepted in total.
+      "kCal": round(self._k, 3),
+      "kFits": self._k_fits,
     })
 
     if not self._live:
@@ -503,6 +595,97 @@ class EverDrive:
                 % (net_kw, win_s, NET_KW_MAX))
       return None
     return round(net_kw + ac_kw, 2)
+
+  def _step_p_now(self, now: float, p_batt: float | None) -> None:
+    """everdriveinstant2pnw: EMA of P_batt. Seeded with the first raw value, so the first moving
+    publish already has a number (no window wait). A lost signal drops it to None, never holds it."""
+    if p_batt is None:
+      self._p_now = None
+      return
+    dt = now - self._p_mono
+    if self._p_now is None or not 0.0 < dt <= SAMPLE_GAP_MAX_S:
+      self._p_now = p_batt
+    else:
+      self._p_now += (p_batt - self._p_now) * dt / (P_TAU_S + dt)
+    self._p_mono = now
+
+  def _step_mile(self, now: float, v_ego: float, moving: bool, p_batt: float | None,
+                 ac_kw: float) -> tuple[float, float] | None:
+    """everdriveinstant2pnw: (load kWh, AC kWh) over the last MILE_M driven, or None until one full
+    mile has been driven. Same rules as _gross_kw: only consecutive moving samples count, so a stop
+    or an unwatched gap adds neither distance nor energy. O(1) amortised per call."""
+    ok = moving and p_batt is not None
+    if ok and self._mi_mono is not None and 0.0 < now - self._mi_mono <= SAMPLE_GAP_MAX_S:
+      dt = now - self._mi_mono
+      self._mi_m += v_ego * dt
+      self._mi_kwh += p_batt * dt / 3600.0
+      self._mi_ac += ac_kw * dt / 3600.0
+    if ok:
+      self._mile.append((self._mi_m, self._mi_kwh, self._mi_ac))
+    self._mi_mono = now if ok else None
+    while len(self._mile) >= 2 and self._mi_m - self._mile[1][0] >= MILE_M:
+      self._mile.popleft()
+    if not self._mile or self._mi_m - self._mile[0][0] < MILE_M:
+      return None
+    return self._mi_kwh - self._mile[0][1], self._mi_ac - self._mile[0][2]
+
+  def _step_cal(self, now: float, moving: bool, soc_pct: float | None, cap_kwh: float | None,
+                p_m2: float | None, ac_kw: float) -> None:
+    """everdriveinstant2pnw: accumulate one calibration stretch and fit k when it is long enough.
+    See the CAL_* block. Every fit, accepted or rejected, is logged once with its numbers."""
+    ok = moving and p_m2 is not None and soc_pct is not None and cap_kwh is not None and ac_kw <= AC_ZERO_KW
+    if ok and self._cal_last is not None and 0.0 < now - self._cal_last[0] <= SAMPLE_GAP_MAX_S:
+      dt = now - self._cal_last[0]
+      self._cal_kwh += (self._cal_last[1] - soc_pct) / 100.0 * cap_kwh
+      self._cal_s += dt
+      self._cal_m2 += p_m2 * dt / 3600.0
+    self._cal_last = (now, soc_pct) if ok else None
+    if self._cal_kwh < CAL_MIN_KWH:
+      return
+    d_soc, secs, m2 = self._cal_kwh, self._cal_s, self._cal_m2
+    self._cal_kwh = self._cal_s = self._cal_m2 = 0.0
+    k_fit = (d_soc - P_ACC_KW * secs / 3600.0) / m2 if m2 > 0.0 else float("nan")
+    if not K_BAND[0] <= k_fit <= K_BAND[1]:      # also rejects nan
+      carlog.warning("everdrive2pnw: k fit REJECTED: dE_soc %.3f kWh over %.0f s, P_m2 integral %.3f kWh " +
+                     "-> k %.3f outside [%.1f, %.1f]; k stays %.3f", d_soc, secs, m2, k_fit, *K_BAND, self._k)
+      return
+    k_old = self._k
+    self._k = (1.0 - K_EMA) * k_old + K_EMA * k_fit
+    self._k_fits += 1
+    carlog.warning("everdrive2pnw: k fit accepted (#%d): dE_soc %.3f kWh over %.0f s, P_m2 integral %.3f " +
+                   "kWh -> k_fit %.3f, k %.4f -> %.4f", self._k_fits, d_soc, secs, m2, k_fit, k_old, self._k)
+    if round(self._k, 4) != round(k_old, 4):
+      self._save_cal()
+
+  def _load_cal(self) -> None:
+    """everdriveinstant2pnw: k from CAL_PATH, once per session, on first presence. Missing or
+    invalid -> K_DEFAULT, said in one log line. A valid file is logged too, so the k in use is known."""
+    self._cal_loaded = True
+    try:
+      with open(CAL_PATH) as f:
+        d = json.load(f)
+      k, fits = float(d["k"]), int(d["fits"])
+      if not (K_BAND[0] <= k <= K_BAND[1] and fits >= 0):
+        raise ValueError(f"k {k} / fits {fits} out of band")
+    except FileNotFoundError:
+      carlog.warning("everdrive2pnw: no %s yet; k starts at the default %.2f", CAL_PATH, K_DEFAULT)
+      return
+    except (OSError, ValueError, TypeError, KeyError) as e:
+      carlog.error("everdrive2pnw: %s is unreadable or invalid (%r); k falls back to %.2f", CAL_PATH, e, K_DEFAULT)
+      return
+    self._k, self._k_fits = k, fits
+    carlog.warning("everdrive2pnw: k %.4f loaded from %s (%d accepted fits)", k, CAL_PATH, fits)
+
+  def _save_cal(self) -> None:
+    """everdriveinstant2pnw: atomic write. A failure keeps k in memory for this session, logged."""
+    tmp = CAL_PATH + ".tmp"
+    try:
+      with open(tmp, "w") as f:
+        json.dump({"k": round(self._k, 4), "fits": self._k_fits}, f)
+      os.replace(tmp, CAL_PATH)
+    except OSError:
+      carlog.exception("everdrive2pnw: could not write %s; k %.4f is kept for this session only",
+                       CAL_PATH, self._k)
 
   def _open_params(self) -> bool:
     """everdrive2pnw: build the /dev/shm handle ON FIRST PRESENCE, not at construction, so a truck

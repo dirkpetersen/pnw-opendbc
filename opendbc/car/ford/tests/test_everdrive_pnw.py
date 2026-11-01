@@ -19,6 +19,8 @@ CANbus/ford/f-150/lightning/2024-25/ENERGY-RANGE-SIGNALS.md):
   0x2A7 payload 07 D0 00 00 03 68 00 00 while charging = 12.50 A / 109.0 V = 1.3625 kW
   0x2A7 payload 00 00 00 00 00 00 00 00 x 865 consecutive frames while unplugged = a REAL zero
 """
+import json
+
 import pytest
 
 from opendbc.can import CANPacker
@@ -41,6 +43,7 @@ RANGE_ADDR = 0x442
 EFF_ADDR = 0x36D
 SOC_ADDR = 0x24C
 RPC_ADDR = 0x471
+MTR_ADDR = 0x441
 
 # The LITERAL payloads off the truck. Not reconstructed from a packer -- the bytes as captured.
 CHARGING = bytes.fromhex("07d0000003680000")
@@ -208,9 +211,9 @@ class TestCanValidIsNeverRiskedForADisplayBox:
     is can_valid False -> ret.canValid False -> an undriveable car. Failing here is cheap; the
     alternative is not."""
     pt = CarState.get_can_parsers(self._CP())[Bus.pt]
-    assert set(ed.ENERGY_MSGS) == {ed.AC_MSG, ed.RANGE_MSG, ed.EFF_MSG, ed.SOC_MSG, ed.RPC_MSG}
+    assert set(ed.ENERGY_MSGS) == {ed.AC_MSG, ed.RANGE_MSG, ed.EFF_MSG, ed.SOC_MSG, ed.RPC_MSG, ed.MTR_MSG}
     assert [pt.dbc.name_to_msg[m].address for m in ed.ENERGY_MSGS] == \
-           [AC_ADDR, RANGE_ADDR, EFF_ADDR, SOC_ADDR, RPC_ADDR]   # 0x2A7/0x442/0x36D/0x24C/0x471
+           [AC_ADDR, RANGE_ADDR, EFF_ADDR, SOC_ADDR, RPC_ADDR, MTR_ADDR]   # .../0x471/0x441
     for name in ed.ENERGY_MSGS:
       addr = pt.dbc.name_to_msg[name].address
       assert addr in pt.addresses, f"{name} must be registered up front, not lazily"
@@ -1269,3 +1272,223 @@ class TestPublishedEnergyAndConsumption:
     # 30 kW net + the measured 1.3625 kW of EverDrive input added back
     assert all(29.0 <= g <= 33.0 for g in gross), f"{min(gross)}..{max(gross)} kW for a 30 kW drive"
     assert truck.cap.blobs[-1]["energyKwh"] == pytest.approx(49.5 / 100.0 * cap, abs=0.4)
+
+
+# ---------------------------------------------------------------- everdriveinstant2pnw
+
+
+ENERGY = dict(range_km=180.2, eff_wh_km=320.0, soc_pct=49.99, rpc_km=396.9)
+
+
+def motor(truck, amps, volts=355.0):
+  return truck.frame("MtrTracData_1_FD1", {"MtrTrac2_I_Actl": amps, "MtrTrac2_U_Actl": volts})
+
+
+@pytest.fixture
+def cal_path(monkeypatch, tmp_path):
+  path = tmp_path / "everdrive_cal.json"
+  monkeypatch.setattr(ed, "CAL_PATH", str(path))
+  return path
+
+
+class TestInstantPower:
+  """everdriveinstant2pnw (owner 2026-10-31): P_batt = k x MtrTrac2_I x U + P_ACC_KW, with no window."""
+
+  def test_the_first_moving_publish_already_carries_the_instant_power(self, monkeypatch, carlogs, cal_path):
+    """THE owner requirement: no wait. 3 s of 0x2A7 + 0x441 at 62 mph; every payload has pNowKw."""
+    truck = Truck(monkeypatch)
+    truck.run(3.5, ac=CHARGING, energy=truck.energy(**ENERGY) + [motor(truck, 100.0)], speed_kph=100.0)
+    first = truck.cap.blobs[0]
+    assert first["moving"] is True
+    assert first["pNowKw"] == pytest.approx(1.62 * 100.0 * 355.0 / 1000.0 + 1.2, abs=0.01)
+    assert first["grossKw"] is None, "positive control: the SoC window has NOT filled, yet pNowKw is there"
+    assert first["kCal"] == 1.62 and first["kFits"] == 0
+    assert first["mileKwh"] is None and first["mileAcKwh"] is None
+
+  def test_regen_passes_through_as_negative_power(self, monkeypatch, carlogs, cal_path):
+    """Negative current = regen. The sign is kept; the UI decides that the term falls back."""
+    truck = Truck(monkeypatch)
+    truck.run(3.5, ac=CHARGING, energy=truck.energy(**ENERGY) + [motor(truck, -57.0)], speed_kph=100.0)
+    assert truck.cap.blobs[-1]["pNowKw"] < 0.0
+
+  def test_no_motor_frame_is_None_not_the_accessory_constant(self, monkeypatch, carlogs, cal_path):
+    truck = Truck(monkeypatch)
+    truck.run(3.5, ac=CHARGING, energy=truck.energy(**ENERGY), speed_kph=100.0)
+    assert {b["pNowKw"] for b in truck.cap.blobs} == {None}
+
+  @pytest.mark.parametrize("amps,volts", [(-1000.0, 355.0), (100.0, 1023.0), (100.0, 0.0)])
+  def test_a_floor_or_start_value_is_None_and_logged(self, monkeypatch, carlogs, cal_path, amps, volts):
+    truck = Truck(monkeypatch)
+    truck.run(3.5, ac=CHARGING, energy=truck.energy(**ENERGY) + [motor(truck, amps, volts)], speed_kph=100.0)
+    assert {b["pNowKw"] for b in truck.cap.blobs} == {None}
+    assert [c for c in carlogs if "0x441 outside" in c[1]]
+
+  def test_the_ema_starts_at_the_raw_value_and_then_smooths(self):
+    dev = ed.EverDrive()
+    dev._step_p_now(0.0, 10.0)
+    assert dev._p_now == 10.0, "seeded with the first value: no wait"
+    dev._step_p_now(0.2, 40.0)
+    assert 10.0 < dev._p_now < 12.0, "one 0.2 s step toward a 30 kW jump moves it ~1.2 kW, not all the way"
+    for i in range(2, 200):
+      dev._step_p_now(i * 0.2, 40.0)
+    assert dev._p_now == pytest.approx(40.0, abs=0.1)
+    dev._step_p_now(40.0, None)
+    assert dev._p_now is None, "a lost signal is None, never a held value"
+
+
+class TestLastMile:
+  def _drive(self, dev, seconds, mph, p_kw, ac_kw=0.0, t0=0.0):
+    out, t = [], t0
+    while t < t0 + seconds - 1e-9:
+      v = mph / 2.23694
+      out.append(dev._step_mile(t, v, v >= ed.MOVING_MS, p_kw, ac_kw))
+      t += ed.PUBLISH_S
+    return out
+
+  def test_absent_before_one_mile_present_after(self):
+    dev = ed.EverDrive()
+    got = self._drive(dev, 59.0, 60.0, 30.0)          # 0.983 mi at 60 mph
+    assert set(got) == {None}
+    got = self._drive(dev, 2.0, 60.0, 30.0, t0=59.0)
+    assert got[-1] is not None
+    # one mile at 60 mph is 60 s at 30 kW = 0.5 kWh
+    assert got[-1][0] == pytest.approx(0.5, abs=0.01) and got[-1][1] == 0.0
+
+  def test_the_ac_energy_is_over_the_same_mile(self):
+    dev = ed.EverDrive()
+    got = self._drive(dev, 70.0, 60.0, 30.0, ac_kw=1.4)
+    assert got[-1][1] == pytest.approx(1.4 / 60.0, abs=0.001)
+
+  def test_a_stop_adds_neither_distance_nor_energy(self):
+    dev = ed.EverDrive()
+    self._drive(dev, 30.0, 60.0, 30.0)
+    self._drive(dev, 600.0, 0.0, 1.2, t0=30.0)
+    got = self._drive(dev, 31.0, 60.0, 30.0, t0=630.0)
+    assert got[-1][0] == pytest.approx(0.5, abs=0.01), "the 10 min stop must not be in the mile"
+
+  def test_the_window_slides_to_the_newest_mile(self):
+    dev = ed.EverDrive()
+    self._drive(dev, 120.0, 60.0, 30.0)
+    got = self._drive(dev, 61.0, 60.0, 15.0, t0=120.0)
+    assert got[-1][0] == pytest.approx(0.25, abs=0.01)
+    assert len(dev._mile) < 400, "old snapshots are trimmed"
+
+  def test_lost_power_signal_breaks_the_chain(self):
+    dev = ed.EverDrive()
+    got = self._drive(dev, 120.0, 60.0, None)
+    assert set(got) == {None} and dev._mi_m == 0.0
+
+
+def cal_drive(dev, *, k_true, p_m2, seconds, cap=126.0, soc=80.0, ac_kw=0.0, t0=0.0, mph=60.0):
+  """A steady drive whose pack load is k_true x p_m2 + P_ACC_KW, with SoC quantised to 0.01 %."""
+  load = k_true * p_m2 + ed.P_ACC_KW
+  t = t0
+  while t < t0 + seconds - 1e-9:
+    s = int((soc - load * (t - t0) / 3600.0 / cap * 100.0) * 100.0) / 100.0
+    dev._step_cal(t, mph / 2.23694 >= ed.MOVING_MS, s, cap, p_m2, ac_kw)
+    t += ed.PUBLISH_S
+
+
+class TestCalibration:
+  def test_a_good_stretch_is_accepted_blended_and_persisted(self, carlogs, cal_path):
+    dev = ed.EverDrive()
+    cal_drive(dev, k_true=1.4, p_m2=20.0, seconds=300.0)     # 29.2 kW -> 2 kWh in ~247 s
+    assert dev._k_fits == 1
+    assert dev._k == pytest.approx(0.8 * 1.62 + 0.2 * 1.4, abs=0.005)
+    assert [c for c in carlogs if "k fit accepted" in c[1]]
+    saved = json.loads(cal_path.read_text())
+    assert saved == {"k": round(dev._k, 4), "fits": 1}
+    assert not (cal_path.parent / "everdrive_cal.json.tmp").exists(), "temp file renamed away"
+
+  def test_repeated_fits_converge_on_the_true_k(self, carlogs, cal_path):
+    dev = ed.EverDrive()
+    cal_drive(dev, k_true=1.4, p_m2=20.0, seconds=3000.0)
+    assert dev._k_fits >= 10
+    assert dev._k == pytest.approx(1.4, abs=0.03)
+
+  @pytest.mark.parametrize("k_true", [0.7, 3.0])
+  def test_a_fit_outside_the_band_is_rejected_and_logged(self, carlogs, cal_path, k_true):
+    dev = ed.EverDrive()
+    cal_drive(dev, k_true=k_true, p_m2=20.0, seconds=600.0)
+    assert dev._k == ed.K_DEFAULT and dev._k_fits == 0
+    assert [c for c in carlogs if "REJECTED" in c[1]]
+    assert not cal_path.exists(), "a rejected fit must not write the file"
+
+  @staticmethod
+  def _fit(dev, d_soc, secs, m2):
+    """One fit with preset accumulators; the call itself adds nothing (not moving)."""
+    dev._cal_kwh, dev._cal_s, dev._cal_m2 = d_soc, secs, m2
+    dev._step_cal(0.0, False, None, None, None, 0.0)
+
+  def test_a_stretch_with_no_positive_motor_energy_is_rejected(self, carlogs, cal_path):
+    """A regen-dominated stretch: dividing by a zero or negative motor integral is not a fit."""
+    dev = ed.EverDrive()
+    for m2 in (0.0, -0.3):
+      self._fit(dev, 2.5, 600.0, m2)
+    assert dev._k == ed.K_DEFAULT and dev._k_fits == 0
+    assert len([c for c in carlogs if "REJECTED" in c[1]]) == 2
+    assert dev._cal_kwh == 0.0, "the stretch is consumed either way"
+
+  def test_the_band_edges_are_inclusive(self, carlogs, cal_path):
+    dev = ed.EverDrive()
+    self._fit(dev, 1.2 + ed.K_BAND[1], 3600.0, 1.0)            # k_fit exactly 2.5
+    assert dev._k_fits == 1
+
+  def test_the_everdrive_on_or_a_stop_contributes_nothing(self, carlogs, cal_path):
+    dev = ed.EverDrive()
+    cal_drive(dev, k_true=1.4, p_m2=20.0, seconds=600.0, ac_kw=1.4)
+    cal_drive(dev, k_true=1.4, p_m2=20.0, seconds=600.0, mph=5.0, t0=600.0)
+    assert dev._cal_kwh == 0.0 and dev._cal_s == 0.0 and dev._k_fits == 0
+
+  def test_an_unchanged_k_is_not_rewritten(self, carlogs, cal_path, monkeypatch):
+    dev = ed.EverDrive()
+    writes = []
+    monkeypatch.setattr(ed.EverDrive, "_save_cal", lambda self: writes.append(self._k))
+    dev._k = 1.5
+    self._fit(dev, 2.7, 3600.0, 1.0)                           # k_fit = (2.7 - 1.2) / 1.0 = 1.5
+    assert dev._k_fits == 1 and writes == [], "an accepted fit that leaves k unchanged writes nothing"
+    self._fit(dev, 2.9, 3600.0, 1.0)                           # k_fit 1.7 -> k moves
+    assert writes == [pytest.approx(0.8 * 1.5 + 0.2 * 1.7)]
+
+  def test_load_missing_file_is_the_default_with_one_log_line(self, carlogs, cal_path):
+    dev = ed.EverDrive()
+    dev._load_cal()
+    assert dev._k == ed.K_DEFAULT and dev._k_fits == 0
+    assert len([c for c in carlogs if "no " in c[1] and "default" in c[1]]) == 1
+
+  @pytest.mark.parametrize("body", ["{not json", '{"k": 9.0, "fits": 3}', '{"k": "x", "fits": 1}',
+                                    '{"fits": 1}', '[1, 2]', '{"k": 1.5, "fits": -1}'])
+  def test_load_corrupt_or_out_of_band_is_the_default_and_logged(self, carlogs, cal_path, body):
+    cal_path.write_text(body)
+    dev = ed.EverDrive()
+    dev._load_cal()
+    assert dev._k == ed.K_DEFAULT and dev._k_fits == 0
+    assert len([c for c in carlogs if c[0] == "error" and "invalid" in c[1]]) == 1
+
+  def test_load_a_valid_file(self, carlogs, cal_path):
+    cal_path.write_text('{"k": 1.43, "fits": 7}')
+    dev = ed.EverDrive()
+    dev._load_cal()
+    assert dev._k == 1.43 and dev._k_fits == 7
+
+  def test_a_failed_write_keeps_k_and_says_so(self, carlogs, monkeypatch, tmp_path):
+    monkeypatch.setattr(ed, "CAL_PATH", str(tmp_path / "no_such_dir" / "cal.json"))
+    dev = ed.EverDrive()
+    cal_drive(dev, k_true=1.4, p_m2=20.0, seconds=300.0)
+    assert dev._k_fits == 1 and dev._k != ed.K_DEFAULT
+    assert [c for c in carlogs if c[0] == "exception" and "could not write" in c[1]]
+
+  def test_the_file_is_loaded_once_on_first_presence_and_k_is_published(self, monkeypatch, carlogs, cal_path):
+    cal_path.write_text('{"k": 1.43, "fits": 7}')
+    truck = Truck(monkeypatch)
+    assert truck.ed._k == ed.K_DEFAULT, "nothing is read before an EverDrive is seen"
+    truck.run(3.5, ac=CHARGING, energy=truck.energy(**ENERGY) + [motor(truck, 100.0)], speed_kph=100.0)
+    last = truck.cap.blobs[-1]
+    assert last["kCal"] == 1.43 and last["kFits"] == 7
+    assert last["pNowKw"] == pytest.approx(1.43 * 35.5 + 1.2, abs=0.05)
+    assert len([c for c in carlogs if "loaded from" in c[1]]) == 1
+
+  def test_a_truck_without_an_everdrive_never_reads_the_file_or_logs(self, monkeypatch, carlogs, cal_path):
+    truck = Truck(monkeypatch)
+    truck.run(5.0, energy=truck.energy(**ENERGY) + [motor(truck, 100.0)], speed_kph=100.0)
+    assert truck.cap.blobs == [] and not truck.ed._cal_loaded and carlogs == []
