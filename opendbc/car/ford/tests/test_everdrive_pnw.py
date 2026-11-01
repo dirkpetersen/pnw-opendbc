@@ -828,21 +828,32 @@ class TestDerivedPackCapacity:
     assert last["capKwh"] == pytest.approx(396.9 * 320.0 / 1000.0, abs=0.01)
 
   @pytest.mark.parametrize("missing", ["rpc_km", "eff_wh_km"])
-  def test_capacity_is_None_when_either_input_is_missing(self, monkeypatch, carlogs, missing):
-    """Rule 2: half an input must not produce a confident number. NEVER a 0.0-as-a-guess."""
+  def test_half_an_input_gives_the_measured_capacity_not_a_derived_one(self, monkeypatch, carlogs, missing):
+    """Rule 2: half an input must not produce a confident DERIVED number. Since 2026-11-01 the
+    measured CAP_MEASURED_KWH is used instead, and the payload says so."""
     kw = dict(range_km=156.1, eff_wh_km=320.0, soc_pct=43.85, rpc_km=396.9)
     kw.pop(missing)
-    assert self._pub(monkeypatch, **kw)["capKwh"] is None, f"missing {missing} must give None"
+    last = self._pub(monkeypatch, **kw)
+    assert (last["capKwh"], last["capSrc"]) == (ed.CAP_MEASURED_KWH, "measured"), f"missing {missing}"
 
-  def test_a_sentinel_RngPerChrgAvg_is_None_not_a_capacity(self, monkeypatch, carlogs):
-    """raw 4094 NoDataExists decodes to 409.4 km -- which would imply a plausible 131 kWh."""
+  def test_the_derived_capacity_is_kept_when_present(self, monkeypatch, carlogs):
+    last = self._pub(monkeypatch, range_km=156.1, eff_wh_km=320.0, soc_pct=43.85, rpc_km=396.9)
+    assert last["capSrc"] == "derived" and last["capKwh"] != ed.CAP_MEASURED_KWH
+    assert not [c for c in carlogs if "derived capacity unavailable" in c[1]], "no fallback, no line"
+
+  def test_a_sentinel_RngPerChrgAvg_is_not_a_derived_capacity(self, monkeypatch, carlogs):
+    """raw 4094 NoDataExists decodes to 409.4 km -- which would imply a plausible 131 kWh. The
+    device showed exactly this on 2026-11-01 (rngPerChrgKm None, ts non-zero)."""
     last = self._pub(monkeypatch, range_km=156.1, eff_wh_km=320.0, soc_pct=43.85, rpc_km=409.4)
-    assert last["capKwh"] is None
+    assert (last["capKwh"], last["capSrc"]) == (ed.CAP_MEASURED_KWH, "measured")
+    assert last["energyKwh"] == pytest.approx(43.85 / 100.0 * ed.CAP_MEASURED_KWH, abs=0.01)
 
-  def test_a_missing_RngPerChrgAvg_is_logged_loudly(self, monkeypatch, carlogs):
-    """Without this the kWh figure just silently vanishes from the box -- an invisible degradation."""
+  def test_the_fallback_is_logged_once_per_session(self, monkeypatch, carlogs):
+    """Rule 2: the substitution is said, once, with the reason; it no longer fires the truck-gap
+    error, because nothing is missing from the box any more."""
     self._pub(monkeypatch, range_km=156.1, eff_wh_km=320.0, soc_pct=43.85)
-    assert [m for lvl, m, a in carlogs if lvl == "error" and "rngPerChrgKm" in m]
+    assert len([c for c in carlogs if "derived capacity unavailable" in c[1]]) == 1
+    assert not [c for c in carlogs if c[0] == "error" and "not usable" in c[1]]
 
   def test_one_lsb_of_efficiency_spans_fords_stated_capacity(self, monkeypatch, carlogs):
     """THE anti-misreading test. VehElEffAvg is 10 Wh/km per bit. At the observed 396.9 km one LSB
@@ -880,7 +891,7 @@ class TestDbcStartValuesAreRejected:
 
   def test_RngPerChrgAvg_start_value_4093_is_not_a_131kWh_pack(self, monkeypatch, carlogs):
     last = self._pub(monkeypatch, range_km=156.1, eff_wh_km=320.0, soc_pct=43.85, rpc_km=409.3)
-    assert last["capKwh"] is None, "409.3 km x 320 Wh/km = 131.0 kWh, indistinguishable from the truth"
+    assert last["capSrc"] == "measured", "409.3 km x 320 Wh/km = 131.0 kWh, indistinguishable from the truth"
 
   def test_VehElRnge_start_value_4093_is_not_254_miles_of_range(self, monkeypatch, carlogs):
     last = self._pub(monkeypatch, range_km=409.3, eff_wh_km=320.0, soc_pct=43.85, rpc_km=396.9)
@@ -897,7 +908,7 @@ class TestDbcStartValuesAreRejected:
     full-charge range would publish capKwh 0.0, and the UI would then print '(0.000kwh)' -- an empty
     pack, from a signal that simply had not populated."""
     last = self._pub(monkeypatch, range_km=156.1, eff_wh_km=320.0, soc_pct=43.85, rpc_km=0.0)
-    assert last["capKwh"] is None
+    assert (last["capKwh"], last["capSrc"]) == (ed.CAP_MEASURED_KWH, "measured")
 
   def test_a_capacity_that_rounds_to_zero_is_None_not_a_zero_capacity(self, monkeypatch, carlogs):
     """Fable review 2026-09-20. Both inputs can sit AT their band floors and still be 'usable':
@@ -906,8 +917,9 @@ class TestDbcStartValuesAreRejected:
     `win_kwh >= floor_kwh` test in _gross_kw then passes on ANY window -- publishing acKw itself
     as 'consumption', a plausible wrong number rather than no answer (Rule 2)."""
     last = self._pub(monkeypatch, range_km=156.1, eff_wh_km=10.0, soc_pct=43.85, rpc_km=0.1)
-    assert last["capKwh"] is None, "0.1 km x 10 Wh/km rounds to 0.00 kWh -- must be None"
-    assert last["energyKwh"] is None, "energy derives from capacity; it cannot survive it"
+    assert (last["capKwh"], last["capSrc"]) == (ed.CAP_MEASURED_KWH, "measured"), \
+      "0.1 km x 10 Wh/km rounds to 0.00 kWh -- never a zero capacity"
+    assert last["energyKwh"] == pytest.approx(43.85 / 100.0 * ed.CAP_MEASURED_KWH, abs=0.01)
     assert last["grossKw"] is None, "a zero floor must not let the window report"
 
 
@@ -1193,14 +1205,20 @@ class TestPublishedEnergyAndConsumption:
     assert last["capKwh"] == pytest.approx(127.01, abs=0.01)
     assert last["energyKwh"] == pytest.approx(43.85 / 100.0 * 127.01, abs=0.01)
 
-  @pytest.mark.parametrize("missing", ["soc_pct", "rpc_km", "eff_wh_km"])
-  def test_energyKwh_is_None_when_an_input_is_missing_never_zero(self, monkeypatch, carlogs, missing):
+  def test_energyKwh_is_None_when_soc_is_missing_never_zero(self, monkeypatch, carlogs):
     """Rule 2. A 0.0 here would print as an empty pack and as a zero range."""
+    truck = Truck(monkeypatch)
+    truck.run(6.0, ac=CHARGING, energy=truck.energy(range_km=156.1, eff_wh_km=320.0, rpc_km=396.9))
+    assert truck.cap.blobs[-1]["energyKwh"] is None
+
+  @pytest.mark.parametrize("missing", ["rpc_km", "eff_wh_km"])
+  def test_energyKwh_uses_the_measured_capacity_when_the_derived_one_is_missing(self, monkeypatch, carlogs,
+                                                                               missing):
     kw = dict(range_km=156.1, eff_wh_km=320.0, soc_pct=43.85, rpc_km=396.9)
     kw.pop(missing)
     truck = Truck(monkeypatch)
     truck.run(6.0, ac=CHARGING, energy=truck.energy(**kw))
-    assert truck.cap.blobs[-1]["energyKwh"] is None, f"missing {missing} must give None"
+    assert truck.cap.blobs[-1]["energyKwh"] == pytest.approx(43.85 / 100.0 * ed.CAP_MEASURED_KWH, abs=0.01)
 
   def test_grossKw_is_published_and_is_None_on_a_short_parked_session(self, monkeypatch, carlogs):
     """The key must EXIST (the UI reads it every poll) and must be None until earned. A parked truck

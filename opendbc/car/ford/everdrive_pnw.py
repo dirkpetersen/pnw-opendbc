@@ -96,6 +96,12 @@ SOC_PCT_BAND = (0.0, 100.0)       # a real SoC cannot exceed 100 %
 # RngPerChrgAvg band: 409.3 is the DBC's own max, below its sentinels. POSITIVE lower bound because
 # this is a load-bearing input to the derived capacity, and a zero or negative would poison it.
 RPC_KM_BAND = (0.1, 409.25)
+# everdriveinstant2pnw (owner 2026-11-01): the MEASURED usable capacity, used only when the derived
+# one is not available. 0x224848 Energy 59.350 kWh / 0x224801 HvbSoc 47.120 % = 125.96 kWh, read
+# over UDS on 2026-09-20 (ENERGY-RANGE-SIGNALS.md §2). Needed because the truck can stop sending a
+# usable RngPerChrgAvg (seen on the device 2026-11-01: rngPerChrgKm None with a non-zero ts, i.e.
+# a sentinel), and without a capacity the kWh, "@" and last-mile terms cannot show at all.
+CAP_MEASURED_KWH = 125.96
 # The efficiency lower bound is POSITIVE, not -99.9. `effOk` means "this is a real measurement", and a
 # negative average Wh/km is not one -- raws 1..9 decode to -90..-10 Wh/km, which are inside the signal's
 # declared range and are not sentinels, so nothing else would reject them. The consumer also DIVIDES by
@@ -282,6 +288,7 @@ class EverDrive:
     self._live = False                 # is an EverDrive currently broadcasting?
     self._live_logged = False
     self._truck_gap_logged = False
+    self._cap_fallback_logged = False
     self._last_log_mono = -LOG_EVERY_S
     self._err = 0
     # everdrive2pnw: the rolling-consumption window. Cumulative snapshots (wall_mono, moving_s,
@@ -407,6 +414,14 @@ class EverDrive:
     cap_kwh = None if (rpc_km is None or eff_wh_km is None) else round(rpc_km * eff_wh_km / 1000.0, 2)
     if cap_kwh is not None and cap_kwh <= 0.0:
       cap_kwh = None
+    cap_src = "derived"
+    if cap_kwh is None:
+      cap_kwh, cap_src = CAP_MEASURED_KWH, "measured"
+      if not self._cap_fallback_logged:   # Rule 2: once per session, with the reason
+        self._cap_fallback_logged = True
+        carlog.warning("everdrive2pnw: derived capacity unavailable (rngPerChrgKm=%s ts=%d, effWhKm=%s ts=%d; " +
+                       "ts 0 = never received, non-zero ts with None = sentinel) -- using the measured " +
+                       "%.2f kWh (capSrc=measured)", rpc_km, ts_rpc, eff_wh_km, ts_eff, CAP_MEASURED_KWH)
     energy_kwh = None if (soc_pct is None or cap_kwh is None) else round(soc_pct * cap_kwh / 100.0, 2)
     # ORDER: the window must be stepped on EVERY publish, including the ones where it reports None,
     # or it would only ever advance while it already had an answer.
@@ -471,6 +486,9 @@ class EverDrive:
       # It is still a 10 Wh/km-quantised product -- see test_one_lsb_of_efficiency_spans_fords_stated
       # _capacity -- so a 126-vs-131 "gap" is quantisation, not a degraded pack.
       "capKwh": cap_kwh,
+      # everdriveinstant2pnw: "derived" (RngPerChrgAvg x VehElEffAvg) or "measured" (CAP_MEASURED_KWH,
+      # used when the derived value is unavailable). Never None: one of the two is always in use.
+      "capSrc": cap_src,
       # everdrive2pnw (2026-09-20): energy actually left in the pack, kWh. The broadcast SoC IS the
       # true SoC (0x24C read 47.12 % against UDS HvbSoc 47.120 % on 2026-09-20), so this needs no UDS.
       # None whenever socPct or capKwh is None -- never a 0.0-as-a-guess.
@@ -509,10 +527,9 @@ class EverDrive:
     # Rule 2: an EverDrive that IS talking on this bus means we are on the Lightning, so the truck's
     # own energy messages must be there too. If one is not, the DBC/bus assumption is wrong and that
     # has to be visible rather than showing up as a silently missing part of the display box.
-    # RngPerChrgAvg is included (2026-09-20) because capKwh depends on it: without it the consumer
-    # simply drops the kWh figure, which would otherwise be an invisible degradation.
-    if not self._truck_gap_logged and (range_km is None or eff_wh_km is None or soc_pct is None
-                                       or rpc_km is None):
+    # rngPerChrgKm is in the line for context but no longer triggers it (2026-11-01): a missing one
+    # now selects the measured capacity, which logs on its own above.
+    if not self._truck_gap_logged and (range_km is None or eff_wh_km is None or soc_pct is None):
       self._truck_gap_logged = True
       carlog.error("everdrive2pnw: 0x2A7 is live but a truck energy signal is not usable " +
                    "(rangeKm=%s ts=%d, effWhKm=%s ts=%d, socPct=%s ts=%d, rngPerChrgKm=%s ts=%d; " +
