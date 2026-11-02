@@ -1457,6 +1457,30 @@ class TestLastMileIsTheAverageOfTermOne:
     assert max(loads) - min(loads) < 0.5 and 19.0 <= min(loads) and max(loads) <= 21.0, (min(loads), max(loads))
 
 
+class TestTheMileLoadMatchesTermOne:
+  """Gemini 2026-11-02: with the generator off, a grossKw <= 0 is no load in term 1, so the mile uses
+  the speed estimate there too (and says so); with the generator on it is the measured load."""
+
+  def _publish(self, monkeypatch, gross, ac):
+    truck = Truck(monkeypatch)
+    monkeypatch.setattr(ed.EverDrive, "_gross_kw", lambda self, *a: gross)
+    seen = []
+    monkeypatch.setattr(ed.EverDrive, "_step_mile", lambda self, *a: seen.append(a) or None)
+    truck.run(3.0, ac=ac, energy=truck.energy(**ENERGY), speed_kph=100.0)
+    return seen[-1]
+
+  def test_regen_with_the_generator_off_is_the_estimate(self, monkeypatch, carlogs):
+    _now, v, _mov, load, ac, est = self._publish(monkeypatch, -20.0, UNPLUGGED)
+    assert est is True and load == pytest.approx(320.0 / 1000.0 * v * 3.6 + ed.P_ACC_KW) and ac == 0.0
+
+  def test_a_measured_positive_load_is_used(self, monkeypatch, carlogs):
+    assert self._publish(monkeypatch, 20.0, UNPLUGGED)[3:] == (20.0, 0.0, False)
+
+  def test_with_the_generator_on_a_low_load_is_still_measured(self, monkeypatch, carlogs):
+    _now, _v, _mov, load, _ac, est = self._publish(monkeypatch, -5.0, CHARGING)
+    assert (load, est) == (-5.0, False)
+
+
 class TestNoMotorSignalAnyMore:
   """everdrivesoc2pnw: the 0x441 path is gone. A truck that never sends 0x441 is the normal case."""
 

@@ -436,8 +436,14 @@ class EverDrive:
     gross_kw = self._gross_kw(now, soc_pct, cap_kwh, v_ego, kw)
     moving = v_ego >= MOVING_MS
     # Term 1's load: the measured grossKw, else the speed estimate (the UI's "?" figure, same formula).
+    # As in term 1, with the generator off a grossKw <= 0 (regen) is no usable load (Gemini 2026-11-02).
+    # 0.05 kW mirrors the UI's _AC_ZERO_KW.
     p_est = None if eff_wh_km is None else eff_wh_km / 1000.0 * v_ego * 3.6 + P_ACC_KW
-    load_kw, load_est = (gross_kw, False) if gross_kw is not None else (p_est, True)
+    charging = kw > 0.05 or gen == "on"
+    if gross_kw is not None and (gross_kw > 0.0 or charging):
+      load_kw, load_est = gross_kw, False
+    else:
+      load_kw, load_est = p_est, True
     mile = self._step_mile(now, v_ego, moving, load_kw, kw, load_est)
 
     self._params.put_nonblocking(PARAM_KEY, {
