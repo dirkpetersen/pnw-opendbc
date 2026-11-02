@@ -119,6 +119,25 @@ EFF_WH_KM_BAND = (0.1, 1159.9)    # exclusive of the -100 floor, of negatives, a
 AC_I_BAND = (0.0, 100.0)
 AC_U_BAND = (0.0, 277.0)
 
+# everdrivegen2pnw (owner 2026-11-02): THE GENERATOR STATE, from the same 0x2A7 frame. Measured live
+# 2026-11-02 09:47-09:52 PT at 1 Hz: generator off -> U 0 V, I 0 A. Generator started -> U 234 V at
+# ONCE with only 1.2-3.2 A (0.3-0.75 kW) for ~5 s, then I ramps ~0.9 A/s (+10 s 6.6 A, +20 s 15.5 A,
+# +30 s 23.1 A, ~+35 s 26.4 A) toward ~46 A (10.8 kW). So voltage without current is a real state:
+# "generator running, not supplying".
+#   "off"   U < GEN_V_MIN (the frame is live; when 0x2A7 is not live nothing is published at all)
+#   "on"    U >= GEN_V_MIN and P >= GEN_ON_KW
+#   "idle"  U >= GEN_V_MIN and P < GEN_ON_KW for more than GEN_IDLE_S
+# Inside the first GEN_IDLE_S of "voltage, no power" the previous state is kept, so a normal start
+# (off, then the ~5 s of low current, then the ramp) goes off -> on and never shows "idle"; a supply
+# that stops for more than GEN_IDLE_S goes on -> idle. No separate "ramp" state: "on" covers the ramp
+# (the kW figure itself shows it rising), which keeps the state machine to three states.
+# GEN_V_MIN 100 V: far below any mains (the meter read 109 V at L1 and 234 V on the generator) and far
+# above the 0 V of a stopped generator. GEN_ON_KW 0.5 kW: above the 0.3 kW low end of the start-up
+# trickle and below the 0.75 kW high end, so the start becomes "on" within the first ~5 s.
+GEN_V_MIN = 100.0
+GEN_ON_KW = 0.5
+GEN_IDLE_S = 10.0
+
 # everdrive2pnw (2026-09-20): ROLLING PACK CONSUMPTION -- the input to the UI's "range at the speed
 # you are doing right now" figure. There is still NO broadcast signal for vehicle power on this truck
 # (ENERGY-RANGE-SIGNALS.md §3 ruled out all eight candidates over 13 minutes of real driving), so it
@@ -293,6 +312,9 @@ class EverDrive:
     self._mile: deque[tuple[float, float, float, float]] = deque(maxlen=2 * int(MILE_M / MOVING_MS / PUBLISH_S))
     self._mi_m = self._mi_net = self._mi_ac = self._mi_est_m = 0.0
     self._mi_last: tuple[float, float | None] | None = None   # (mono, socPct) of the previous sample
+    # everdrivegen2pnw: the generator state and since when the voltage has stood without power.
+    self._gen = "off"
+    self._gen_low_since: float | None = None
 
   def update(self, cp, v_ego: float) -> None:
     """Called once per CarState.update() (100 Hz) with the POWERTRAIN parser. Never raises."""
@@ -363,6 +385,7 @@ class EverDrive:
       return
 
     kw = (amps * volts) / 1000.0
+    gen = self._step_gen(now, amps, volts, kw)
 
     # ORDER IS LOAD-BEARING, DO NOT REORDER THESE BELOW THE cp.vl READS. cp.ts_nanos is a plain dict
     # and RAISES KeyError for an unregistered message; cp.vl is a VLDict whose __getitem__ LAZILY
@@ -411,6 +434,10 @@ class EverDrive:
       # written while 0x2A7 has arrived within the last 3 s.
       "ts": round(time.time(), 2),
       "acKw": round(kw, 3),
+      # everdrivegen2pnw (2026-11-02): the AC voltage (0.125 V/bit, inside AC_U_BAND, already checked
+      # above) and the generator state "off" / "idle" / "on" -- see the GEN_* block.
+      "acV": round(volts, 1),
+      "genState": gen,
       # Invariantly True -- see the class docstring. Absence of the key is how "no module" is said.
       "acSeen": True,
       # None = that message has never been received, or reported a sentinel / encoding floor.
@@ -644,6 +671,23 @@ class EverDrive:
     k = MILE_M / span
     ac = (end[2] - start[2]) * k
     return (end[1] - start[1]) * k + ac, ac, end[3] - start[3] > 0.0
+
+  def _step_gen(self, now: float, amps: float, volts: float, kw: float) -> str:
+    """everdrivegen2pnw: the generator state, see the GEN_* block. Each change is logged once with
+    the U, I and kW that caused it (Rule 2: the driver sees a banner, the log must say why)."""
+    if volts < GEN_V_MIN:
+      state, self._gen_low_since = "off", None
+    elif kw >= GEN_ON_KW:
+      state, self._gen_low_since = "on", None
+    else:
+      if self._gen_low_since is None:
+        self._gen_low_since = now
+      state = "idle" if now - self._gen_low_since > GEN_IDLE_S else self._gen
+    if state != self._gen:
+      carlog.warning("everdrive2pnw: generator %s -> %s (U %.1f V, I %.2f A, %.3f kW)",
+                     self._gen, state, volts, amps, kw)
+      self._gen = state
+    return state
 
   def _open_params(self) -> bool:
     """everdrive2pnw: build the /dev/shm handle ON FIRST PRESENCE, not at construction, so a truck

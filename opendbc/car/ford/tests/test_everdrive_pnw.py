@@ -1467,3 +1467,59 @@ class TestNoMotorSignalAnyMore:
     assert not [c for c in carlogs if "0x441" in c[1]], carlogs
     assert truck.pt.dbc.name_to_msg["MtrTracData_1_FD1"].address not in truck.pt.addresses, \
       "0x441 must not even be registered any more"
+
+
+# ---------------------------------------------------------------- everdrivegen2pnw
+
+
+def gen_feed(dev, seconds, amps, volts, t0):
+  """1 Hz 0x2A7 values into _step_gen at the 5 Hz publish rate. Returns the states seen."""
+  out, t = [], t0
+  while t < t0 + seconds - 1e-9:
+    out.append(dev._step_gen(t, amps, volts, amps * volts / 1000.0))
+    t += ed.PUBLISH_S
+  return out
+
+
+class TestGeneratorState:
+  """everdrivegen2pnw (owner 2026-11-02): off / idle / on from the AC voltage and power."""
+
+  def test_the_measured_start_goes_off_to_on_and_never_idle(self, carlogs):
+    """2026-11-02: 234 V at once with 1.2 A (0.28 kW) for ~5 s, then 3.2 A (0.75 kW) and the ramp."""
+    dev = ed.EverDrive()
+    assert set(gen_feed(dev, 10.0, 0.0, 0.0, 0.0)) == {"off"}
+    assert set(gen_feed(dev, 5.0, 1.2, 234.0, 10.0)) == {"off"}, "under GEN_IDLE_S: keep the old state"
+    assert gen_feed(dev, 1.0, 3.2, 234.0, 15.0)[-1] == "on"
+    assert set(gen_feed(dev, 30.0, 15.5, 234.0, 16.0)) == {"on"}
+    hits = [a for _l, m, a in carlogs if "generator" in m]
+    assert len(hits) == 1 and hits[0][:2] == ("off", "on"), hits
+
+  def test_voltage_without_power_for_more_than_10_s_is_idle(self, carlogs):
+    dev = ed.EverDrive()
+    got = gen_feed(dev, 12.0, 0.0, 234.0, 0.0)
+    assert got[int(10.0 / ed.PUBLISH_S)] == "off" and got[-1] == "idle", got
+    first_idle = got.index("idle") * ed.PUBLISH_S
+    assert 10.0 < first_idle <= 10.4, first_idle
+
+  def test_idle_to_on_to_idle_to_off(self, carlogs):
+    dev = ed.EverDrive()
+    gen_feed(dev, 12.0, 0.0, 234.0, 0.0)
+    assert gen_feed(dev, 1.0, 46.0, 234.0, 12.0)[-1] == "on"
+    got = gen_feed(dev, 12.0, 0.0, 234.0, 13.0)
+    assert got[0] == "on" and got[-1] == "idle", "a supply that stops for > 10 s is idle"
+    assert gen_feed(dev, 1.0, 0.0, 0.0, 25.0)[-1] == "off"
+    states = [a[:2] for _l, m, a in carlogs if "generator" in m]
+    assert states == [("off", "idle"), ("idle", "on"), ("on", "idle"), ("idle", "off")], states
+    assert all(len(a) == 5 for _l, m, a in carlogs if "generator" in m), "U, I and kW are in each line"
+
+  def test_a_short_dip_in_power_keeps_on(self, carlogs):
+    dev = ed.EverDrive()
+    gen_feed(dev, 2.0, 46.0, 234.0, 0.0)
+    assert set(gen_feed(dev, 9.0, 0.5, 234.0, 2.0)) == {"on"}
+
+  def test_the_payload_carries_acV_and_genState(self, monkeypatch, carlogs):
+    truck = Truck(monkeypatch)
+    truck.run(4.0, ac=UNPLUGGED, energy=truck.energy(**ENERGY))
+    assert (truck.cap.blobs[-1]["acV"], truck.cap.blobs[-1]["genState"]) == (0.0, "off")
+    truck.run(4.0, ac=CHARGING, energy=truck.energy(**ENERGY))
+    assert (truck.cap.blobs[-1]["acV"], truck.cap.blobs[-1]["genState"]) == (109.0, "on")
