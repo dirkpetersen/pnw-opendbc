@@ -311,10 +311,10 @@ class EverDrive:
     self._cum_s = 0.0                  # seconds accumulated ABOVE MOVING_MS only
     self._cum_kwh = 0.0                # pack energy DROP over those seconds (may go down: regen)
     self._last_sample: tuple[float, float] | None = None   # (mono, socPct) of the previous sample
-    # The last-mile window: cumulative (m, load kW x m, acKw x m, estimated m) at each moving sample.
-    # maxlen is 2x the samples one mile takes at MOVING_MS, so a full mile always fits.
-    self._mile: deque[tuple[float, float, float, float]] = deque(maxlen=2 * int(MILE_M / MOVING_MS / PUBLISH_S))
-    self._mi_m = self._mi_load = self._mi_ac = self._mi_est_m = 0.0
+    # The last-mile window: cumulative (m, load kW x m, acKw x m, estimated m, net kWh) at each moving
+    # sample. maxlen is 2x the samples one mile takes at MOVING_MS, so a full mile always fits.
+    self._mile: deque[tuple[float, float, float, float, float]] = deque(maxlen=2 * int(MILE_M / MOVING_MS / PUBLISH_S))
+    self._mi_m = self._mi_load = self._mi_ac = self._mi_est_m = self._mi_net = 0.0
     self._mi_last: float | None = None   # mono of the previous moving sample with a load
     # everdrivegen2pnw: the generator state, since when the voltage has stood without power, and
     # whether this run of voltage has reached GEN_ON_KW yet.
@@ -503,6 +503,10 @@ class EverDrive:
       # until the first full mile of this drive. See _step_mile.
       "mileLoadKw": None if mile is None else round(mile[0], 2),
       "mileAcKw": None if mile is None else round(mile[1], 3),
+      # everdrivetwoline2pnw: the NET energy per mile over the same mile, kWh/mi, the time integral of
+      # (term 1's load - acKw). The UI's SoC-based "1mi:" is energyKwh / this; at a steady speed and load
+      # it equals the instant range energyKwh / (load - acKw) x mph.
+      "mileNetKwh": None if mile is None else round(mile[3], 4),
       # True when any part of that mile used the speed estimate instead of grossKw.
       "mileEst": None if mile is None else mile[2],
     })
@@ -633,8 +637,9 @@ class EverDrive:
     return round(net_kw + ac_kw, 2)
 
   def _step_mile(self, now: float, v_ego: float, moving: bool, load_kw: float | None, ac_kw: float,
-                 est: bool) -> tuple[float, float, bool] | None:
-    """everdrivemile2pnw (owner 2026-11-02): (mean load kW, mean acKw, estimated) over the last mile
+                 est: bool) -> tuple[float, float, bool, float] | None:
+    """everdrivemile2pnw (owner 2026-11-02): (mean load kW, mean acKw, estimated, net kWh per mile)
+    over the last mile
     driven, or None until one full mile has been driven. The owner's rule: the last-mile figure is the
     AVERAGE of the first figure over that mile, so this averages term 1's own inputs, distance-weighted.
     `load_kw` is grossKw, or the speed estimate when grossKw is None (`est`); `estimated` is True while
@@ -654,22 +659,24 @@ class EverDrive:
       self._mi_ac += ac_kw * ds
       if est:
         self._mi_est_m += ds
+      self._mi_net += (load_kw - ac_kw) * (now - last) / 3600.0
     # Only a sample that added distance is a new snapshot: each resume after a stop adds none, and
     # stop-and-go must not fill the deque with duplicates and evict the start of the mile (Gemini).
     if not self._mile or self._mi_m > self._mile[-1][0]:
-      self._mile.append((self._mi_m, self._mi_load, self._mi_ac, self._mi_est_m))
+      self._mile.append((self._mi_m, self._mi_load, self._mi_ac, self._mi_est_m, self._mi_net))
     while len(self._mile) >= 2 and self._mi_m - self._mile[1][0] >= MILE_M:
       self._mile.popleft()
     return self._mile_result()
 
-  def _mile_result(self) -> tuple[float, float, bool] | None:
+  def _mile_result(self) -> tuple[float, float, bool, float] | None:
     if not self._mile:
       return None
     start = self._mile[0]
     span = self._mi_m - start[0]
     if span < MILE_M:
       return None
-    return (self._mi_load - start[1]) / span, (self._mi_ac - start[2]) / span, self._mi_est_m - start[3] > 0.0
+    return ((self._mi_load - start[1]) / span, (self._mi_ac - start[2]) / span, self._mi_est_m - start[3] > 0.0,
+            (self._mi_net - start[4]) * MILE_M / span)
 
   def _step_gen(self, now: float, amps: float, volts: float, kw: float) -> str:
     """everdrivegen2pnw: the generator state, see the GEN_* block. Each change is logged once with

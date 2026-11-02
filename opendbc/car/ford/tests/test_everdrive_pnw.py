@@ -1394,27 +1394,27 @@ class TestLastMileIsTheAverageOfTermOne:
   def test_absent_before_one_mile_present_after(self):
     dev = ed.EverDrive()
     assert set(mile_feed(dev, load=30.0, mph=60.0, seconds=59.0)) == {None}   # 0.983 mi
-    load, ac, est = mile_feed(dev, load=30.0, mph=60.0, seconds=2.0, t0=59.0)[-1]
+    load, ac, est, _net = mile_feed(dev, load=30.0, mph=60.0, seconds=2.0, t0=59.0)[-1]
     assert load == pytest.approx(30.0) and ac == 0.0 and est is False
 
   def test_a_swinging_load_averages(self):
     """The load swings 28..32 kW: the mile mean is ~30 kW, so the UI's R2 sits mid-way in R1's swing."""
     dev = ed.EverDrive()
     got = mile_feed(dev, load=lambda t: 30.0 + 2.0 * math.sin(t / 7.0), mph=60.0, seconds=180.0, ac_kw=10.8)
-    load, ac, _est = got[-1]
+    load, ac, _est, _net = got[-1]
     assert load == pytest.approx(30.0, abs=0.3) and ac == pytest.approx(10.8)
 
   def test_it_is_distance_weighted(self):
     """30 s at 30 mph with 10 kW, then 60 s at 60 mph with 30 kW: 0.25 + 1.0 mi; the last mile is 30 kW."""
     dev = ed.EverDrive()
     mile_feed(dev, load=10.0, mph=30.0, seconds=30.0)
-    load, _ac, _est = mile_feed(dev, load=30.0, mph=60.0, seconds=60.4, t0=30.0)[-1]
+    load, _ac, _est, _net = mile_feed(dev, load=30.0, mph=60.0, seconds=60.4, t0=30.0)[-1]
     assert load == pytest.approx(30.0, abs=0.2)
 
   def test_the_generator_turned_on_mid_mile_is_half_in_the_mean(self):
     dev = ed.EverDrive()
     mile_feed(dev, load=22.0, mph=60.0, seconds=60.0)
-    load, ac, _est = mile_feed(dev, load=22.0, mph=60.0, seconds=30.0, ac_kw=10.8, t0=60.0)[-1]
+    load, ac, _est, _net = mile_feed(dev, load=22.0, mph=60.0, seconds=30.0, ac_kw=10.8, t0=60.0)[-1]
     assert load == pytest.approx(22.0) and ac == pytest.approx(5.4, abs=0.1)
 
   def test_a_stop_adds_neither_distance_nor_load(self):
@@ -1437,6 +1437,27 @@ class TestLastMileIsTheAverageOfTermOne:
     for i in range(5000):                       # moving, stopped, moving ... one sample each
       dev._step_mile(i * 0.2, v if i % 2 == 0 else 0.0, i % 2 == 0, 20.0, 0.0, False)
     assert dev._mi_m == 0.0 and len(dev._mile) == 1, len(dev._mile)
+
+  def test_steady_net_per_mile_gives_the_instant_range(self):
+    """everdrivetwoline2pnw: at a steady speed and load, energy / mileNetKwh == energy / (P - acKw) x mph."""
+    dev = ed.EverDrive()
+    *_rest, net = mile_feed(dev, load=27.0, mph=54.0, seconds=120.0, ac_kw=10.8)[-1]
+    assert net == pytest.approx((27.0 - 10.8) / 54.0, rel=1e-6)
+    assert 65.0 / net == pytest.approx(65.0 / (27.0 - 10.8) * 54.0, rel=1e-6)
+
+  def test_net_per_mile_is_the_time_integral(self):
+    """Half the mile's TIME at 30 mph with 20 kW net, half at 60 mph with 10 kW net: the time integral
+    is not the distance-weighted mean."""
+    dev = ed.EverDrive()
+    mile_feed(dev, load=20.0, mph=30.0, seconds=41.0)
+    *_rest, net = mile_feed(dev, load=10.0, mph=60.0, seconds=40.0, t0=41.0)[-1]
+    # last mile = 40 s at 60 mph (0.667 mi) + the last 0.333 mi at 30 mph (40 s): (20 x 40 + 10 x 40) / 3600
+    assert net == pytest.approx((20.0 * 40.0 + 10.0 * 40.0) / 3600.0, rel=0.02)
+
+  def test_a_generator_covering_the_load_is_a_negative_net(self):
+    dev = ed.EverDrive()
+    *_rest, net = mile_feed(dev, load=8.0, mph=60.0, seconds=61.0, ac_kw=10.8)[-1]
+    assert net < 0.0
 
   def test_no_load_adds_nothing(self):
     dev = ed.EverDrive()
