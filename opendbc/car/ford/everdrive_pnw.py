@@ -125,18 +125,21 @@ AC_U_BAND = (0.0, 277.0)
 # +30 s 23.1 A, ~+35 s 26.4 A) toward ~46 A (10.8 kW). So voltage without current is a real state:
 # "generator running, not supplying".
 #   "off"   U < GEN_V_MIN (the frame is live; when 0x2A7 is not live nothing is published at all)
-#   "on"    U >= GEN_V_MIN and P >= GEN_ON_KW
-#   "idle"  U >= GEN_V_MIN and P < GEN_ON_KW for more than GEN_IDLE_S
-# Inside the first GEN_IDLE_S of "voltage, no power" the previous state is kept, so a normal start
-# (off, then the ~5 s of low current, then the ramp) goes off -> on and never shows "idle"; a supply
-# that stops for more than GEN_IDLE_S goes on -> idle. No separate "ramp" state: "on" covers the ramp
-# (the kW figure itself shows it rising), which keeps the state machine to three states.
+#   "on"    U >= GEN_V_MIN, AT ONCE on the first frame with voltage (owner 2026-11-02: the start
+#           must show immediately), and while P >= GEN_ON_KW
+#   "idle"  U >= GEN_V_MIN and P < GEN_ON_KW for more than GEN_START_S since the voltage came (it
+#           never reached GEN_ON_KW), or for more than GEN_IDLE_S after it did reach it
+# So a normal start (234 V with ~0.3 kW for ~5 s, then the ~50 s ramp) is "on" from its first frame
+# and never shows "idle"; a supply that stops for more than GEN_IDLE_S goes on -> idle. No separate
+# "ramp" state: "on" covers the ramp (the kW figure itself shows it rising).
 # GEN_V_MIN 100 V: far below any mains (the meter read 109 V at L1 and 234 V on the generator) and far
 # above the 0 V of a stopped generator. GEN_ON_KW 0.5 kW: above the 0.3 kW low end of the start-up
-# trickle and below the 0.75 kW high end, so the start becomes "on" within the first ~5 s.
+# trickle. GEN_START_S 60 s: longer than the ~50 s measured ramp to full power. A gap in 0x2A7 (not
+# live) resets the timers, so time that was not watched never counts toward "idle".
 GEN_V_MIN = 100.0
 GEN_ON_KW = 0.5
 GEN_IDLE_S = 10.0
+GEN_START_S = 60.0
 
 # everdrive2pnw (2026-09-20): ROLLING PACK CONSUMPTION -- the input to the UI's "range at the speed
 # you are doing right now" figure. There is still NO broadcast signal for vehicle power on this truck
@@ -244,8 +247,10 @@ NET_KW_MAX = 250.0
 # ... is accessory load"). The UI mirrors it as _P_ACC_KW.
 P_ACC_KW = 1.2
 #
-# ---- LAST MILE: pack energy over the last MILE_M driven above MOVING_MS, distance from vEgo --------
-# From the SoC change over that mile (see _step_mile), not from a power signal.
+# ---- LAST MILE: the mean of term 1's load over the last MILE_M driven above MOVING_MS --------------
+# Owner 2026-11-02: the "1mi:" figure is the AVERAGE of the first figure over the last mile. So the
+# producer averages term 1's inputs (the load and acKw) over that mile, distance-weighted, and the UI
+# applies the term-1 formula to the means. See _step_mile.
 MILE_M = 1609.34
 
 
@@ -306,15 +311,16 @@ class EverDrive:
     self._cum_s = 0.0                  # seconds accumulated ABOVE MOVING_MS only
     self._cum_kwh = 0.0                # pack energy DROP over those seconds (may go down: regen)
     self._last_sample: tuple[float, float] | None = None   # (mono, socPct) of the previous sample
-    # everdrivesoc2pnw: the last-mile window. Cumulative (m, pack net kWh, ac kWh, estimated m) at each
-    # BOUNDARY (see _step_mile); maxlen is 2x the samples one mile takes at MOVING_MS, the most
-    # boundaries a mile can hold (one per sample, when SoC is missing).
+    # The last-mile window: cumulative (m, load kW x m, acKw x m, estimated m) at each moving sample.
+    # maxlen is 2x the samples one mile takes at MOVING_MS, so a full mile always fits.
     self._mile: deque[tuple[float, float, float, float]] = deque(maxlen=2 * int(MILE_M / MOVING_MS / PUBLISH_S))
-    self._mi_m = self._mi_net = self._mi_ac = self._mi_est_m = 0.0
-    self._mi_last: tuple[float, float | None] | None = None   # (mono, socPct) of the previous sample
-    # everdrivegen2pnw: the generator state and since when the voltage has stood without power.
+    self._mi_m = self._mi_load = self._mi_ac = self._mi_est_m = 0.0
+    self._mi_last: float | None = None   # mono of the previous moving sample with a load
+    # everdrivegen2pnw: the generator state, since when the voltage has stood without power, and
+    # whether this run of voltage has reached GEN_ON_KW yet.
     self._gen = "off"
     self._gen_low_since: float | None = None
+    self._gen_charged = False
 
   def update(self, cp, v_ego: float) -> None:
     """Called once per CarState.update() (100 Hz) with the POWERTRAIN parser. Never raises."""
@@ -360,6 +366,8 @@ class EverDrive:
           self._log(("everdrive2pnw: 0x2A7 quiet for >%.0f s (last seen %.1f s ago) -- EverDrive " +
                      "stopped broadcasting; EverDriveStatus is no longer published")
                     % (AC_QUIET_S, (cp._last_update_nanos - ac_ns) / 1e9))
+        # Time not watched must not count toward "idle" when the frames come back (Gemini 2026-11-02).
+        self._gen, self._gen_low_since, self._gen_charged = "off", None, False
         return                         # PUBLISH NOTHING: an absent key is "no module fitted"
 
       if self._params is None and not self._open_params():
@@ -425,7 +433,10 @@ class EverDrive:
     # or it would only ever advance while it already had an answer.
     gross_kw = self._gross_kw(now, soc_pct, cap_kwh, v_ego, kw)
     moving = v_ego >= MOVING_MS
-    mile = self._step_mile(now, v_ego, moving, soc_pct, cap_kwh, kw, eff_wh_km)
+    # Term 1's load: the measured grossKw, else the speed estimate (the UI's "?" figure, same formula).
+    p_est = None if eff_wh_km is None else eff_wh_km / 1000.0 * v_ego * 3.6 + P_ACC_KW
+    load_kw, load_est = (gross_kw, False) if gross_kw is not None else (p_est, True)
+    mile = self._step_mile(now, v_ego, moving, load_kw, kw, load_est)
 
     self._params.put_nonblocking(PARAM_KEY, {
       # Wall clock, for the UI's staleness check. Rule 2: this advances even if the DECODE is frozen,
@@ -480,12 +491,11 @@ class EverDrive:
       # everdriveinstant2pnw (2026-10-31): the producer's own "moving" (v_ego >= MOVING_MS), so the UI
       # and the windows here share one threshold.
       "moving": moving,
-      # LOAD energy (pack net from SoC + EverDrive AC in) and EverDrive AC energy PER MILE over the
-      # last mile driven, kWh. The UI nets them (mileKwh - mileAcKwh = the SoC drop). None until the
-      # first full mile of this drive. See _step_mile.
-      "mileKwh": None if mile is None else round(mile[0], 3),
-      "mileAcKwh": None if mile is None else round(mile[1], 3),
-      # True when any part of that mile had no SoC and used the speed estimate (_step_mile).
+      # everdrivemile2pnw: the mean of term 1's load and of acKw over the last mile driven, kW. None
+      # until the first full mile of this drive. See _step_mile.
+      "mileLoadKw": None if mile is None else round(mile[0], 2),
+      "mileAcKw": None if mile is None else round(mile[1], 3),
+      # True when any part of that mile used the speed estimate instead of grossKw.
       "mileEst": None if mile is None else mile[2],
     })
 
@@ -575,8 +585,10 @@ class EverDrive:
     # history costs a bounded forward scan and settles it: 5 blocks of median 72 s, and coverage up
     # from 23 % to 37 % of that route -- against a ceiling of 71 %, which is simply how much of a
     # stop-and-go city drive was spent above 10 mph at all.
-    # Conservative where regen makes cum_kwh non-monotonic: the scan stops at the first baseline that
-    # fails, so it may use a longer window than strictly necessary. Longer is the safe direction.
+    # Where regen or a generator surplus makes cum_kwh non-monotonic, a long window can net to under the
+    # floor while a shorter one clears it (Gemini 2026-11-02: 90 s of surplus, then 65 s at 30 kW gave
+    # None for ~25 s). So the scan does not stop at the first baseline that fails: it takes the newest
+    # one at least WINDOW_MIN_S old that clears the floor. On a monotonic cum_kwh this is the same pick.
     #
     # ⚠️ NOT COVERED BY A TEST, AND SAID SO RATHER THAN QUIETLY LEFT (mutation P14, 2026-09-20).
     # Replacing this scan with `popleft()` leaves all 87 tests in test_everdrive_pnw.py green. The two
@@ -592,10 +604,11 @@ class EverDrive:
     # Reproduce with the replay harness, not with pytest. If you are tempted to "simplify" this back
     # to a popleft, run the route first.
     floor_kwh = MIN_DSOC_PCT / 100.0 * cap_kwh
-    i = 0
-    while (i + 1 < len(self._win) and (self._cum_s - self._win[i + 1][1]) >= WINDOW_MIN_S
-           and abs(self._cum_kwh - self._win[i + 1][2]) >= floor_kwh):
-      i += 1
+    i = j = 0
+    while j + 1 < len(self._win) and (self._cum_s - self._win[j + 1][1]) >= WINDOW_MIN_S:
+      j += 1
+      if abs(self._cum_kwh - self._win[j][2]) >= floor_kwh:
+        i = j
     win_s = self._cum_s - self._win[i][1]
     win_kwh = self._cum_kwh - self._win[i][2]
     # WINDOW_FIRST_S, not WINDOW_MIN_S: the scan above never shortens below WINDOW_MIN_S, so a window
@@ -611,78 +624,54 @@ class EverDrive:
       return None
     return round(net_kw + ac_kw, 2)
 
-  def _step_mile(self, now: float, v_ego: float, moving: bool, soc_pct: float | None, cap_kwh: float | None,
-                 ac_kw: float, eff_wh_km: float | None) -> tuple[float, float, bool] | None:
-    """everdrivesoc2pnw (owner 2026-11-02): (load kWh, AC kWh, estimated) PER MILE over the last mile
-    driven, or None until one full mile has been driven. load = pack net + AC in, so the UI's
-    mileKwh - mileAcKwh is the pack net, i.e. the SoC drop x capKwh. Same chain rules as _gross_kw:
-    only consecutive moving samples count, so a stop or an unwatched gap adds neither distance nor energy.
-
-    THE PACK NET COMES FROM THE SoC. A sample whose SoC (this one or the previous) is missing uses the
-    SPEED ESTIMATE instead, (effWhKm x km/h + P_ACC_KW - acKw) x dt, and its distance counts as
-    estimated: `estimated` is True while any of the mile came from it. No efficiency either: that
-    sample adds nothing (the chain does not bridge it).
-
-    SoC STEPS AND WHY THE MILE ENDS ON THEM. SoC is a staircase (0.01 % = 12.6 Wh per bit, and the BMS
-    may update in coarser steps). A plain sliding mile would gain or lose one whole step depending on
-    where the mile boundaries fall, so a near-balanced mile (generator on) would flip between 0 and 1
-    step, i.e. between ">999m" and a number, every few seconds. So the window is measured BETWEEN
-    STEP EDGES: a BOUNDARY snapshot is kept only at a sample where the SoC changed (or at an estimated
-    sample, where there is no staircase; or as the very first sample of the drive). The window ends at
-    the newest boundary and starts at the newest boundary at least MILE_M before it; the energies are
-    scaled to one mile (MILE_M / span). Both ends sit on an edge, so the count of steps is exact.
-    If no SoC step came for a whole mile, the window ends NOW instead: the pack net over it is under
-    one step, published as 0 (the UI shows ">999m" with the generator on, "1mi:--" with it off).
-    The cost: the figure only changes when the SoC steps, and it may lag by up to one step's distance.
-    The first window of a drive starts at the drive-start boundary, not an edge: +/-1 step on that one.
-
-    shortcut: a BMS revision of the SoC estimate (a step of several %) enters the mile as consumption
-    and shows a low range for up to one mile; add a per-step plausibility cap if one is seen on the car."""
-    p_est = None if eff_wh_km is None else eff_wh_km / 1000.0 * v_ego * 3.6 + P_ACC_KW
-    ok = moving and (soc_pct is not None or p_est is not None)
+  def _step_mile(self, now: float, v_ego: float, moving: bool, load_kw: float | None, ac_kw: float,
+                 est: bool) -> tuple[float, float, bool] | None:
+    """everdrivemile2pnw (owner 2026-11-02): (mean load kW, mean acKw, estimated) over the last mile
+    driven, or None until one full mile has been driven. The owner's rule: the last-mile figure is the
+    AVERAGE of the first figure over that mile, so this averages term 1's own inputs, distance-weighted.
+    `load_kw` is grossKw, or the speed estimate when grossKw is None (`est`); `estimated` is True while
+    any of the mile used the estimate. Same chain rules as _gross_kw: only consecutive moving samples
+    with a load count, so a stop or an unwatched gap adds neither distance nor load.
+    Replaces the SoC-step-edge mile energy (mileKwh / mileAcKwh): that measured a different quantity
+    than term 1 and read 165 m beside a term 1 of 238 m on 2026-11-02."""
+    ok = moving and load_kw is not None
     last = self._mi_last
-    self._mi_last = (now, soc_pct) if ok else None
-    edge = False
-    if ok and last is not None and 0.0 < now - last[0] <= SAMPLE_GAP_MAX_S:
-      dt = now - last[0]
-      d_net = None
-      if soc_pct is not None and last[1] is not None and cap_kwh is not None:
-        d_net, edge = (last[1] - soc_pct) / 100.0 * cap_kwh, soc_pct != last[1]
-      elif p_est is not None:
-        d_net, edge = (p_est - ac_kw) * dt / 3600.0, True
-        self._mi_est_m += v_ego * dt
-      if d_net is not None:
-        self._mi_m += v_ego * dt
-        self._mi_net += d_net
-        self._mi_ac += ac_kw * dt / 3600.0
-    if ok and (edge or not self._mile):
-      self._mile.append((self._mi_m, self._mi_net, self._mi_ac, self._mi_est_m))
+    self._mi_last = now if ok else None
+    if not ok:
+      return self._mile_result()
+    if last is not None and 0.0 < now - last <= SAMPLE_GAP_MAX_S:
+      ds = v_ego * (now - last)
+      self._mi_m += ds
+      self._mi_load += load_kw * ds
+      self._mi_ac += ac_kw * ds
+      if est:
+        self._mi_est_m += ds
+    self._mile.append((self._mi_m, self._mi_load, self._mi_ac, self._mi_est_m))
+    while len(self._mile) >= 2 and self._mi_m - self._mile[1][0] >= MILE_M:
+      self._mile.popleft()
+    return self._mile_result()
+
+  def _mile_result(self) -> tuple[float, float, bool] | None:
     if not self._mile:
       return None
-    end = self._mile[-1]
-    if self._mi_m - end[0] >= MILE_M:          # no SoC step for a whole mile: end the window now
-      end = (self._mi_m, self._mi_net, self._mi_ac, self._mi_est_m)
-    while len(self._mile) >= 2 and end[0] - self._mile[1][0] >= MILE_M:
-      self._mile.popleft()
     start = self._mile[0]
-    span = end[0] - start[0]
+    span = self._mi_m - start[0]
     if span < MILE_M:
       return None
-    k = MILE_M / span
-    ac = (end[2] - start[2]) * k
-    return (end[1] - start[1]) * k + ac, ac, end[3] - start[3] > 0.0
+    return (self._mi_load - start[1]) / span, (self._mi_ac - start[2]) / span, self._mi_est_m - start[3] > 0.0
 
   def _step_gen(self, now: float, amps: float, volts: float, kw: float) -> str:
     """everdrivegen2pnw: the generator state, see the GEN_* block. Each change is logged once with
     the U, I and kW that caused it (Rule 2: the driver sees a banner, the log must say why)."""
     if volts < GEN_V_MIN:
-      state, self._gen_low_since = "off", None
+      state, self._gen_low_since, self._gen_charged = "off", None, False
     elif kw >= GEN_ON_KW:
-      state, self._gen_low_since = "on", None
+      state, self._gen_low_since, self._gen_charged = "on", None, True
     else:
       if self._gen_low_since is None:
         self._gen_low_since = now
-      state = "idle" if now - self._gen_low_since > GEN_IDLE_S else self._gen
+      wait = GEN_IDLE_S if self._gen_charged else GEN_START_S
+      state = "idle" if now - self._gen_low_since > wait else "on"
     if state != self._gen:
       carlog.warning("everdrive2pnw: generator %s -> %s (U %.1f V, I %.2f A, %.3f kW)",
                      self._gen, state, volts, amps, kw)

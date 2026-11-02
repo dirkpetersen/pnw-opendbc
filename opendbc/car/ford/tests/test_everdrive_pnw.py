@@ -20,6 +20,7 @@ CANbus/ford/f-150/lightning/2024-25/ENERGY-RANGE-SIGNALS.md):
   0x2A7 payload 00 00 00 00 00 00 00 00 x 865 consecutive frames while unplugged = a REAL zero
 """
 
+import math
 import pytest
 
 from opendbc.can import CANPacker
@@ -46,6 +47,8 @@ RPC_ADDR = 0x471
 # The LITERAL payloads off the truck. Not reconstructed from a packer -- the bytes as captured.
 CHARGING = bytes.fromhex("07d0000003680000")
 UNPLUGGED = bytes(8)
+# everdrivegen2pnw: the generator start trickle, 1.2 A x 234 V (0.28 kW), built from the DBC scaling.
+TRICKLE = bytes.fromhex("00c0000007500000")
 
 
 # ---------------------------------------------------------------- harness
@@ -1089,10 +1092,13 @@ class TestRollingConsumption:
     hilly = ed.EverDrive()
     a = synth_drive(hilly, kw=30.0, mph=60.0, seconds=200.0)
     b = synth_drive(hilly, kw=-20.0, mph=60.0, seconds=100.0, soc=a[-1][1], t0=200.0)
-    live = [g for _t, _s, g in b if g is not None]
+    live = [g for t, _s, g in b if g is not None and t < 230.0]
     assert steady and live
     assert min(live) < min(steady), "the regen stretch must pull the average DOWN, not be dropped"
     assert min(live) > 0.0, "and the reported figure must still be positive"
+    # After 60 s of only regen the newest 60 s window is all regen and clears the floor: it is reported
+    # as it is (negative; the UI reads <= 0 as no usable load), not as an older, longer average.
+    assert b[-1][2] is not None and b[-1][2] < 0.0, b[-1]
 
   @pytest.mark.parametrize("cap_before,cap_after", [(127.0, 131.0), (131.0, 127.0)])
   def test_a_capacity_revision_is_not_consumption(self, cap_before, cap_after):
@@ -1356,93 +1362,89 @@ class TestTheSocWindowOnTheHighway:
     assert back[0][2] is not None and 18.66 <= back[0][2] <= 21.34, back[0]
 
 
-def mile_drive(dev, *, net_kw, mph, seconds, soc, ac_kw=0.0, cap=126.0, step=0.01, t0=0.0,
-               soc_ok=True, eff=None):
-  """Feed `_step_mile` a steady drive. SoC falls at net_kw and is put on the wire in whole `step`s
-  (0.01 % is the DBC bit; 0.2 % models a BMS that updates coarser). Returns (results, raw soc at end)."""
-  out, t, raw = [], t0, soc
+class TestTheWindowShortensAcrossASignChange:
+  """Gemini 2026-11-02: SoC rising (generator surplus) for 90 s, then a 30 kW net drain. The newest
+  60 s clears the floor although the whole history nets to under it; the old scan stopped at i = 0."""
+
+  def test_a_surplus_then_a_climb_reports_the_climb(self):
+    dev = ed.EverDrive()
+    a = synth_drive(dev, kw=-18.0, mph=60.0, seconds=90.0, soc=50.0)
+    b = synth_drive(dev, kw=30.0, mph=60.0, seconds=65.0, soc=a[-1][1], t0=90.0)
+    g = b[-1][2]
+    assert g is not None and 27.0 <= g <= 33.0, g
+
+
+def mile_feed(dev, *, load, mph, seconds, ac_kw=0.0, est=False, t0=0.0):
+  """Feed `_step_mile` at the publish cadence. `load` is a number or a function of t. Returns results."""
+  out, t = [], t0
   v = mph / 2.23694
   while t < t0 + seconds - 1e-9:
-    wire = round(int(raw / step + 1e-9) * step, 2) if soc_ok else None
-    out.append(dev._step_mile(t, v, v >= ed.MOVING_MS, wire, cap, ac_kw, eff))
-    raw -= net_kw * ed.PUBLISH_S / 3600.0 / cap * 100.0
+    kw = load(t) if callable(load) else load
+    out.append(dev._step_mile(t, v, v >= ed.MOVING_MS, kw, ac_kw, est))
     t += ed.PUBLISH_S
-  return out, raw
+  return out
 
 
-class TestLastMileFromSoc:
-  """everdrivesoc2pnw: mileKwh = (SoC drop x capKwh + AC kWh) per mile, mileAcKwh = AC kWh per mile."""
+class TestLastMileIsTheAverageOfTermOne:
+  """everdrivemile2pnw (owner 2026-11-02): mileLoadKw / mileAcKw = the distance-weighted means of
+  term 1's load and of acKw over the last mile driven."""
 
   def test_absent_before_one_mile_present_after(self):
     dev = ed.EverDrive()
-    got, raw = mile_drive(dev, net_kw=30.0, mph=60.0, seconds=59.0, soc=80.0)   # 0.983 mi
-    assert set(got) == {None}
-    got, _ = mile_drive(dev, net_kw=30.0, mph=60.0, seconds=5.0, soc=raw, t0=59.0)
-    load, ac, est = got[-1]
-    # 1 mi at 60 mph = 60 s at 30 kW = 0.5 kWh; the first mile starts off-edge, so +/- 1 LSB (12.6 Wh)
-    assert load == pytest.approx(0.5, abs=0.015) and ac == 0.0 and est is False
+    assert set(mile_feed(dev, load=30.0, mph=60.0, seconds=59.0)) == {None}   # 0.983 mi
+    load, ac, est = mile_feed(dev, load=30.0, mph=60.0, seconds=2.0, t0=59.0)[-1]
+    assert load == pytest.approx(30.0) and ac == 0.0 and est is False
 
-  def test_load_is_the_soc_drop_plus_the_ac_energy_over_the_same_mile(self):
-    """The UI nets them: load - ac must be the SoC drop, not the drop minus the charge again."""
+  def test_a_swinging_load_averages(self):
+    """The load swings 28..32 kW: the mile mean is ~30 kW, so the UI's R2 sits mid-way in R1's swing."""
     dev = ed.EverDrive()
-    got, _ = mile_drive(dev, net_kw=19.2, mph=60.0, seconds=150.0, soc=80.0, ac_kw=10.8)
-    load, ac, est = got[-1]
-    assert ac == pytest.approx(10.8 / 60.0, rel=0.02)
-    assert load - ac == pytest.approx(19.2 / 60.0, rel=0.05), "net = the SoC drop per mile"
-    assert est is False
-
-  def test_a_stop_adds_neither_distance_nor_energy(self):
-    dev = ed.EverDrive()
-    _, raw = mile_drive(dev, net_kw=30.0, mph=60.0, seconds=30.0, soc=80.0)
-    _, raw = mile_drive(dev, net_kw=1.2, mph=0.0, seconds=600.0, soc=raw, t0=30.0)
-    got, _ = mile_drive(dev, net_kw=30.0, mph=60.0, seconds=40.0, soc=raw, t0=630.0)
-    assert got[-1][0] == pytest.approx(0.5, abs=0.03), "the 10 min stop must not be in the mile"
-
-  def test_the_window_slides_to_the_newest_mile(self):
-    dev = ed.EverDrive()
-    _, raw = mile_drive(dev, net_kw=30.0, mph=60.0, seconds=120.0, soc=80.0)
-    got, _ = mile_drive(dev, net_kw=15.0, mph=60.0, seconds=65.0, soc=raw, t0=120.0)
-    assert got[-1][0] == pytest.approx(0.25, abs=0.015)
-    assert len(dev._mile) < 400, "old boundaries are trimmed"
-
-  def test_coarse_soc_steps_do_not_flicker(self):
-    """A BMS that moves in 0.2 % steps (0.252 kWh) at 0.3 kWh/mi net: a plain sliding mile holds 1 or
-    2 steps (0.252 / 0.504 kWh) depending on where it falls. Edge to edge it is the true rate."""
-    dev = ed.EverDrive()
-    got, _ = mile_drive(dev, net_kw=18.0, mph=60.0, seconds=600.0, soc=80.0, step=0.2)
-    nets = [r[0] - r[1] for r in got[400:] if r is not None]          # after the first edge-to-edge mile
-    assert nets and all(0.28 <= n <= 0.32 for n in nets), (min(nets), max(nets))
-
-  def test_no_soc_step_for_a_whole_mile_is_a_zero_net_not_the_old_rate(self):
-    """The generator nearly balancing the load: no step for over a mile. The net over that mile is under
-    one step, published as 0 (">999m" with the generator on), never the stale edge-to-edge figure."""
-    dev = ed.EverDrive()
-    _, raw = mile_drive(dev, net_kw=30.0, mph=60.0, seconds=120.0, soc=80.0, ac_kw=10.8)
-    got, _ = mile_drive(dev, net_kw=0.0, mph=60.0, seconds=90.0, soc=raw, t0=120.0, ac_kw=10.8)
+    got = mile_feed(dev, load=lambda t: 30.0 + 2.0 * math.sin(t / 7.0), mph=60.0, seconds=180.0, ac_kw=10.8)
     load, ac, _est = got[-1]
-    assert load - ac == pytest.approx(0.0, abs=1e-9) and ac == pytest.approx(0.18, rel=0.02)
+    assert load == pytest.approx(30.0, abs=0.3) and ac == pytest.approx(10.8)
 
-  def test_missing_soc_uses_the_speed_estimate_and_says_so(self):
-    """320 Wh/km at 60 mph = 30.9 kW + 1.2 kW load; net = load - AC, so load per mile = P_est / 60."""
+  def test_it_is_distance_weighted(self):
+    """30 s at 30 mph with 10 kW, then 60 s at 60 mph with 30 kW: 0.25 + 1.0 mi; the last mile is 30 kW."""
     dev = ed.EverDrive()
-    got, _ = mile_drive(dev, net_kw=0.0, mph=60.0, seconds=65.0, soc=80.0, soc_ok=False, eff=320.0, ac_kw=5.0)
-    p_est = 320.0 / 1000.0 * (60.0 / 2.23694) * 3.6 + ed.P_ACC_KW
-    load, ac, est = got[-1]
-    assert load == pytest.approx(p_est / 60.0, rel=0.01) and ac == pytest.approx(5.0 / 60.0, rel=0.01)
-    assert est is True
+    mile_feed(dev, load=10.0, mph=30.0, seconds=30.0)
+    load, _ac, _est = mile_feed(dev, load=30.0, mph=60.0, seconds=60.4, t0=30.0)[-1]
+    assert load == pytest.approx(30.0, abs=0.2)
 
-  def test_no_soc_and_no_efficiency_adds_nothing(self):
+  def test_the_generator_turned_on_mid_mile_is_half_in_the_mean(self):
     dev = ed.EverDrive()
-    got, _ = mile_drive(dev, net_kw=30.0, mph=60.0, seconds=120.0, soc=80.0, soc_ok=False)
-    assert set(got) == {None} and dev._mi_m == 0.0 and not dev._mile
+    mile_feed(dev, load=22.0, mph=60.0, seconds=60.0)
+    load, ac, _est = mile_feed(dev, load=22.0, mph=60.0, seconds=30.0, ac_kw=10.8, t0=60.0)[-1]
+    assert load == pytest.approx(22.0) and ac == pytest.approx(5.4, abs=0.1)
 
-  def test_a_partly_estimated_mile_is_estimated_until_it_slides_out(self):
+  def test_a_stop_adds_neither_distance_nor_load(self):
     dev = ed.EverDrive()
-    _, raw = mile_drive(dev, net_kw=30.0, mph=60.0, seconds=10.0, soc=80.0, soc_ok=False, eff=320.0)
-    got, raw = mile_drive(dev, net_kw=30.0, mph=60.0, seconds=60.0, soc=raw, t0=10.0, eff=320.0)
-    assert got[-1][2] is True, "the estimated 10 s are still inside the mile"
-    got, _ = mile_drive(dev, net_kw=30.0, mph=60.0, seconds=30.0, soc=raw, t0=70.0, eff=320.0)
-    assert got[-1][2] is False, "once they slide out the mile is fully SoC-measured again"
+    mile_feed(dev, load=30.0, mph=60.0, seconds=30.0)
+    mile_feed(dev, load=1.2, mph=0.0, seconds=600.0, t0=30.0)
+    got = mile_feed(dev, load=30.0, mph=60.0, seconds=30.0, t0=630.0)
+    assert got[-1] is None, "30 + 30 s at 60 mph is just under a mile: the stop must not add distance"
+
+  def test_an_estimated_stretch_is_marked_until_it_slides_out(self):
+    dev = ed.EverDrive()
+    mile_feed(dev, load=31.0, mph=60.0, seconds=10.0, est=True)
+    assert mile_feed(dev, load=30.0, mph=60.0, seconds=55.0, t0=10.0)[-1][2] is True
+    assert mile_feed(dev, load=30.0, mph=60.0, seconds=11.0, t0=65.0)[-1][2] is False
+
+  def test_no_load_adds_nothing(self):
+    dev = ed.EverDrive()
+    assert set(mile_feed(dev, load=None, mph=60.0, seconds=120.0)) == {None}
+    assert dev._mi_m == 0.0
+
+  def test_no_flicker_per_soc_step(self):
+    """The whole chain: a quantised SoC staircase through _gross_kw, its load into _step_mile."""
+    dev = ed.EverDrive()
+    v, cap, loads = 60.0 / 2.23694, 126.0, []
+    for i in range(int(300 / ed.PUBLISH_S)):
+      t = i * ed.PUBLISH_S
+      soc = int((80.0 - 20.0 * t / 3600.0 / cap * 100.0) * 100.0) / 100.0
+      g = dev._gross_kw(t, soc, cap, v, 0.0)
+      r = dev._step_mile(t, v, True, g if g is not None else 30.0, 0.0, g is None)
+      if t > 200.0:
+        loads.append(r[0])
+    assert max(loads) - min(loads) < 0.5 and 19.0 <= min(loads) and max(loads) <= 21.0, (min(loads), max(loads))
 
 
 class TestNoMotorSignalAnyMore:
@@ -1460,9 +1462,7 @@ class TestNoMotorSignalAnyMore:
       truck.tick(truck.frame("BrakeSysFeatures", {"Veh_V_ActlBrk": 100.0}), *slow, dt=int(1e9 / hz))
     last = truck.cap.blobs[-1]
     assert not {"pNowKw", "kCal", "kFits"} & set(last), last
-    assert last["mileEst"] is False, "the mile came from the SoC"
-    # 30 kW at 62.14 mph = 0.483 kWh/mi net, plus 1.3625 kW of AC = 0.022 kWh/mi; SoC is 1 Hz, so loose
-    assert last["mileKwh"] - last["mileAcKwh"] == pytest.approx(30.0 / 62.137, rel=0.1), last
+    assert last["mileLoadKw"] is not None and last["mileAcKw"] == pytest.approx(1.3625, abs=1e-3), last
     assert last["grossKw"] is not None, "positive control: the SoC window filled too"
     assert not [c for c in carlogs if "0x441" in c[1]], carlogs
     assert truck.pt.dbc.name_to_msg["MtrTracData_1_FD1"].address not in truck.pt.addresses, \
@@ -1484,38 +1484,59 @@ def gen_feed(dev, seconds, amps, volts, t0):
 class TestGeneratorState:
   """everdrivegen2pnw (owner 2026-11-02): off / idle / on from the AC voltage and power."""
 
-  def test_the_measured_start_goes_off_to_on_and_never_idle(self, carlogs):
-    """2026-11-02: 234 V at once with 1.2 A (0.28 kW) for ~5 s, then 3.2 A (0.75 kW) and the ramp."""
+  def test_the_measured_start_is_on_at_the_first_frame_with_voltage(self, carlogs):
+    """2026-11-02: 234 V at once with 1.2 A (0.28 kW) for ~5 s, then the ramp. Owner: show it at once."""
     dev = ed.EverDrive()
     assert set(gen_feed(dev, 10.0, 0.0, 0.0, 0.0)) == {"off"}
-    assert set(gen_feed(dev, 5.0, 1.2, 234.0, 10.0)) == {"off"}, "under GEN_IDLE_S: keep the old state"
-    assert gen_feed(dev, 1.0, 3.2, 234.0, 15.0)[-1] == "on"
-    assert set(gen_feed(dev, 30.0, 15.5, 234.0, 16.0)) == {"on"}
+    assert gen_feed(dev, 5.0, 1.2, 234.0, 10.0)[0] == "on", "the first frame with voltage is on"
+    assert set(gen_feed(dev, 30.0, 15.5, 234.0, 15.0)) == {"on"}
     hits = [a for _l, m, a in carlogs if "generator" in m]
     assert len(hits) == 1 and hits[0][:2] == ("off", "on"), hits
 
-  def test_voltage_without_power_for_more_than_10_s_is_idle(self, carlogs):
+  def test_a_ramp_under_half_a_kw_for_50_s_stays_on(self, carlogs):
     dev = ed.EverDrive()
-    got = gen_feed(dev, 12.0, 0.0, 234.0, 0.0)
-    assert got[int(10.0 / ed.PUBLISH_S)] == "off" and got[-1] == "idle", got
+    gen_feed(dev, 2.0, 0.0, 0.0, 0.0)
+    assert set(gen_feed(dev, 50.0, 2.0, 234.0, 2.0)) == {"on"}, "0.47 kW for 50 s is a slow start, not idle"
+
+  def test_61_s_of_voltage_without_power_is_idle(self, carlogs):
+    dev = ed.EverDrive()
+    got = gen_feed(dev, 61.0, 0.0, 234.0, 0.0)
+    first_idle = got.index("idle") * ed.PUBLISH_S
+    assert 59.9 < first_idle <= 60.4, first_idle
+    assert set(got[:got.index("idle")]) == {"on"}
+
+  def test_charging_then_a_drop_with_voltage_is_idle_after_10_s(self, carlogs):
+    dev = ed.EverDrive()
+    assert gen_feed(dev, 1.0, 46.0, 234.0, 0.0)[-1] == "on"
+    got = gen_feed(dev, 12.0, 0.0, 234.0, 1.0)
     first_idle = got.index("idle") * ed.PUBLISH_S
     assert 10.0 < first_idle <= 10.4, first_idle
-
-  def test_idle_to_on_to_idle_to_off(self, carlogs):
-    dev = ed.EverDrive()
-    gen_feed(dev, 12.0, 0.0, 234.0, 0.0)
-    assert gen_feed(dev, 1.0, 46.0, 234.0, 12.0)[-1] == "on"
-    got = gen_feed(dev, 12.0, 0.0, 234.0, 13.0)
-    assert got[0] == "on" and got[-1] == "idle", "a supply that stops for > 10 s is idle"
-    assert gen_feed(dev, 1.0, 0.0, 0.0, 25.0)[-1] == "off"
+    assert gen_feed(dev, 1.0, 46.0, 234.0, 13.0)[-1] == "on"
+    assert gen_feed(dev, 0.2, 0.0, 0.0, 14.0) == ["off"], "voltage gone: off at once"
     states = [a[:2] for _l, m, a in carlogs if "generator" in m]
-    assert states == [("off", "idle"), ("idle", "on"), ("on", "idle"), ("idle", "off")], states
+    assert states == [("off", "on"), ("on", "idle"), ("idle", "on"), ("on", "off")], states
     assert all(len(a) == 5 for _l, m, a in carlogs if "generator" in m), "U, I and kW are in each line"
+
+  def test_voltage_gone_is_off_at_once_and_a_new_start_waits_60_s_again(self, carlogs):
+    dev = ed.EverDrive()
+    gen_feed(dev, 2.0, 46.0, 234.0, 0.0)
+    assert gen_feed(dev, 0.2, 0.0, 0.0, 2.0) == ["off"]
+    assert set(gen_feed(dev, 30.0, 0.0, 234.0, 2.2)) == {"on"}, "the 10 s rule is only after charging"
 
   def test_a_short_dip_in_power_keeps_on(self, carlogs):
     dev = ed.EverDrive()
     gen_feed(dev, 2.0, 46.0, 234.0, 0.0)
     assert set(gen_feed(dev, 9.0, 0.5, 234.0, 2.0)) == {"on"}
+
+  def test_a_0x2A7_gap_does_not_count_toward_idle(self, monkeypatch, carlogs):
+    """Gemini 2026-11-02: 0.28 kW, 15 s with no 0x2A7, the trickle again -> must not be idle at once."""
+    truck = Truck(monkeypatch)
+    truck.run(55.0, ac=TRICKLE)
+    assert truck.cap.blobs[-1]["genState"] == "on"
+    truck.run(15.0, ac=None)
+    n = len(truck.cap.blobs)
+    truck.run(3.0, ac=TRICKLE)
+    assert {b["genState"] for b in truck.cap.blobs[n:]} == {"on"}, "the unwatched 15 s must not count"
 
   def test_the_payload_carries_acV_and_genState(self, monkeypatch, carlogs):
     truck = Truck(monkeypatch)
