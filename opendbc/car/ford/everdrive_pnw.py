@@ -390,6 +390,8 @@ class EverDrive:
     if not (AC_I_BAND[0] <= amps <= AC_I_BAND[1] and AC_U_BAND[0] <= volts <= AC_U_BAND[1]):
       self._log(("everdrive2pnw: 0x2A7 outside the physical band (%.3f A, %.1f V) -- frame " +
                  "ignored, EverDriveStatus not updated this cycle") % (amps, volts))
+      # Time with no valid reading must not count toward "idle" (Gemini 2026-11-02); restart that timer.
+      self._gen_low_since = None
       return
 
     kw = (amps * volts) / 1000.0
@@ -646,7 +648,10 @@ class EverDrive:
       self._mi_ac += ac_kw * ds
       if est:
         self._mi_est_m += ds
-    self._mile.append((self._mi_m, self._mi_load, self._mi_ac, self._mi_est_m))
+    # Only a sample that added distance is a new snapshot: each resume after a stop adds none, and
+    # stop-and-go must not fill the deque with duplicates and evict the start of the mile (Gemini).
+    if not self._mile or self._mi_m > self._mile[-1][0]:
+      self._mile.append((self._mi_m, self._mi_load, self._mi_ac, self._mi_est_m))
     while len(self._mile) >= 2 and self._mi_m - self._mile[1][0] >= MILE_M:
       self._mile.popleft()
     return self._mile_result()

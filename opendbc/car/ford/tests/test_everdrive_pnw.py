@@ -49,6 +49,8 @@ CHARGING = bytes.fromhex("07d0000003680000")
 UNPLUGGED = bytes(8)
 # everdrivegen2pnw: the generator start trickle, 1.2 A x 234 V (0.28 kW), built from the DBC scaling.
 TRICKLE = bytes.fromhex("00c0000007500000")
+# 1.2 A x 300 V: outside AC_U_BAND, so the producer ignores it.
+GARBLED = bytes.fromhex("00c0000009600000")
 
 
 # ---------------------------------------------------------------- harness
@@ -1428,6 +1430,14 @@ class TestLastMileIsTheAverageOfTermOne:
     assert mile_feed(dev, load=30.0, mph=60.0, seconds=55.0, t0=10.0)[-1][2] is True
     assert mile_feed(dev, load=30.0, mph=60.0, seconds=11.0, t0=65.0)[-1][2] is False
 
+  def test_stop_and_go_does_not_fill_the_window_with_duplicates(self):
+    """Gemini 2026-11-02: each resume after a stop adds no distance and must add no snapshot."""
+    dev = ed.EverDrive()
+    v = 30.0 / 2.23694
+    for i in range(5000):                       # moving, stopped, moving ... one sample each
+      dev._step_mile(i * 0.2, v if i % 2 == 0 else 0.0, i % 2 == 0, 20.0, 0.0, False)
+    assert dev._mi_m == 0.0 and len(dev._mile) == 1, len(dev._mile)
+
   def test_no_load_adds_nothing(self):
     dev = ed.EverDrive()
     assert set(mile_feed(dev, load=None, mph=60.0, seconds=120.0)) == {None}
@@ -1522,6 +1532,15 @@ class TestGeneratorState:
     gen_feed(dev, 2.0, 46.0, 234.0, 0.0)
     assert gen_feed(dev, 0.2, 0.0, 0.0, 2.0) == ["off"]
     assert set(gen_feed(dev, 30.0, 0.0, 234.0, 2.2)) == {"on"}, "the 10 s rule is only after charging"
+
+  def test_a_garbled_burst_does_not_count_toward_idle(self, monkeypatch, carlogs):
+    """Gemini 2026-11-02: out-of-band 0x2A7 frames for 12 s while live, then the trickle again."""
+    truck = Truck(monkeypatch)
+    truck.run(55.0, ac=TRICKLE)
+    truck.run(12.0, ac=GARBLED)
+    n = len(truck.cap.blobs)
+    truck.run(3.0, ac=TRICKLE)
+    assert len(truck.cap.blobs) > n and {b["genState"] for b in truck.cap.blobs[n:]} == {"on"}
 
   def test_a_short_dip_in_power_keeps_on(self, carlogs):
     dev = ed.EverDrive()
