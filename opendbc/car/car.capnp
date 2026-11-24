@@ -206,6 +206,19 @@ struct CarState {
   lowSpeedAlert @56 :Bool;  # lost steering control due to a dynamic min steering speed
   blockPcmEnable @60 :Bool;  # whether to allow PCM to enable this frame
 
+  # pnw fsdguard2pnw: who may steer the Tesla Raven (TESLA_MODEL_S_HW3). From 0x399 AutopilotStatus.autopilotStatus
+  # and the stock 0x488 DAS_steeringControlType on the autopilot-party bus. selfdrived blocks engagement unless
+  # it is `taccOnly` (toggle TeslaCommaOverridesFsd turns the guard off). `unavailable` on every other car.
+  teslaAutopilot @61 :TeslaAutopilot;
+
+  enum TeslaAutopilot {
+    unavailable @0;    # this car does not decode it
+    taccOnly @1;       # status 1 (UNAVAILABLE) and stock steering type 0: the only state openpilot may engage in
+    selected @2;       # status 0 or 2: Autosteer/FSD is selected or the state is unclear; stock is not steering
+    stockSteering @3;  # stock steering type != 0 or status >= 3: the stock system is steering
+    missing @4;        # 0x399 or 0x488 missing or stale
+  }
+
   # cruise state
   cruiseState @10 :CruiseState;
 

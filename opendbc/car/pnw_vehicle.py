@@ -59,6 +59,9 @@ class PnwVehicle:
     self.stalk_cruise_buttons: bool = fp == "TESLA_MODEL_S_HW3"
     # teslastalk2pnw: alert when the EPS does not follow a lateral-only command (Rule 2 for teslamads2pnw).
     self.eps_refusal_alert: bool = fp == "TESLA_MODEL_S_HW3"
+    # fsdguard2pnw: carstate decodes carState.teslaAutopilot (0x399 status + stock 0x488 type) so selfdrived can block
+    # engaging while stock Autosteer/FSD is selected. Read-only, no panda change.
+    self.fsd_guard: bool = fp == "TESLA_MODEL_S_HW3"
 
     # predicted-curvature blend (fordlat2pnw): Ford curvature-only lateral cars where the
     # BluePilot-derived turn-exit blend is validated

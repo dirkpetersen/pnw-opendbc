@@ -108,6 +108,26 @@ def next_eps_refusal(count: int, lateral_only_commanded: bool, eac_active: bool)
   return count >= EPS_REFUSAL_FRAMES, count
 
 
+# fsdguard2pnw: the Raven's stock Autosteer/FSD and openpilot must not both be selected (owner, 2026-11-23). Evidence:
+# drives/2026-11-23/tesla-fsd-detection/FSD-SIGNAL-ANALYSIS.md -- 0x399 autopilotStatus read 1 in every TACC-only drive,
+# 2 while FSD was armed and 6 while the stock system steered; stock 0x488 on the autopilot-party bus went from type 0 to 1
+# in the same windows. Only "status 1 and type 0" is clean. Everything else, including a missing or stale frame, is not.
+TeslaAutopilot = structs.CarState.TeslaAutopilot
+
+
+def tesla_autopilot_state(status: int, steer_type: int, fresh: bool) -> structs.CarState.TeslaAutopilot:
+  if not fresh:
+    return TeslaAutopilot.missing
+  if steer_type != 0 or status >= 3:
+    return TeslaAutopilot.stockSteering
+  return TeslaAutopilot.taccOnly if status == 1 else TeslaAutopilot.selected
+
+
+def frame_fresh(cp, name: str) -> bool:
+  """The parser's own alive check for one frame: received, and not older than its learned timeout (about 10 periods)."""
+  return cp.message_states[cp.dbc.name_to_msg[name].address].valid(cp._last_update_nanos, False)
+
+
 class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
@@ -412,6 +432,12 @@ class CarState(CarStateBase):
 
     # LKAS
     ret.stockLkas = cp_ap_party.vl["DAS_steeringControl"]["DAS_steeringControlType"] == 2  # LANE_KEEP_ASSIST
+    # fsdguard2pnw: who may steer. The frames are already alive-checked by can_valid; this also names the case.
+    if self.pnw.fsd_guard:
+      ret.teslaAutopilot = tesla_autopilot_state(
+        int(cp_chassis.vl["AutopilotStatus"]["autopilotStatus"]),
+        int(cp_ap_party.vl["DAS_steeringControl"]["DAS_steeringControlType"]),
+        frame_fresh(cp_chassis, "AutopilotStatus") and frame_fresh(cp_ap_party, "DAS_steeringControl"))
 
     # Stock Autosteer should be off (includes FSD)
     # ret.invalidLkasSetting = cp_ap_party.vl["DAS_settings"]["DAS_autosteerEnabled"] != 0
