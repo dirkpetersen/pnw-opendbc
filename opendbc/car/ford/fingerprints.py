@@ -136,7 +136,9 @@ FW_VERSIONS = {
   },
   CAR.FORD_F_150_LIGHTNING_MK1: {
     (Ecu.abs, 0x760, None): [
+      b'NL38-2D053-AF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',  # bp71items2pnw: BluePilot ford-op/opendbc 2abe9990 fingerprints_ext.py
       b'PL38-2D053-AA\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+      b'RL38-2D053-BC\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',  # bp71items2pnw: BluePilot 2abe9990
       b'RL38-2D053-BD\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
       b'TL38-2D053-AD\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
     ],
@@ -146,10 +148,13 @@ FW_VERSIONS = {
       b'RJ6T-14H102-BBC\x00\x00\x00\x00\x00\x00\x00\x00\x00',
     ],
     (Ecu.fwdRadar, 0x764, None): [
+      b'ML3T-14D049-AH\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',  # bp71items2pnw: BluePilot 2abe9990
       b'ML3T-14D049-AL\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
       b'RB5T-14D049-AB\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
     ],
     (Ecu.eps, 0x730, None): [
+      b'NL38-14D003-AA\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',  # bp71items2pnw: BluePilot 2abe9990
+      b'NL38-14D003-AC\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',  # bp71items2pnw: BluePilot 2abe9990
       b'RL38-14D003-AA\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
     ],
   },
