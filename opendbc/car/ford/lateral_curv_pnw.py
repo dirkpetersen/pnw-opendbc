@@ -38,6 +38,7 @@ from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, DT_CTRL
 from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.vehicle_model import VehicleModel
 from opendbc.car.ford.values import CarControllerParams, FordFlags
+from opendbc.car.ford.fordlat_pnw import FiniteModelGate
 from opendbc.car.ford.values_pnw import BP_ANGLE_LIMITS, CURVATURE_MAX
 
 try:
@@ -178,6 +179,7 @@ class LateralCurvExt:
     self.sm = messaging.SubMaster(['modelV2', 'liveParameters', 'selfdriveState', 'radarState'])
     self.VM = VehicleModel(CP)
     self.model = None
+    self._model_gate = FiniteModelGate()
     self.lp = None
     self.ss = None
 
@@ -297,7 +299,7 @@ class LateralCurvExt:
     self.sm.update(0)
 
     if self.sm.updated['modelV2']:
-      self.model = self.sm['modelV2']
+      self.model = self._model_gate.filter(self.sm['modelV2'])  # bp71items2pnw: drop NaN/inf frames
     if self.sm.updated['liveParameters']:
       self.lp = self.sm['liveParameters']
     if self.sm.updated['selfdriveState']:

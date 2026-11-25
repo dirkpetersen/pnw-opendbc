@@ -11,6 +11,12 @@ custom panda reset latch to jump straight to 0; feeding 0 as the DESIRED value a
 stock rate limiter do the ramp needs no safety changes at all.
 """
 
+import itertools
+import math
+import time
+
+from opendbc.car.carlog import carlog
+
 HT_ANGLE_DEG = 45.0   # |steering angle| above this counts as a manual turn (bp value)
 HT_HOLD_S = 1.5       # sustained this long (bp value — avoids resets on in-curve nudges)
 _STEER_DT = 0.05      # called at the 20 Hz steer step
@@ -29,3 +35,43 @@ class HumanTurnHold:
     else:
       self._hold_s = 0.0
     return self._hold_s >= HT_HOLD_S
+
+
+# bp71items2pnw (BluePilot bluepilot-lateral 5a31711): a NaN/inf in modelV2 does not raise in the
+# lateral math; it reaches the CAN packer, which raises (int(floor(nan))), and card dies while steering.
+NONFINITE_HOLD_FRAMES = 5     # model frames (20 Hz): hold the last good frame for 0.25 s, then no model terms
+NONFINITE_LOG_PERIOD_S = 5.0
+
+
+def model_lateral_finite(model) -> bool:
+  """True when every modelV2 field the Ford lateral reads is finite."""
+  vals = itertools.chain(model.orientationRate.z, model.position.y, model.laneLineProbs,
+                         *(ll.y for ll in model.laneLines))
+  return all(math.isfinite(v) for v in vals)
+
+
+class FiniteModelGate:
+  """filter(model) on each NEW modelV2 frame. A non-finite frame is dropped: the last good frame is held
+  for NONFINITE_HOLD_FRAMES, then None (the lateral runs on the planner curvature only, no model terms).
+  Every drop is logged (rate-limited), and the switch to None is always logged."""
+
+  def __init__(self):
+    self._good = None
+    self.bad_run = 0
+    self.dropped = 0
+    self._last_log = -math.inf
+
+  def filter(self, model):
+    if model_lateral_finite(model):
+      self._good = model
+      self.bad_run = 0
+      return model
+    self.bad_run += 1
+    self.dropped += 1
+    held = self._good if self.bad_run <= NONFINITE_HOLD_FRAMES else None
+    now = time.monotonic()
+    if now - self._last_log >= NONFINITE_LOG_PERIOD_S or self.bad_run == NONFINITE_HOLD_FRAMES + 1:
+      self._last_log = now
+      carlog.error(f"bp71items2pnw: dropped modelV2 frame with NaN/inf ({self.bad_run} in a row, {self.dropped} total); " +
+                   ("holding last good frame" if held is not None else "Ford lateral runs WITHOUT model terms"))
+    return held

@@ -228,6 +228,9 @@ class CarController(CarControllerBase):
         except ImportError:
           from selfdrive.modeld.constants import ModelConstants
         self._pcblend_sm = messaging.SubMaster(['modelV2'])
+        from opendbc.car.ford.fordlat_pnw import FiniteModelGate
+        self._pcblend_gate = FiniteModelGate()  # bp71items2pnw: drop NaN/inf model frames
+        self._pcblend_model = None
         self._pcblend_tidxs = list(ModelConstants.T_IDXS)
       except Exception:
         self._pcblend_enabled = False
@@ -731,9 +734,11 @@ class CarController(CarControllerBase):
       if self._pcblend_enabled and CC.latActive and CS.out.vEgoRaw > PC_BLEND_MIN_V:
         try:
           self._pcblend_sm.update(0)
-          model = self._pcblend_sm['modelV2']
-          lane_changing = model.meta.laneChangeState in (1, 2, 3)  # preLaneChange/Starting/Finishing
-          if (self._pcblend_sm.alive['modelV2'] and not lane_changing
+          if self._pcblend_sm.updated['modelV2']:
+            self._pcblend_model = self._pcblend_gate.filter(self._pcblend_sm['modelV2'])
+          model = self._pcblend_model
+          lane_changing = model is not None and model.meta.laneChangeState in (1, 2, 3)  # preLaneChange/Starting/Finishing
+          if (model is not None and self._pcblend_sm.alive['modelV2'] and not lane_changing
               and len(model.orientationRate.z) >= 17):
             curvatures = np.array(model.orientationRate.z) / CS.out.vEgoRaw
             predicted = float(np.interp(PC_BLEND_LOOKUP_S, self._pcblend_tidxs, curvatures))

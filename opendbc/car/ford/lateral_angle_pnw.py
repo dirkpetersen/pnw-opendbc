@@ -65,6 +65,7 @@ from opendbc.car.carlog import carlog
 from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.ford.values import CarControllerParams
 from opendbc.car.ford.angle_tuning_pnw import AngleTuning, load_angle_tuning
+from opendbc.car.ford.fordlat_pnw import FiniteModelGate
 from opendbc.car.ford.human_turn_pnw import HumanTurnDetector
 from opendbc.car.ford.lateral_curv_pnw import LateralResult
 from opendbc.car.ford.values_pnw import BP_ANGLE_LIMITS
@@ -247,6 +248,7 @@ class LateralAngleExt:
   def __init__(self, CP):
     self.sm = messaging.SubMaster(['modelV2', 'liveDelay'])
     self.model = None
+    self._model_gate = FiniteModelGate()
 
     # Capability view (deviation d): platform gain pair, resolved once here, never re-checked via
     # carFingerprint anywhere else in this file (his own update_angle_params() re-derives it from
@@ -440,7 +442,7 @@ class LateralAngleExt:
   def update_sm(self):
     self.sm.update(0)
     if self.sm.updated['modelV2']:
-      self.model = self.sm['modelV2']
+      self.model = self._model_gate.filter(self.sm['modelV2'])  # bp71items2pnw: drop NaN/inf frames
 
   def get_current_curvature(self, CS):
     """Measured curvature of the car right now (OP sign convention), yaw-rate only.
