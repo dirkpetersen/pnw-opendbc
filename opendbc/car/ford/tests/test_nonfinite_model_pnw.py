@@ -159,3 +159,68 @@ def test_nan_model_pcblend_fallback_path():
   ci.CC._pcblend_sm.alive["modelV2"] = True
   _run(ci)
   assert ci.CC._pcblend_gate.dropped > 0
+
+
+def _short(field):
+  m = _fake_model()
+  if field == "orientationRate":
+    m.orientationRate.z = m.orientationRate.z[:17]  # np.interp against the 33 T_IDXS raises on this
+  elif field == "position":
+    m.position.y = []
+  elif field == "laneLines":
+    m.laneLines = m.laneLines[:2]
+  elif field == "laneLineY":
+    m.laneLines[2].y = []
+  elif field == "laneLineProbs":
+    m.laneLineProbs = m.laneLineProbs[:2]
+  return m
+
+
+@pytest.mark.parametrize("field", ["orientationRate", "position", "laneLines", "laneLineY", "laneLineProbs"])
+def test_short_frames_are_rejected(field):
+  assert not model_lateral_finite(_short(field))
+
+
+@pytest.mark.skipif(not HAVE_CEREAL, reason="cereal not on PYTHONPATH")
+def test_model_idx_n_matches_modeld():
+  from openpilot.selfdrive.modeld.constants import ModelConstants
+  from opendbc.car.ford.fordlat_pnw import MODEL_IDX_N
+  assert MODEL_IDX_N == ModelConstants.IDX_N == len(ModelConstants.T_IDXS)
+
+
+class _SM:
+  def __init__(self):
+    self.updated, self.alive, self.data = {"modelV2": False}, {"modelV2": True}, {}
+
+  def __getitem__(self, k):
+    return self.data[k]
+
+
+def test_step_drops_the_model_when_modelv2_dies(monkeypatch):
+  import opendbc.car.ford.fordlat_pnw as fl
+  logged = []
+  monkeypatch.setattr(fl.carlog, "error", lambda msg, *a, **k: logged.append(msg))
+  g, sm, good = FiniteModelGate(), _SM(), _fake_model()
+  sm.updated["modelV2"], sm.data["modelV2"] = True, good
+  cur = g.step(sm, None)
+  assert cur is good
+  sm.updated["modelV2"] = False
+  assert g.step(sm, cur) is good                  # alive, no new frame: keep using it
+  sm.alive["modelV2"] = False
+  assert g.step(sm, cur) is None                  # dead: never steer on a frozen frame
+  assert any("not alive" in m for m in logged)
+  assert g.filter(_fake_model("position")) is None  # and no pre-outage frame is held afterwards
+
+
+@pytest.mark.skipif(not HAVE_CEREAL, reason="cereal not on PYTHONPATH")
+@pytest.mark.parametrize("path", ["4signal", "angle"])
+def test_dead_modelv2_clears_the_held_model(path):
+  from opendbc.car.ford.lateral_angle_pnw import LateralAngleExt
+  ci = _make_interface()
+  if path == "angle":
+    ci.CC._latext = None
+    ci.CC._latext_angle = LateralAngleExt(ci.CP)
+  ext = ci.CC._latext or ci.CC._latext_angle
+  ext.model = _fake_model()  # a good frame from before the outage
+  _run(ci, 5)                 # real SubMaster, no publisher: modelV2 is not alive
+  assert ext.model is None

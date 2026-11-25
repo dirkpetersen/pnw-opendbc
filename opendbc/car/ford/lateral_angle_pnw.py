@@ -441,8 +441,7 @@ class LateralAngleExt:
 
   def update_sm(self):
     self.sm.update(0)
-    if self.sm.updated['modelV2']:
-      self.model = self._model_gate.filter(self.sm['modelV2'])  # bp71items2pnw: drop NaN/inf frames
+    self.model = self._model_gate.step(self.sm, self.model)  # bp71items2pnw: drop NaN/inf/short frames and a dead modelV2
 
   def get_current_curvature(self, CS):
     """Measured curvature of the car right now (OP sign convention), yaw-rate only.

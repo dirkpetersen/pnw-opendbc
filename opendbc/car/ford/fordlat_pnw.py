@@ -41,17 +41,23 @@ class HumanTurnHold:
 # lateral math; it reaches the CAN packer, which raises (int(floor(nan))), and card dies while steering.
 NONFINITE_HOLD_FRAMES = 5     # model frames (20 Hz): hold the last good frame for 0.25 s, then no model terms
 NONFINITE_LOG_PERIOD_S = 5.0
+MODEL_IDX_N = 33  # ModelConstants.IDX_N: the consumers np.interp orientationRate.z / position.y against T_IDXS
 
 
 def model_lateral_finite(model) -> bool:
-  """True when every modelV2 field the Ford lateral reads is finite."""
+  """True when every modelV2 field the Ford lateral reads is finite and long enough for how it is indexed
+  (np.interp against T_IDXS; laneLines[1..2].y[0]; laneLineProbs[1..2]). Real modeld frames: 33 / 33 / 4x33 / 4."""
+  if not (len(model.orientationRate.z) == MODEL_IDX_N and len(model.position.y) == MODEL_IDX_N and
+          len(model.laneLines) >= 3 and len(model.laneLines[1].y) > 0 and len(model.laneLines[2].y) > 0 and
+          len(model.laneLineProbs) >= 3):
+    return False
   vals = itertools.chain(model.orientationRate.z, model.position.y, model.laneLineProbs,
                          *(ll.y for ll in model.laneLines))
   return all(math.isfinite(v) for v in vals)
 
 
 class FiniteModelGate:
-  """filter(model) on each NEW modelV2 frame. A non-finite frame is dropped: the last good frame is held
+  """step(sm, current) once per control frame; filter(model) on each NEW modelV2 frame. A non-finite or short frame is dropped: the last good frame is held
   for NONFINITE_HOLD_FRAMES, then None (the lateral runs on the planner curvature only, no model terms).
   Every drop is logged (rate-limited), and the switch to None is always logged."""
 
@@ -72,6 +78,19 @@ class FiniteModelGate:
     now = time.monotonic()
     if now - self._last_log >= NONFINITE_LOG_PERIOD_S or self.bad_run == NONFINITE_HOLD_FRAMES + 1:
       self._last_log = now
-      carlog.error(f"bp71items2pnw: dropped modelV2 frame with NaN/inf ({self.bad_run} in a row, {self.dropped} total); " +
-                   ("holding last good frame" if held is not None else "Ford lateral runs WITHOUT model terms"))
+      carlog.error(f"bp71items2pnw: dropped modelV2 frame with NaN/inf or short arrays ({self.bad_run} in a row, " +
+                   f"{self.dropped} total); " + ("holding last good frame" if held is not None else "Ford lateral runs WITHOUT model terms"))
     return held
+
+  def step(self, sm, current):
+    """The model the lateral may use this frame: the gated new frame, `current` while modelV2 is alive, else None."""
+    if sm.updated['modelV2']:
+      return self.filter(sm['modelV2'])
+    if current is not None and not sm.alive['modelV2']:
+      self._good = None  # never resume on a frame from before the outage
+      now = time.monotonic()
+      if now - self._last_log >= NONFINITE_LOG_PERIOD_S:
+        self._last_log = now
+        carlog.error("bp71items2pnw: modelV2 not alive -- Ford lateral drops the held model frame, runs WITHOUT model terms")
+      return None
+    return current

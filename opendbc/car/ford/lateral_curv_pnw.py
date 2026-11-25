@@ -298,8 +298,7 @@ class LateralCurvExt:
     """Update SubMaster and vehicle model. Called each frame before lateral/long update."""
     self.sm.update(0)
 
-    if self.sm.updated['modelV2']:
-      self.model = self._model_gate.filter(self.sm['modelV2'])  # bp71items2pnw: drop NaN/inf frames
+    self.model = self._model_gate.step(self.sm, self.model)  # bp71items2pnw: drop NaN/inf/short frames and a dead modelV2
     if self.sm.updated['liveParameters']:
       self.lp = self.sm['liveParameters']
     if self.sm.updated['selfdriveState']:
